@@ -1,4 +1,4 @@
-//! Session-aware Claude Code stdio bridge for a remote ai-memory MCP server.
+//! Secret-safe stdio bridge for a remote ai-memory MCP server.
 
 use std::collections::HashMap;
 
@@ -19,12 +19,12 @@ use crate::config::Config;
 const ACTOR_SESSION_HEADER: HeaderName = HeaderName::from_static("x-memory-actor-session-id");
 
 #[derive(Clone)]
-struct SessionAwareBridge {
+struct HttpBridge {
     upstream: Peer<RoleClient>,
     server_info: ServerInfo,
 }
 
-impl ServerHandler for SessionAwareBridge {
+impl ServerHandler for HttpBridge {
     fn get_info(&self) -> ServerInfo {
         self.server_info.clone()
     }
@@ -61,16 +61,18 @@ fn upstream_error(error: ServiceError) -> McpError {
 
 fn upstream_config(
     server_url: &str,
-    session_id: &str,
+    session_id: Option<&str>,
     auth_token: Option<&str>,
 ) -> Result<StreamableHttpClientTransportConfig> {
     let mut headers = HashMap::new();
-    headers.insert(
-        ACTOR_SESSION_HEADER,
-        HeaderValue::from_str(session_id).context(
-            "CLAUDE_CODE_SESSION_ID contains characters that are invalid in an HTTP header",
-        )?,
-    );
+    if let Some(session_id) = session_id {
+        headers.insert(
+            ACTOR_SESSION_HEADER,
+            HeaderValue::from_str(session_id).context(
+                "CLAUDE_CODE_SESSION_ID contains characters that are invalid in an HTTP header",
+            )?,
+        );
+    }
 
     let mut config =
         StreamableHttpClientTransportConfig::with_uri(server_url).custom_headers(headers);
@@ -80,15 +82,14 @@ fn upstream_config(
     Ok(config)
 }
 
-/// Run the Claude Code session-aware stdio bridge.
+/// Run the secret-safe stdio-to-HTTP bridge.
 ///
 /// # Errors
-/// Returns an error when Claude did not provide a lifecycle session id, the
-/// upstream HTTP MCP server cannot initialize, or either transport fails.
+/// Returns an error when the upstream HTTP MCP server cannot initialize or
+/// either transport fails. Claude Code's lifecycle session id is forwarded
+/// when present; other MCP clients use the same bridge without that header.
 pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
-    let session_id = config.runtime_env.claude_code_session_id().context(
-        "CLAUDE_CODE_SESSION_ID is missing; this bridge must be launched by Claude Code as an stdio MCP server",
-    )?;
+    let session_id = config.runtime_env.claude_code_session_id();
     let server_url = args
         .server_url
         .as_deref()
@@ -108,7 +109,7 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         .peer_info()
         .map(|info| (*info).clone())
         .context("upstream MCP server completed initialization without server info")?;
-    let bridge = SessionAwareBridge {
+    let bridge = HttpBridge {
         upstream: upstream.peer().clone(),
         server_info,
     };
@@ -188,7 +189,7 @@ mod tests {
     fn upstream_config_injects_session_id_and_raw_bearer_token() {
         let config = upstream_config(
             "https://memory.example/mcp",
-            "550e8400-e29b-41d4-a716-446655440000",
+            Some("550e8400-e29b-41d4-a716-446655440000"),
             Some("secret-token"),
         )
         .unwrap();
@@ -207,31 +208,25 @@ mod tests {
 
     #[test]
     fn upstream_config_rejects_an_invalid_header_value() {
-        let error =
-            upstream_config("https://memory.example/mcp", "session\ninjected", None).unwrap_err();
+        let error = upstream_config(
+            "https://memory.example/mcp",
+            Some("session\ninjected"),
+            None,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("invalid in an HTTP header"),
             "{error:#}"
         );
     }
 
-    #[tokio::test]
-    async fn bridge_fails_closed_without_a_claude_session_id() {
-        let error = run(
-            &Config::default(),
-            McpBridgeArgs {
-                server_url: Some("https://memory.example/mcp".into()),
-            },
-        )
-        .await
-        .unwrap_err();
+    #[test]
+    fn upstream_config_allows_clients_without_a_claude_session_id() {
+        let config =
+            upstream_config("https://memory.example/mcp", None, Some("secret-token")).unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("CLAUDE_CODE_SESSION_ID is missing"),
-            "{error:#}"
-        );
+        assert_eq!(config.auth_header.as_deref(), Some("secret-token"));
+        assert!(!config.custom_headers.contains_key(&ACTOR_SESSION_HEADER));
     }
 
     async fn assert_bridge_round_trip(stateful: bool) {
@@ -256,10 +251,15 @@ mod tests {
         });
 
         let upstream_transport = StreamableHttpClientTransport::from_config(
-            upstream_config(&format!("http://{address}/mcp"), "claude-session-244", None).unwrap(),
+            upstream_config(
+                &format!("http://{address}/mcp"),
+                Some("claude-session-244"),
+                None,
+            )
+            .unwrap(),
         );
         let upstream = ().serve(upstream_transport).await.unwrap();
-        let bridge = SessionAwareBridge {
+        let bridge = HttpBridge {
             upstream: upstream.peer().clone(),
             server_info: upstream.peer_info().map(|info| (*info).clone()).unwrap(),
         };
