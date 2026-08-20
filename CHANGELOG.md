@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.29.1-aerox.1] - 2026-08-20
+
 ### Added
 - Allow the built-in stdio-to-HTTP MCP bridge to run for Codex, Antigravity,
   and other stdio clients when `CLAUDE_CODE_SESSION_ID` is absent. Claude Code
@@ -3477,7 +3479,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.29.0...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.1...HEAD
+[1.29.1-aerox.1]: https://github.com/Aerox912/ai-memory/compare/805fa4b17d575dadcd9cc9064aad42975e59e04e...v1.29.1-aerox.1
 [1.29.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.29.0
 [1.28.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.28.1
 [1.28.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.28.0
