@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams, ServerInfo,
@@ -18,10 +18,63 @@ use crate::config::Config;
 
 const ACTOR_SESSION_HEADER: HeaderName = HeaderName::from_static("x-memory-actor-session-id");
 
+const SCOPED_TOOLS: &[&str] = &[
+    "memory_query",
+    "memory_recent",
+    "memory_feedback",
+    "memory_forget_sweep",
+    "memory_lint",
+    "memory_auto_improve",
+    "memory_write_page",
+    "memory_read_page",
+    "memory_read_session_observations",
+    "memory_delete_page",
+    "memory_handoff_begin",
+    "memory_handoff_accept",
+    "memory_handoff_cancel",
+    "memory_status",
+    "memory_briefing",
+    "memory_explore",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScopePin {
+    workspace: String,
+    project: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScopePolicy {
+    Passthrough,
+    Pinned(ScopePin),
+}
+
+impl ScopePolicy {
+    fn from_args(args: &McpBridgeArgs) -> Result<Self> {
+        match (&args.workspace, &args.project) {
+            (Some(workspace), Some(project)) => {
+                let workspace = workspace.trim();
+                let project = project.trim();
+                if workspace.is_empty() || project.is_empty() {
+                    bail!("--workspace and --project must not be empty");
+                }
+                Ok(Self::Pinned(ScopePin {
+                    workspace: workspace.to_string(),
+                    project: project.to_string(),
+                }))
+            }
+            (None, None) if !args.require_scope_pin => Ok(Self::Passthrough),
+            (None, None) => bail!("--require-scope-pin requires both --workspace and --project"),
+            _ => bail!("--workspace and --project must be supplied together"),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct HttpBridge {
     upstream: Peer<RoleClient>,
     server_info: ServerInfo,
+    scope_policy: ScopePolicy,
 }
 
 impl ServerHandler for HttpBridge {
@@ -45,11 +98,113 @@ impl ServerHandler for HttpBridge {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let request = enforce_scope_policy(request, &self.scope_policy)?;
         self.upstream
             .call_tool(request)
             .await
             .map_err(upstream_error)
     }
+}
+
+fn enforce_scope_policy(
+    mut request: CallToolRequestParams,
+    policy: &ScopePolicy,
+) -> Result<CallToolRequestParams, McpError> {
+    let ScopePolicy::Pinned(pin) = policy else {
+        return Ok(request);
+    };
+    let tool_name = request.name.as_ref();
+
+    if tool_name == "memory_install_self_routing" {
+        return Ok(request);
+    }
+    if tool_name == "memory_consolidate" {
+        return Err(scope_error(
+            "memory_consolidate cannot prove an explicit project scope and is disabled by a pinned bridge",
+        ));
+    }
+    if !SCOPED_TOOLS.contains(&tool_name) {
+        return Err(scope_error(format!(
+            "tool {tool_name} is not approved by the pinned bridge"
+        )));
+    }
+
+    let mut arguments = request.arguments.take().unwrap_or_default();
+    if tool_name == "memory_query" {
+        validate_query_scope(&mut arguments, pin)?;
+    }
+    if tool_name == "memory_write_page"
+        && arguments.get("scope").and_then(serde_json::Value::as_str) == Some("global")
+    {
+        return Err(scope_error(
+            "global page writes are disabled by a pinned bridge",
+        ));
+    }
+    enforce_exact_argument(&mut arguments, "workspace", &pin.workspace)?;
+    enforce_exact_argument(&mut arguments, "project", &pin.project)?;
+    request.arguments = Some(arguments);
+    Ok(request)
+}
+
+fn validate_query_scope(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+    pin: &ScopePin,
+) -> Result<(), McpError> {
+    if arguments.get("global").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(scope_error(
+            "global memory queries are disabled by a pinned bridge",
+        ));
+    }
+
+    let Some(scopes) = arguments.remove("scopes") else {
+        return Ok(());
+    };
+    let serde_json::Value::Array(scopes) = scopes else {
+        return Err(scope_error("memory_query scopes must be an array"));
+    };
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    if scopes.len() != 1 || !scope_value_matches(&scopes[0], pin) {
+        return Err(scope_error(
+            "memory_query scopes conflict with the pinned workspace and project",
+        ));
+    }
+    Ok(())
+}
+
+fn scope_value_matches(value: &serde_json::Value, pin: &ScopePin) -> bool {
+    let Some(scope) = value.as_object() else {
+        return false;
+    };
+    scope.len() == 2
+        && scope.get("workspace").and_then(serde_json::Value::as_str)
+            == Some(pin.workspace.as_str())
+        && scope.get("project").and_then(serde_json::Value::as_str) == Some(pin.project.as_str())
+}
+
+fn enforce_exact_argument(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    expected: &str,
+) -> Result<(), McpError> {
+    match arguments.get(name) {
+        None | Some(serde_json::Value::Null) => {
+            arguments.insert(
+                name.to_string(),
+                serde_json::Value::String(expected.to_string()),
+            );
+            Ok(())
+        }
+        Some(serde_json::Value::String(value)) if value == expected => Ok(()),
+        Some(_) => Err(scope_error(format!(
+            "{name} conflicts with the bridge's pinned scope"
+        ))),
+    }
+}
+
+fn scope_error(message: impl Into<String>) -> McpError {
+    McpError::invalid_params(message.into(), None)
 }
 
 fn upstream_error(error: ServiceError) -> McpError {
@@ -89,6 +244,7 @@ fn upstream_config(
 /// either transport fails. Claude Code's lifecycle session id is forwarded
 /// when present; other MCP clients use the same bridge without that header.
 pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
+    let scope_policy = ScopePolicy::from_args(&args)?;
     let session_id = config.runtime_env.claude_code_session_id();
     let server_url = args
         .server_url
@@ -104,7 +260,7 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
     let mut upstream = ()
         .serve(transport)
         .await
-        .with_context(|| format!("connecting session-aware bridge to {server_url}"))?;
+        .with_context(|| format!("connecting stdio bridge to {server_url}"))?;
     let server_info = upstream
         .peer_info()
         .map(|info| (*info).clone())
@@ -112,16 +268,17 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
     let bridge = HttpBridge {
         upstream: upstream.peer().clone(),
         server_info,
+        scope_policy,
     };
     let downstream = bridge
         .serve(stdio())
         .await
-        .context("starting session-aware stdio MCP bridge")?;
+        .context("starting stdio-to-HTTP MCP bridge")?;
 
     downstream
         .waiting()
         .await
-        .context("waiting for Claude Code stdio MCP transport")?;
+        .context("waiting for downstream stdio MCP transport")?;
     upstream
         .close()
         .await
@@ -144,6 +301,7 @@ mod tests {
     #[derive(Clone)]
     struct EchoServer {
         seen_session: Arc<Mutex<Option<String>>>,
+        seen_arguments: Arc<Mutex<Option<serde_json::Value>>>,
     }
 
     impl ServerHandler for EchoServer {
@@ -158,7 +316,7 @@ mod tests {
         ) -> Result<ListToolsResult, McpError> {
             Ok(ListToolsResult {
                 tools: vec![Tool::new(
-                    "echo",
+                    "memory_status",
                     "Echo through the bridge",
                     Arc::new(Default::default()),
                 )],
@@ -178,6 +336,8 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
             *self.seen_session.lock().unwrap() = session;
+            *self.seen_arguments.lock().unwrap() =
+                request.arguments.clone().map(serde_json::Value::Object);
             Ok(CallToolResult::success(vec![Content::text(format!(
                 "echo:{}",
                 request.name
@@ -229,10 +389,202 @@ mod tests {
         assert!(!config.custom_headers.contains_key(&ACTOR_SESSION_HEADER));
     }
 
-    async fn assert_bridge_round_trip(stateful: bool) {
+    fn bridge_args(
+        workspace: Option<&str>,
+        project: Option<&str>,
+        require_scope_pin: bool,
+    ) -> McpBridgeArgs {
+        McpBridgeArgs {
+            server_url: None,
+            workspace: workspace.map(str::to_string),
+            project: project.map(str::to_string),
+            require_scope_pin,
+        }
+    }
+
+    fn pinned_policy() -> ScopePolicy {
+        ScopePolicy::Pinned(ScopePin {
+            workspace: "personal".into(),
+            project: "agent-system".into(),
+        })
+    }
+
+    fn request_with_arguments(name: &str, arguments: serde_json::Value) -> CallToolRequestParams {
+        CallToolRequestParams::new(name.to_string())
+            .with_arguments(arguments.as_object().unwrap().clone())
+    }
+
+    fn enforced_arguments(name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let request =
+            enforce_scope_policy(request_with_arguments(name, arguments), &pinned_policy())
+                .unwrap();
+        serde_json::Value::Object(request.arguments.unwrap())
+    }
+
+    #[test]
+    fn scope_policy_requires_a_complete_non_empty_pin() {
+        assert_eq!(
+            ScopePolicy::from_args(&bridge_args(None, None, false)).unwrap(),
+            ScopePolicy::Passthrough
+        );
+        assert!(ScopePolicy::from_args(&bridge_args(None, None, true)).is_err());
+        assert!(ScopePolicy::from_args(&bridge_args(Some("personal"), None, false)).is_err());
+        assert!(ScopePolicy::from_args(&bridge_args(None, Some("app"), false)).is_err());
+        assert!(ScopePolicy::from_args(&bridge_args(Some("  "), Some("app"), true)).is_err());
+        assert_eq!(
+            ScopePolicy::from_args(&bridge_args(
+                Some(" personal "),
+                Some(" agent-system "),
+                true,
+            ))
+            .unwrap(),
+            pinned_policy()
+        );
+    }
+
+    #[test]
+    fn pinned_bridge_injects_missing_scope_and_accepts_exact_scope() {
+        assert_eq!(
+            enforced_arguments("memory_status", serde_json::json!({})),
+            serde_json::json!({
+                "workspace": "personal",
+                "project": "agent-system",
+            })
+        );
+        assert_eq!(
+            enforced_arguments(
+                "memory_status",
+                serde_json::json!({
+                    "workspace": "personal",
+                    "project": "agent-system",
+                }),
+            ),
+            serde_json::json!({
+                "workspace": "personal",
+                "project": "agent-system",
+            })
+        );
+    }
+
+    #[test]
+    fn pinned_bridge_rejects_conflicting_or_untyped_scope() {
+        for arguments in [
+            serde_json::json!({"workspace": "rws"}),
+            serde_json::json!({"project": "other"}),
+            serde_json::json!({"workspace": 12}),
+            serde_json::json!({"project": false}),
+        ] {
+            assert!(
+                enforce_scope_policy(
+                    request_with_arguments("memory_status", arguments),
+                    &pinned_policy(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_bridge_normalizes_one_exact_query_scope() {
+        assert_eq!(
+            enforced_arguments(
+                "memory_query",
+                serde_json::json!({
+                    "query": "routing",
+                    "scopes": [{
+                        "workspace": "personal",
+                        "project": "agent-system",
+                    }],
+                }),
+            ),
+            serde_json::json!({
+                "query": "routing",
+                "workspace": "personal",
+                "project": "agent-system",
+            })
+        );
+    }
+
+    #[test]
+    fn pinned_bridge_rejects_global_or_cross_scope_queries() {
+        for arguments in [
+            serde_json::json!({"query": "routing", "global": true}),
+            serde_json::json!({
+                "query": "routing",
+                "scopes": [{"workspace": "rws", "project": "agent-system"}],
+            }),
+            serde_json::json!({
+                "query": "routing",
+                "scopes": [
+                    {"workspace": "personal", "project": "agent-system"},
+                    {"workspace": "personal", "project": "other"},
+                ],
+            }),
+            serde_json::json!({"query": "routing", "scopes": "personal"}),
+        ] {
+            assert!(
+                enforce_scope_policy(
+                    request_with_arguments("memory_query", arguments),
+                    &pinned_policy(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_bridge_rejects_unscoped_and_unknown_tools() {
+        assert!(
+            enforce_scope_policy(
+                request_with_arguments(
+                    "memory_consolidate",
+                    serde_json::json!({"session_id": "session-1"}),
+                ),
+                &pinned_policy(),
+            )
+            .is_err()
+        );
+        assert!(
+            enforce_scope_policy(
+                request_with_arguments("memory_future_tool", serde_json::json!({})),
+                &pinned_policy(),
+            )
+            .is_err()
+        );
+        assert!(
+            enforce_scope_policy(
+                request_with_arguments(
+                    "memory_write_page",
+                    serde_json::json!({"path": "a.md", "body": "# A", "scope": "global"}),
+                ),
+                &pinned_policy(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn passthrough_bridge_does_not_rewrite_requests() {
+        let request = request_with_arguments(
+            "memory_query",
+            serde_json::json!({"query": "routing", "global": true}),
+        );
+        assert_eq!(
+            enforce_scope_policy(request.clone(), &ScopePolicy::Passthrough).unwrap(),
+            request
+        );
+    }
+
+    async fn assert_bridge_round_trip(
+        stateful: bool,
+        scope_policy: ScopePolicy,
+        expected_arguments: Option<serde_json::Value>,
+    ) {
         let seen_session = Arc::new(Mutex::new(None));
+        let seen_arguments = Arc::new(Mutex::new(None));
         let echo = EchoServer {
             seen_session: seen_session.clone(),
+            seen_arguments: seen_arguments.clone(),
         };
         let service: StreamableHttpService<EchoServer, LocalSessionManager> =
             StreamableHttpService::new(
@@ -262,6 +614,7 @@ mod tests {
         let bridge = HttpBridge {
             upstream: upstream.peer().clone(),
             server_info: upstream.peer_info().map(|info| (*info).clone()).unwrap(),
+            scope_policy,
         };
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let downstream_server = tokio::spawn(async move { bridge.serve(server_io).await.unwrap() });
@@ -270,9 +623,9 @@ mod tests {
 
         let tools = downstream_client.list_all_tools().await.unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].name, "memory_status");
         let result = downstream_client
-            .call_tool(CallToolRequestParams::new("echo"))
+            .call_tool(CallToolRequestParams::new("memory_status"))
             .await
             .unwrap();
         assert_eq!(
@@ -281,12 +634,13 @@ mod tests {
                 .first()
                 .and_then(|content| content.as_text())
                 .map(|text| text.text.as_str()),
-            Some("echo:echo")
+            Some("echo:memory_status")
         );
         assert_eq!(
             seen_session.lock().unwrap().as_deref(),
             Some("claude-session-244")
         );
+        assert_eq!(*seen_arguments.lock().unwrap(), expected_arguments);
 
         downstream_client.cancel().await.unwrap();
         downstream_server.cancel().await.unwrap();
@@ -296,7 +650,20 @@ mod tests {
 
     #[tokio::test]
     async fn stdio_bridge_forwards_tools_and_session_header_in_both_http_modes() {
-        assert_bridge_round_trip(false).await;
-        assert_bridge_round_trip(true).await;
+        assert_bridge_round_trip(false, ScopePolicy::Passthrough, None).await;
+        assert_bridge_round_trip(true, ScopePolicy::Passthrough, None).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_bridge_forwards_rewritten_scope_to_http_upstream() {
+        assert_bridge_round_trip(
+            false,
+            pinned_policy(),
+            Some(serde_json::json!({
+                "workspace": "personal",
+                "project": "agent-system",
+            })),
+        )
+        .await;
     }
 }

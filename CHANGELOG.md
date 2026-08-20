@@ -10,7 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Allow the built-in stdio-to-HTTP MCP bridge to run for Codex, Antigravity,
   and other stdio clients when `CLAUDE_CODE_SESSION_ID` is absent. Claude Code
-  still forwards its lifecycle session header when one is available.
+  still forwards its lifecycle session header when one is available. The
+  bridge can now require an exact workspace/project pin, inject it into every
+  supported memory call, and reject global, conflicting, unscoped, or unknown
+  calls instead of relying on the server's process-wide active project.
 - Windows tests moved to their own workflow
   (`.github/workflows/windows.yml`), running on every push to `main`,
   nightly, on demand, and on any PR labelled `windows`. They were the

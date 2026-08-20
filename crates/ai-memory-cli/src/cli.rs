@@ -1684,6 +1684,18 @@ pub struct McpBridgeArgs {
     /// Remote ai-memory base URL or full `/mcp` endpoint.
     #[arg(long)]
     pub server_url: Option<String>,
+    /// Workspace that every scope-capable MCP request must target. Must be
+    /// supplied together with `--project`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project that every scope-capable MCP request must target. Must be
+    /// supplied together with `--workspace`.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Refuse to start unless both `--workspace` and `--project` pin the
+    /// bridge to one exact scope.
+    #[arg(long)]
+    pub require_scope_pin: bool,
 }
 
 /// Transport for the MCP server.
@@ -1970,6 +1982,33 @@ mod tests {
         assert!(args.session_aware);
         assert!(args.apply);
         assert!(matches!(args.client, McpClient::ClaudeCode));
+    }
+
+    #[test]
+    fn mcp_bridge_scope_pin_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "mcp-bridge",
+            "--server-url",
+            "http://127.0.0.1:49374/mcp",
+            "--workspace",
+            "personal",
+            "--project",
+            "agent-system",
+            "--require-scope-pin",
+        ])
+        .unwrap();
+
+        let Command::McpBridge(args) = cli.command else {
+            panic!("expected mcp-bridge command");
+        };
+        assert_eq!(
+            args.server_url.as_deref(),
+            Some("http://127.0.0.1:49374/mcp")
+        );
+        assert_eq!(args.workspace.as_deref(), Some("personal"));
+        assert_eq!(args.project.as_deref(), Some("agent-system"));
+        assert!(args.require_scope_pin);
     }
 
     #[test]

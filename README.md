@@ -519,6 +519,12 @@ every MCP request. Existing static HTTP installs remain the default. See
 [`docs/auto-scope.md`](docs/auto-scope.md) for Claude's `/clear` and
 implicit-resume limitations.
 
+The same bridge can serve stdio-only Codex or Antigravity clients without a
+Claude session id. Deployment wrappers that already resolved a repository can
+run it with `--require-scope-pin --workspace <name> --project <name>` so every
+memory call is constrained to that exact scope. Keep bearer tokens in
+`AI_MEMORY_AUTH_TOKEN`; do not place them in tracked MCP configuration.
+
 The `install-mcp` / `install-hooks` commands use
 `AI_MEMORY_SERVER_URL` / `AI_MEMORY_AUTH_TOKEN` when set; otherwise
 they default to `http://127.0.0.1:49374` (matching the server above)

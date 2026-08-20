@@ -406,14 +406,21 @@ MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
 cwd parameters use their canonical names.
 
-Claude Code's optional session-aware MCP registration is a transport adapter,
-not a second tool implementation. `ai-memory mcp-bridge` serves the upstream
-tool catalogue over local stdio, delegates tool calls to the configured HTTP
-server through rmcp's client transport, and injects the inherited
-`CLAUDE_CODE_SESSION_ID` as `X-Memory-Actor-Session-Id`. The server therefore
-keeps the same auth, scope resolver, and tool handlers as direct HTTP clients.
-The adapter fails closed without a Claude session id and is installed only by
-the explicit `install-mcp --client claude-code --session-aware` option.
+The optional `ai-memory mcp-bridge` is a transport adapter, not a second tool
+implementation. It serves the upstream tool catalogue over local stdio and
+delegates tool calls to the configured HTTP server through rmcp's client
+transport. Claude Code's session-aware registration also injects the inherited
+`CLAUDE_CODE_SESSION_ID` as `X-Memory-Actor-Session-Id`; Codex, Antigravity,
+and other stdio clients can run the bridge without that header.
+
+Installer-owned wrappers can add `--require-scope-pin`, `--workspace <name>`,
+and `--project <name>`. A pinned bridge injects that exact pair into every
+supported memory call, permits only exact matches, rejects global and
+cross-project queries or writes, and fails closed for unscoped or unknown
+tools. The bearer token remains an environment input and must not be rendered
+into tracked MCP configuration. Built-in `install-mcp --session-aware`
+registration remains a Claude Code option; multi-client deployment wrappers
+own their own registration and verified project selection.
 
 ## CLI subcommand surface
 
