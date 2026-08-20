@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Allow a pinned MCP bridge to accept repeated `--read-project` values as a
+  narrow read-only allowlist. Unscoped queries search the current project plus
+  those curated projects, while writes and every other tool stay pinned to the
+  current project. (#1)
+
+### Security
+- Keep static hook bearers out of spool files, delete legacy token-bearing
+  entries locally, rebind queued requests to the runtime-selected destination,
+  and optionally bind every event and drainer to an explicit pool identity.
+  Mixed-pool entries remain queued without network access or retry charging,
+  detached drainers scrub inherited ai-memory auth and scope variables, and
+  installer-managed hooks can require a validated workspace/project pin. (#1)
+
 ## [1.29.1-aerox.1] - 2026-08-20
 
 ### Added
