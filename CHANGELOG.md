@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bridge can now require an exact workspace/project pin, inject it into every
   supported memory call, and reject global, conflicting, unscoped, or unknown
   calls instead of relying on the server's process-wide active project.
+- Keep prerelease tags isolated from stable publication channels: canary images
+  receive only their versioned GHCR tag, canary GitHub Releases are marked as
+  prereleases, and AUR publishing is skipped. Stable releases continue to
+  update GHCR `latest` and GitHub's latest-release marker.
 - Windows tests moved to their own workflow
   (`.github/workflows/windows.yml`), running on every push to `main`,
   nightly, on demand, and on any PR labelled `windows`. They were the

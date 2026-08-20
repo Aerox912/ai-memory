@@ -213,6 +213,21 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
     assert!(ci.contains("--target runtime-prebuilt-amd64"));
 }
 
+#[test]
+fn prerelease_tags_do_not_replace_stable_release_channels() {
+    let release = read_repo(".github/workflows/release.yml");
+
+    assert!(release.contains("prerelease: ${{ steps.version.outputs.prerelease }}"));
+    assert!(release.contains("if [[ \"$tag_version\" == *-* ]]"));
+    assert!(
+        release
+            .contains("tag_args=(-t \"${image}:${{ needs.validate-version.outputs.version }}\")")
+    );
+    assert!(release.contains("release_flags=(--prerelease)"));
+    assert!(release.contains("release_flags=(--latest)"));
+    assert!(release.contains("needs.validate-version.outputs.prerelease == 'false'"));
+}
+
 #[cfg(unix)]
 #[test]
 fn macos_wrapper_routes_urls_by_real_subcommand() {
