@@ -1535,8 +1535,12 @@ pub struct HookArgs {
     #[arg(long)]
     pub server_url: String,
     /// Optional bearer token (`Authorization: Bearer <token>`).
-    #[arg(long, hide_env_values = true)]
+    #[arg(long, env = "AI_MEMORY_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
+    /// Optional deployment pool identity. When set, the identity is persisted
+    /// with the event and must match the pool-specific drainer.
+    #[arg(long, env = "AI_MEMORY_HOOK_POOL")]
+    pub pool_id: Option<String>,
     /// Default project strategy baked in by `install-hooks
     /// --project-strategy`. Applies only when a `.ai-memory.toml`
     /// marker does not pin its own `project_strategy`.
@@ -1556,7 +1560,21 @@ pub struct HookArgs {
 
 /// Arguments for hidden `hook-drain`.
 #[derive(Debug, Args)]
-pub struct HookDrainArgs {}
+pub struct HookDrainArgs {
+    /// Trusted base URL. Queued URLs supply only the hook query, never the destination.
+    #[arg(
+        long,
+        env = "AI_MEMORY_SERVER_URL",
+        default_value_t = crate::config::DEFAULT_SERVER_URL.to_string()
+    )]
+    pub server_url: String,
+    /// Runtime-only static bearer. Never serialized into the spool or command arguments.
+    #[arg(long, env = "AI_MEMORY_AUTH_TOKEN", hide_env_values = true)]
+    pub auth_token: Option<String>,
+    /// Pool identity accepted by this drainer. Entries from another pool stay queued.
+    #[arg(long, env = "AI_MEMORY_HOOK_POOL")]
+    pub pool_id: Option<String>,
+}
 
 /// Arguments for `install-hooks`.
 #[derive(Debug, Args)]
@@ -1696,6 +1714,11 @@ pub struct McpBridgeArgs {
     /// bridge to one exact scope.
     #[arg(long)]
     pub require_scope_pin: bool,
+    /// Additional project in the pinned workspace that read-only query/page
+    /// tools may access. Repeat for an explicit allowlist. Writes and all other
+    /// tools remain pinned to the exact `--project`.
+    #[arg(long, requires_all = ["workspace", "project"])]
+    pub read_project: Vec<String>,
 }
 
 /// Transport for the MCP server.
@@ -1996,6 +2019,8 @@ mod tests {
             "--project",
             "agent-system",
             "--require-scope-pin",
+            "--read-project",
+            "rws-shared",
         ])
         .unwrap();
 
@@ -2009,6 +2034,7 @@ mod tests {
         assert_eq!(args.workspace.as_deref(), Some("personal"));
         assert_eq!(args.project.as_deref(), Some("agent-system"));
         assert!(args.require_scope_pin);
+        assert_eq!(args.read_project, vec!["rws-shared"]);
     }
 
     #[test]

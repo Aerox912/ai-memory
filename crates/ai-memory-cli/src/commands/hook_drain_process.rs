@@ -66,15 +66,27 @@ pub enum DetachConfig {
     None,
 }
 
-/// Build `ai-memory --data-dir <dir> hook-drain`.
-pub fn command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
+/// Build `ai-memory --data-dir <dir> hook-drain --server-url <trusted-base>`.
+/// The bearer is deliberately absent from this inspectable command line.
+pub fn command_spec(
+    data_dir: &Path,
+    server_url: &str,
+    pool_id: Option<&str>,
+) -> io::Result<DrainCommandSpec> {
+    let mut args = vec![
+        OsString::from("--data-dir"),
+        data_dir.as_os_str().to_os_string(),
+        OsString::from("hook-drain"),
+        OsString::from("--server-url"),
+        OsString::from(server_url),
+    ];
+    if let Some(pool_id) = pool_id {
+        args.push(OsString::from("--pool-id"));
+        args.push(OsString::from(pool_id));
+    }
     Ok(DrainCommandSpec {
         exe: std::env::current_exe()?,
-        args: vec![
-            OsString::from("--data-dir"),
-            data_dir.as_os_str().to_os_string(),
-            OsString::from("hook-drain"),
-        ],
+        args,
         stderr_log: data_dir.join("logs").join("hook-drain.log"),
     })
 }
@@ -91,12 +103,17 @@ pub fn spawn_config(spec: &DrainCommandSpec, try_breakaway: bool) -> SpawnConfig
 }
 
 /// Spawn the hidden drainer without inheriting hook stdio.
-pub fn spawn(data_dir: &Path) -> io::Result<()> {
-    let spec = command_spec(data_dir)?;
-    spawn_spec(&spec)
+pub fn spawn(
+    data_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    pool_id: Option<&str>,
+) -> io::Result<()> {
+    let spec = command_spec(data_dir, server_url, pool_id)?;
+    spawn_spec(&spec, auth_token)
 }
 
-fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
+fn spawn_spec(spec: &DrainCommandSpec, auth_token: Option<&str>) -> io::Result<()> {
     if let Some(parent) = spec.stderr_log.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -108,6 +125,7 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
         .open(&config.stderr_file)?;
 
     let mut command = command_for_spec(spec, &config.detach);
+    apply_runtime_auth(&mut command, auth_token);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -130,6 +148,7 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
                 .append(true)
                 .open(&config.stderr_file)?;
             let mut retry = command_for_spec(spec, &config.detach);
+            apply_runtime_auth(&mut retry, auth_token);
             retry
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -137,6 +156,24 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
             retry.spawn().map(|_| ())
         }
         Err(err) => Err(err),
+    }
+}
+
+fn apply_runtime_auth(command: &mut Command, auth_token: Option<&str>) {
+    for name in [
+        "AI_MEMORY_AUTH_TOKEN",
+        "AI_MEMORY_DATA_DIR",
+        "AI_MEMORY_SERVER_URL",
+        "AI_MEMORY_HOOK_POOL",
+        "AI_MEMORY_HOOK_PROJECT",
+        "AI_MEMORY_HOOK_WORKSPACE",
+        "AI_MEMORY_HOOK_REQUIRE_PINNED_SCOPE",
+        "AI_MEMORY_HOOK_STATIC_AUTH",
+    ] {
+        command.env_remove(name);
+    }
+    if let Some(token) = auth_token {
+        command.env("AI_MEMORY_AUTH_TOKEN", token);
     }
 }
 
@@ -234,7 +271,7 @@ mod tests {
     #[test]
     fn command_spec_uses_data_dir_then_hidden_subcommand() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), "http://127.0.0.1:49374", Some("personal")).unwrap();
 
         assert_eq!(
             spec.args,
@@ -242,6 +279,10 @@ mod tests {
                 OsString::from("--data-dir"),
                 tmp.path().as_os_str().to_os_string(),
                 OsString::from("hook-drain"),
+                OsString::from("--server-url"),
+                OsString::from("http://127.0.0.1:49374"),
+                OsString::from("--pool-id"),
+                OsString::from("personal"),
             ]
         );
         assert_eq!(
@@ -280,7 +321,7 @@ mod tests {
     #[test]
     fn spawn_config_redirects_stdio_and_logs_under_data_dir_logs() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), "http://127.0.0.1:49374", None).unwrap();
         let config = spawn_config(&spec, true);
 
         assert!(config.stdin_null);
@@ -291,11 +332,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_auth_scrubs_inherited_pool_and_scope_environment() {
+        let mut command = Command::new("ai-memory-test");
+        for name in [
+            "AI_MEMORY_AUTH_TOKEN",
+            "AI_MEMORY_DATA_DIR",
+            "AI_MEMORY_SERVER_URL",
+            "AI_MEMORY_HOOK_POOL",
+            "AI_MEMORY_HOOK_PROJECT",
+            "AI_MEMORY_HOOK_WORKSPACE",
+            "AI_MEMORY_HOOK_REQUIRE_PINNED_SCOPE",
+            "AI_MEMORY_HOOK_STATIC_AUTH",
+        ] {
+            command.env(name, "attacker-controlled");
+        }
+
+        apply_runtime_auth(&mut command, Some("runtime-secret"));
+        let env = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(
+            env.get("AI_MEMORY_AUTH_TOKEN"),
+            Some(&Some("runtime-secret".into()))
+        );
+        for name in [
+            "AI_MEMORY_DATA_DIR",
+            "AI_MEMORY_SERVER_URL",
+            "AI_MEMORY_HOOK_POOL",
+            "AI_MEMORY_HOOK_PROJECT",
+            "AI_MEMORY_HOOK_WORKSPACE",
+            "AI_MEMORY_HOOK_REQUIRE_PINNED_SCOPE",
+            "AI_MEMORY_HOOK_STATIC_AUTH",
+        ] {
+            assert_eq!(env.get(name), Some(&None), "{name} was not scrubbed");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_spawn_config_prefers_true_session_detach_when_available() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), "http://127.0.0.1:49374", None).unwrap();
         let DetachConfig::UnixNewSession { setsid } = spawn_config(&spec, true).detach;
         if let Some(path) = setsid {
             assert!(
@@ -309,7 +394,7 @@ mod tests {
     #[test]
     fn windows_spawn_config_uses_expected_flags_and_breakaway_toggle() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = command_spec(tmp.path()).unwrap();
+        let spec = command_spec(tmp.path(), "http://127.0.0.1:49374", None).unwrap();
         let DetachConfig::WindowsCreationFlags(with_breakaway) = spawn_config(&spec, true).detach;
         let DetachConfig::WindowsCreationFlags(without_breakaway) =
             spawn_config(&spec, false).detach;

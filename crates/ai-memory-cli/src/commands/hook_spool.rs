@@ -14,11 +14,11 @@
 //! call. It also fits ai-memory's model: consolidation runs on `session-end`,
 //! after the drain has delivered the session's observations in order.
 //!
-//! Each event carries its own auth so a single global spool can hold events
-//! for several instances: a static token is stored inline (file mode 0600);
-//! an OIDC event stores only the mode and is resolved + refreshed from
-//! `auth.json` at drain time (so a token that expired while the event waited is
-//! renewed rather than rejected).
+//! Each event records only its auth mode. Static bearer tokens are supplied by
+//! the live drainer and never serialized into the spool; OIDC events are
+//! resolved + refreshed from `auth.json` at drain time. A production drain also
+//! rebinds every queued request to its configured server before attaching a
+//! bearer, so a tampered or stale spool URL cannot redirect credentials.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -57,7 +57,7 @@ static ENQUEUE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// How a spooled event authenticates to the server when drained.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuthMode {
-    /// A static bearer stored inline (`token`) — service-account / edge token.
+    /// A static bearer supplied by the live drainer — service-account / edge token.
     #[serde(rename = "static")]
     Static,
     /// Resolve + refresh a stored OIDC device-grant token from `auth.json`.
@@ -80,9 +80,10 @@ pub struct SpoolEntry {
     pub created_ms: u64,
     /// How to authenticate this event at drain time.
     pub auth_mode: AuthMode,
-    /// Static bearer, present only when `auth_mode == Static`.
+    /// Deployment pool that owns the event. Pool-bound drainers refuse entries
+    /// from any other pool, preventing a misplaced spool from crossing domains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
+    pub pool_id: Option<String>,
     /// Failed delivery attempts so far — incremented on each drain miss and used
     /// (with `created_ms`) to drop a permanently-undeliverable event.
     #[serde(default)]
@@ -276,27 +277,40 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Build a [`SpoolEntry`] for the current event, choosing the auth mode from
-/// the hook's flags + stored credentials (no network, no token I/O):
-/// an explicit `--auth-token` → `Static`; else a present OIDC `auth.json`
-/// entry → `Oidc`; else `Anonymous`.
+/// the hook's flags + stored credentials (no network, no token persistence):
+/// an explicit static bearer → `Static`; else a present OIDC `auth.json` entry
+/// → `Oidc`; else `Anonymous`.
 #[must_use]
+#[cfg(test)]
 pub fn entry_for(
     url: String,
     body: String,
     auth_token: Option<&str>,
     oidc_present: bool,
 ) -> SpoolEntry {
-    let (auth_mode, token) = match auth_token {
-        Some(t) => (AuthMode::Static, Some(t.to_string())),
-        None if oidc_present => (AuthMode::Oidc, None),
-        None => (AuthMode::Anonymous, None),
+    entry_for_pool(url, body, auth_token, oidc_present, None)
+}
+
+/// Build a spool entry tied to one deployment pool.
+#[must_use]
+pub fn entry_for_pool(
+    url: String,
+    body: String,
+    auth_token: Option<&str>,
+    oidc_present: bool,
+    pool_id: Option<&str>,
+) -> SpoolEntry {
+    let auth_mode = match auth_token {
+        Some(_) => AuthMode::Static,
+        None if oidc_present => AuthMode::Oidc,
+        None => AuthMode::Anonymous,
     };
     SpoolEntry {
         url,
         body,
         created_ms: now_ms(),
         auth_mode,
-        token,
+        pool_id: pool_id.map(str::to_owned),
         attempts: 0,
     }
 }
@@ -319,6 +333,34 @@ pub enum DrainLockWait {
     NoWait,
     /// Poll for the lock until this bounded budget expires.
     Bounded(Duration),
+}
+
+#[derive(Clone, Copy, Default)]
+struct DrainRuntime<'a> {
+    trusted_server_url: Option<&'a str>,
+    static_bearer: Option<&'a str>,
+    expected_pool_id: Option<&'a str>,
+}
+
+/// Runtime-only trust boundary for one deployment pool.
+#[derive(Clone, Copy)]
+pub struct TrustedPool<'a> {
+    /// Immutable server base selected by the pool ingress.
+    pub server_url: &'a str,
+    /// Bearer held only by the pool drainer.
+    pub static_bearer: Option<&'a str>,
+    /// Identity persisted with every event in this pool.
+    pub pool_id: &'a str,
+}
+
+impl<'a> From<TrustedPool<'a>> for DrainRuntime<'a> {
+    fn from(pool: TrustedPool<'a>) -> Self {
+        Self {
+            trusted_server_url: Some(pool.server_url),
+            static_bearer: pool.static_bearer,
+            expected_pool_id: Some(pool.pool_id),
+        }
+    }
 }
 
 /// An exclusive hook-spool drain lock. The OS releases it when dropped.
@@ -385,6 +427,7 @@ pub fn acquire_drain_lock(spool: &Path, wait: DrainLockWait) -> std::io::Result<
 }
 
 /// Run one exclusive drain pass if the single-flight lock is available.
+#[cfg(test)]
 pub async fn drain_exclusive(
     spool: &Path,
     data_dir: &Path,
@@ -392,34 +435,156 @@ pub async fn drain_exclusive(
     per_event_timeout: Duration,
     wait: DrainLockWait,
 ) -> Option<DrainResult> {
-    match drain_exclusive_result(spool, data_dir, total_budget, per_event_timeout, wait).await {
+    match drain_exclusive_result_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        DrainRuntime::default(),
+    )
+    .await
+    {
         Ok(LockedDrainResult::Drained(result)) => Some(result),
         Ok(LockedDrainResult::LockBusy) | Err(_) => None,
     }
 }
 
-/// Run one exclusive drain pass, distinguishing lock contention from lock IO errors.
-pub async fn drain_exclusive_result(
+/// Run one exclusive production drain. Every request is rebound to
+/// `trusted_server_url`; `static_bearer` exists only in the live process.
+pub async fn drain_exclusive_trusted(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    trusted_server_url: &str,
+    static_bearer: Option<&str>,
+) -> Option<DrainResult> {
+    match drain_exclusive_result_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        DrainRuntime {
+            trusted_server_url: Some(trusted_server_url),
+            static_bearer,
+            expected_pool_id: None,
+        },
+    )
+    .await
+    {
+        Ok(LockedDrainResult::Drained(result)) => Some(result),
+        Ok(LockedDrainResult::LockBusy) | Err(_) => None,
+    }
+}
+
+/// Run one exclusive production drain for a specific deployment pool.
+pub async fn drain_exclusive_trusted_pool(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+    pool: TrustedPool<'_>,
+) -> Option<DrainResult> {
+    match drain_exclusive_result_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        pool.into(),
+    )
+    .await
+    {
+        Ok(LockedDrainResult::Drained(result)) => Some(result),
+        Ok(LockedDrainResult::LockBusy) | Err(_) => None,
+    }
+}
+
+async fn drain_exclusive_result_with_runtime(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+    runtime: DrainRuntime<'_>,
 ) -> std::io::Result<LockedDrainResult> {
     let Some(_lock) = acquire_drain_lock(spool, wait)? else {
         return Ok(LockedDrainResult::LockBusy);
     };
     Ok(LockedDrainResult::Drained(
-        drain(spool, data_dir, total_budget, per_event_timeout).await,
+        drain_with_runtime(spool, data_dir, total_budget, per_event_timeout, runtime).await,
     ))
 }
 
 /// Run one exclusive drain pass while treating lock wait + drain as one budget.
+#[cfg(test)]
 pub async fn drain_exclusive_within_budget(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
+) -> std::io::Result<LockedDrainResult> {
+    drain_exclusive_within_budget_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        DrainRuntime::default(),
+    )
+    .await
+}
+
+/// Run one exclusive production drain while treating lock wait + drain as one budget.
+pub async fn drain_exclusive_within_budget_trusted(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    trusted_server_url: &str,
+    static_bearer: Option<&str>,
+) -> std::io::Result<LockedDrainResult> {
+    drain_exclusive_within_budget_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        DrainRuntime {
+            trusted_server_url: Some(trusted_server_url),
+            static_bearer,
+            expected_pool_id: None,
+        },
+    )
+    .await
+}
+
+/// Run one exclusive budgeted drain for a specific deployment pool.
+pub async fn drain_exclusive_within_budget_trusted_pool(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    pool: TrustedPool<'_>,
+) -> std::io::Result<LockedDrainResult> {
+    drain_exclusive_within_budget_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        pool.into(),
+    )
+    .await
+}
+
+async fn drain_exclusive_within_budget_with_runtime(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    runtime: DrainRuntime<'_>,
 ) -> std::io::Result<LockedDrainResult> {
     let started = Instant::now();
     let Some(_lock) = acquire_drain_lock(spool, DrainLockWait::Bounded(total_budget))? else {
@@ -438,17 +603,89 @@ pub async fn drain_exclusive_within_budget(
         }));
     }
     Ok(LockedDrainResult::Drained(
-        drain(spool, data_dir, remaining_budget, per_event_timeout).await,
+        drain_with_runtime(
+            spool,
+            data_dir,
+            remaining_budget,
+            per_event_timeout,
+            runtime,
+        )
+        .await,
     ))
 }
 
 /// Hold the drain lock and keep draining until the spool is quiescent or budget expires.
+#[cfg(test)]
 pub async fn drain_until_quiescent(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+) -> std::io::Result<LockedDrainResult> {
+    drain_until_quiescent_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        DrainRuntime::default(),
+    )
+    .await
+}
+
+/// Hold the drain lock and keep draining a production spool until quiescent.
+pub async fn drain_until_quiescent_trusted(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+    trusted_server_url: &str,
+    static_bearer: Option<&str>,
+) -> std::io::Result<LockedDrainResult> {
+    drain_until_quiescent_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        DrainRuntime {
+            trusted_server_url: Some(trusted_server_url),
+            static_bearer,
+            expected_pool_id: None,
+        },
+    )
+    .await
+}
+
+/// Drain a production spool for one pool until it is quiescent or the budget expires.
+pub async fn drain_until_quiescent_trusted_pool(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+    pool: TrustedPool<'_>,
+) -> std::io::Result<LockedDrainResult> {
+    drain_until_quiescent_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        wait,
+        pool.into(),
+    )
+    .await
+}
+
+async fn drain_until_quiescent_with_runtime(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    wait: DrainLockWait,
+    runtime: DrainRuntime<'_>,
 ) -> std::io::Result<LockedDrainResult> {
     let Some(_lock) = acquire_drain_lock(spool, wait)? else {
         return Ok(LockedDrainResult::LockBusy);
@@ -466,7 +703,14 @@ pub async fn drain_until_quiescent(
             return Ok(LockedDrainResult::Drained(combined));
         }
 
-        let result = drain(spool, data_dir, remaining_budget, per_event_timeout).await;
+        let result = drain_with_runtime(
+            spool,
+            data_dir,
+            remaining_budget,
+            per_event_timeout,
+            runtime,
+        )
+        .await;
         combined.sent += result.sent;
         combined.dropped += result.dropped;
         combined.remaining = result.remaining;
@@ -503,17 +747,48 @@ pub async fn drain_until_quiescent(
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
+#[cfg(test)]
 pub async fn drain(
     spool: &Path,
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
 ) -> DrainResult {
+    drain_with_runtime(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        DrainRuntime::default(),
+    )
+    .await
+}
+
+async fn drain_with_runtime(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    runtime: DrainRuntime<'_>,
+) -> DrainResult {
     let mut files = match list_entries(spool) {
         Some(f) => f,
         None => return DrainResult::default(),
     };
     files.sort();
+
+    let trusted_hook_url = match runtime.trusted_server_url {
+        Some(server_url) => match configured_hook_url(server_url) {
+            Some(url) => Some(url),
+            None => {
+                return DrainResult {
+                    remaining: files.len(),
+                    ..DrainResult::default()
+                };
+            }
+        },
+        None => None,
+    };
 
     let client = build_client();
     let started = Instant::now();
@@ -530,15 +805,33 @@ pub async fn drain(
 
         let path = files[idx].clone();
         idx += 1;
-        let Some(entry) = load_live_entry(&path, &mut result) else {
+        let Some(entry) = load_live_entry(&path, &mut result, trusted_hook_url.as_ref()) else {
             continue;
         };
+        if runtime
+            .expected_pool_id
+            .is_some_and(|expected| entry.pool_id.as_deref() != Some(expected))
+        {
+            result.remaining += 1;
+            continue;
+        }
         if body_is_malformed(&entry) {
             bump_or_drop(&path, &entry, &mut result);
             continue;
         }
 
-        let bearer = entry_bearer(&entry, &client, data_dir, &mut oidc_cache).await;
+        if entry.auth_mode == AuthMode::Static && runtime.static_bearer.is_none() {
+            result.remaining += 1 + files.len().saturating_sub(idx);
+            break;
+        }
+        let bearer = entry_bearer(
+            &entry,
+            &client,
+            data_dir,
+            &mut oidc_cache,
+            runtime.static_bearer,
+        )
+        .await;
 
         if batch_supported {
             // Extend the chunk over consecutive entries sharing the same batch
@@ -554,9 +847,18 @@ pub async fn drain(
                 }
                 let next_path = files[idx].clone();
                 idx += 1;
-                let Some(next_entry) = load_live_entry(&next_path, &mut result) else {
+                let Some(next_entry) =
+                    load_live_entry(&next_path, &mut result, trusted_hook_url.as_ref())
+                else {
                     continue;
                 };
+                if runtime
+                    .expected_pool_id
+                    .is_some_and(|expected| next_entry.pool_id.as_deref() != Some(expected))
+                {
+                    result.remaining += 1;
+                    continue;
+                }
                 if body_is_malformed(&next_entry) {
                     bump_or_drop(&next_path, &next_entry, &mut result);
                     continue;
@@ -565,8 +867,18 @@ pub async fn drain(
                     idx -= 1;
                     break;
                 }
-                let next_bearer =
-                    entry_bearer(&next_entry, &client, data_dir, &mut oidc_cache).await;
+                if next_entry.auth_mode == AuthMode::Static && runtime.static_bearer.is_none() {
+                    idx -= 1;
+                    break;
+                }
+                let next_bearer = entry_bearer(
+                    &next_entry,
+                    &client,
+                    data_dir,
+                    &mut oidc_cache,
+                    runtime.static_bearer,
+                )
+                .await;
                 if next_bearer != bearer {
                     idx -= 1;
                     break;
@@ -656,8 +968,14 @@ pub async fn drain(
                             result.remaining += chunk.len() - pos + files.len().saturating_sub(idx);
                             break 'drain;
                         }
-                        let item_bearer =
-                            entry_bearer(entry, &client, data_dir, &mut oidc_cache).await;
+                        let item_bearer = entry_bearer(
+                            entry,
+                            &client,
+                            data_dir,
+                            &mut oidc_cache,
+                            runtime.static_bearer,
+                        )
+                        .await;
                         match post_hook(
                             &client,
                             &entry.url,
@@ -744,13 +1062,55 @@ fn batch_request_timeout(
         .min(remaining_budget)
 }
 
-fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> {
+fn configured_hook_url(server_url: &str) -> Option<reqwest::Url> {
+    let mut url = reqwest::Url::parse(server_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    let path = format!("{}/hook", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url)
+}
+
+fn bind_entry_to_server(entry: &mut SpoolEntry, trusted_hook_url: &reqwest::Url) -> bool {
+    let Ok(stored_url) = reqwest::Url::parse(&entry.url) else {
+        return false;
+    };
+    let mut rebound = trusted_hook_url.clone();
+    rebound.set_query(stored_url.query());
+    entry.url = rebound.into();
+    true
+}
+
+fn load_live_entry(
+    path: &Path,
+    result: &mut DrainResult,
+    trusted_hook_url: Option<&reqwest::Url>,
+) -> Option<SpoolEntry> {
     let Ok(bytes) = std::fs::read(path) else {
         result.remaining += 1;
         return None;
     };
-    let Ok(mut entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
+    let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         // Unparseable spool file: drop it so it can't wedge the queue.
+        let _ = std::fs::remove_file(path);
+        result.dropped += 1;
+        return None;
+    };
+    // Builds before the token-safe spool serialized static bearer tokens. Do
+    // not silently accept those entries through serde's unknown-field handling:
+    // delete the legacy secret-bearing file before any network request.
+    if raw
+        .as_object()
+        .is_some_and(|object| object.contains_key("token"))
+    {
+        let _ = std::fs::remove_file(path);
+        result.dropped += 1;
+        return None;
+    }
+    let Ok(mut entry) = serde_json::from_value::<SpoolEntry>(raw) else {
         let _ = std::fs::remove_file(path);
         result.dropped += 1;
         return None;
@@ -765,6 +1125,11 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
     // (`/hook/batch` chunk or the per-event fallback). Loading is the single
     // choke point both paths pass through, so one strip here covers both.
     strip_assistant_from_entry(&mut entry);
+    if trusted_hook_url.is_some_and(|url| !bind_entry_to_server(&mut entry, url)) {
+        let _ = std::fs::remove_file(path);
+        result.dropped += 1;
+        return None;
+    }
     Some(entry)
 }
 
@@ -787,17 +1152,18 @@ fn body_is_malformed(entry: &SpoolEntry) -> bool {
     serde_json::from_str::<serde_json::Value>(&entry.body).is_err()
 }
 
-/// Resolve the bearer for a spooled entry at drain time: a `Static` token is
-/// stored inline; an `Oidc` entry resolves (and refreshes) the stored token
-/// once per drain via `oidc_cache`; `Anonymous` is None.
+/// Resolve the bearer for a spooled entry at drain time: a `Static` token comes
+/// only from the live drainer; an `Oidc` entry resolves (and refreshes) the
+/// stored token once per drain via `oidc_cache`; `Anonymous` is None.
 async fn entry_bearer(
     entry: &SpoolEntry,
     client: &reqwest::Client,
     data_dir: &Path,
     oidc_cache: &mut Option<Option<String>>,
+    static_bearer: Option<&str>,
 ) -> Option<String> {
     match entry.auth_mode {
-        AuthMode::Static => entry.token.clone(),
+        AuthMode::Static => static_bearer.map(str::to_owned),
         AuthMode::Anonymous => None,
         AuthMode::Oidc => {
             if oidc_cache.is_none() {
@@ -935,11 +1301,12 @@ mod tests {
     fn entry_for_picks_auth_mode() {
         let s = entry_for("u".into(), "{}".into(), Some("tok"), false);
         assert_eq!(s.auth_mode, AuthMode::Static);
-        assert_eq!(s.token.as_deref(), Some("tok"));
+        let serialized = serde_json::to_string(&s).unwrap();
+        assert!(!serialized.contains("tok"));
+        assert!(!serialized.contains("token"));
 
         let o = entry_for("u".into(), "{}".into(), None, true);
         assert_eq!(o.auth_mode, AuthMode::Oidc);
-        assert!(o.token.is_none());
 
         let a = entry_for("u".into(), "{}".into(), None, false);
         assert_eq!(a.auth_mode, AuthMode::Anonymous);
@@ -974,7 +1341,31 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
         assert_eq!(loaded.url, "https://x/hook?event=stop");
         assert_eq!(loaded.auth_mode, AuthMode::Static);
-        assert_eq!(loaded.token.as_deref(), Some("tok"));
+        let raw = String::from_utf8(std::fs::read(&files[0]).unwrap()).unwrap();
+        assert!(!raw.contains("tok"));
+        assert!(!raw.contains("token"));
+    }
+
+    #[test]
+    fn load_live_entry_drops_legacy_secret_bearing_spool_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        let path = spool.join("legacy.json");
+        let raw = serde_json::json!({
+            "url": "https://x/hook?event=stop",
+            "body": "{}",
+            "created_ms": now_ms(),
+            "auth_mode": "static",
+            "token": "legacy-secret",
+            "attempts": 0
+        });
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let mut result = DrainResult::default();
+        assert!(load_live_entry(&path, &mut result, None).is_none());
+        assert_eq!(result.dropped, 1);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -996,7 +1387,7 @@ mod tests {
         let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
 
         let mut result = DrainResult::default();
-        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        let loaded = load_live_entry(&path, &mut result, None).expect("entry is live");
         assert!(
             !loaded.body.contains("SENTINEL_ASSISTANT_MESSAGE"),
             "drain load left the assistant message in the body: {}",
@@ -1030,7 +1421,7 @@ mod tests {
         let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
 
         let mut result = DrainResult::default();
-        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        let loaded = load_live_entry(&path, &mut result, None).expect("entry is live");
         assert_eq!(loaded.body, body, "clean body must stay byte-exact");
     }
 
@@ -1052,7 +1443,7 @@ mod tests {
         let path = list_entries(&spool).unwrap().into_iter().next().unwrap();
 
         let mut result = DrainResult::default();
-        let loaded = load_live_entry(&path, &mut result).expect("entry is live");
+        let loaded = load_live_entry(&path, &mut result, None).expect("entry is live");
         assert!(loaded.url.contains("capture_assistant=1"), "flag dropped");
         assert!(
             loaded.body.contains("_ai_memory_assistant"),
@@ -1628,6 +2019,37 @@ mod tests {
         addr.to_string()
     }
 
+    async fn serve_recording_hook(
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    requests.lock().unwrap().push(request.clone());
+                    let payload = request.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let accepted = serde_json::from_str::<serde_json::Value>(payload)
+                        .ok()
+                        .and_then(|value| value.as_array().map(Vec::len))
+                        .unwrap_or(0);
+                    let body = format!("{{\"accepted\":{accepted}}}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        addr.to_string()
+    }
+
     async fn serve_delayed_batch_hook(
         req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         delay: Duration,
@@ -1712,9 +2134,9 @@ mod tests {
         std::fs::write(spool.join(name), serde_json::to_vec(&e).unwrap()).unwrap();
     }
 
-    fn write_spool_entry_with_token(spool: &Path, name: &str, url: String, token: &str) {
+    fn write_static_spool_entry(spool: &Path, name: &str, url: String) {
         std::fs::create_dir_all(spool).unwrap();
-        let e = entry_for(url, "{}".into(), Some(token), false);
+        let e = entry_for(url, "{}".into(), Some("must-not-persist"), false);
         std::fs::write(spool.join(name), serde_json::to_vec(&e).unwrap()).unwrap();
     }
 
@@ -1974,39 +2396,207 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bearer_change_splits_batches_without_burning_attempts() {
-        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+    async fn trusted_drain_rebinds_destination_before_attaching_runtime_bearer() {
+        let attacker_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attacker_addr = serve_counting_hook(attacker_count.clone(), "200 OK").await;
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trusted_addr = serve_recording_hook(requests.clone()).await;
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
-        write_spool_entry_with_token(
+        write_static_spool_entry(
             &spool,
             "evt-0.json",
-            format!("http://{addr}/hook?event=e0"),
-            "token-a",
+            format!("http://{attacker_addr}/hook?event=e0"),
         );
-        write_spool_entry_with_token(
-            &spool,
-            "evt-1.json",
-            format!("http://{addr}/hook?event=e1"),
-            "token-b",
-        );
+        let serialized = std::fs::read_to_string(spool.join("evt-0.json")).unwrap();
+        assert!(!serialized.contains("must-not-persist"));
 
-        let r = drain(
+        let trusted_url = format!("http://{trusted_addr}");
+        let r = drain_with_runtime(
             &spool,
             tmp.path(),
             Duration::from_secs(5),
             Duration::from_secs(2),
+            DrainRuntime {
+                trusted_server_url: Some(&trusted_url),
+                static_bearer: Some("runtime-secret"),
+                expected_pool_id: None,
+            },
         )
         .await;
 
-        assert_eq!(r.sent, 2);
+        assert_eq!(r.sent, 1);
         assert_eq!(r.remaining, 0);
         assert!(list_entries(&spool).unwrap().is_empty());
         assert_eq!(
+            attacker_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a spooled URL redirected the runtime bearer"
+        );
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let request = &captured[0];
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer runtime-secret")
+        );
+        assert!(request.contains(&trusted_addr));
+        assert!(!request.contains(&attacker_addr));
+    }
+
+    #[tokio::test]
+    async fn static_entry_without_runtime_bearer_stays_queued_without_network_or_retry() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let trusted_addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_static_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{trusted_addr}/hook?event=e0"),
+        );
+        let trusted_url = format!("http://{trusted_addr}");
+
+        let result = drain_with_runtime(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            DrainRuntime {
+                trusted_server_url: Some(&trusted_url),
+                static_bearer: None,
+                expected_pool_id: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result.sent, 0);
+        assert_eq!(result.dropped, 0);
+        assert_eq!(result.remaining, 1);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(sorted_attempts(&spool), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn pool_bound_drain_refuses_cross_pool_entry_without_network_or_retry() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let trusted_addr = serve_counting_hook(req_count.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let entry = entry_for_pool(
+            format!("http://{trusted_addr}/hook?event=e0"),
+            "{}".into(),
+            Some("must-not-persist"),
+            false,
+            Some("personal"),
+        );
+        enqueue(&spool, &entry).unwrap();
+        let trusted_url = format!("http://{trusted_addr}");
+
+        let result = drain_with_runtime(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            DrainRuntime {
+                trusted_server_url: Some(&trusted_url),
+                static_bearer: Some("rws-secret"),
+                expected_pool_id: Some("rws"),
+            },
+        )
+        .await;
+
+        assert_eq!(result.sent, 0);
+        assert_eq!(result.dropped, 0);
+        assert_eq!(result.remaining, 1);
+        assert_eq!(req_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(sorted_attempts(&spool), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn pool_bound_batch_skips_later_cross_pool_and_legacy_entries() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trusted_addr = serve_recording_hook(requests.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for (body, pool_id) in [
+            (r#"{"pool":"rws"}"#, Some("rws")),
+            (r#"{"pool":"personal"}"#, Some("personal")),
+            (r#"{"pool":"legacy"}"#, None),
+        ] {
+            let entry = entry_for_pool(
+                format!("http://{trusted_addr}/hook?event=e"),
+                body.into(),
+                Some("must-not-persist"),
+                false,
+                pool_id,
+            );
+            enqueue(&spool, &entry).unwrap();
+        }
+        let trusted_url = format!("http://{trusted_addr}");
+
+        let result = drain_with_runtime(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            DrainRuntime {
+                trusted_server_url: Some(&trusted_url),
+                static_bearer: Some("rws-secret"),
+                expected_pool_id: Some("rws"),
+            },
+        )
+        .await;
+
+        assert_eq!(result.sent, 1);
+        assert_eq!(result.remaining, 2);
+        assert_eq!(sorted_attempts(&spool), vec![0, 0]);
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].contains(r#""pool":"rws""#));
+        assert!(!captured[0].contains("personal"));
+        assert!(!captured[0].contains("legacy"));
+    }
+
+    #[tokio::test]
+    async fn pool_bound_unsupported_batch_fallback_never_sends_mismatched_entry() {
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let trusted_addr = serve_counting_hook(req_count.clone(), "404 Not Found").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for pool_id in ["rws", "personal"] {
+            let entry = entry_for_pool(
+                format!("http://{trusted_addr}/hook?event={pool_id}"),
+                "{}".into(),
+                Some("must-not-persist"),
+                false,
+                Some(pool_id),
+            );
+            enqueue(&spool, &entry).unwrap();
+        }
+        let trusted_url = format!("http://{trusted_addr}");
+
+        let result = drain_with_runtime(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            DrainRuntime {
+                trusted_server_url: Some(&trusted_url),
+                static_bearer: Some("rws-secret"),
+                expected_pool_id: Some("rws"),
+            },
+        )
+        .await;
+
+        assert_eq!(result.sent, 1);
+        assert_eq!(result.remaining, 1);
+        assert_eq!(sorted_attempts(&spool), vec![0]);
+        assert_eq!(
             req_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "different bearer tokens require separate batch requests"
+            "only one batch probe and the accepted RWS per-event fallback are allowed"
         );
     }
 
