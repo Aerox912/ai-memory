@@ -12,7 +12,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, stdio};
 use rmcp::{ErrorData as McpError, Peer, ServerHandler, ServiceExt};
 
-use crate::cli::McpBridgeArgs;
+use crate::cli::{McpBridgeArgs, McpToolProfile};
 use crate::commands::install_mcp::mcp_server_url_from_base;
 use crate::config::Config;
 
@@ -36,6 +36,41 @@ const SCOPED_TOOLS: &[&str] = &[
     "memory_briefing",
     "memory_explore",
 ];
+
+const RECALL_TOOLS: &[&str] = &[
+    "memory_query",
+    "memory_recent",
+    "memory_read_page",
+    "memory_read_session_observations",
+    "memory_status",
+    "memory_briefing",
+    "memory_explore",
+];
+
+const SESSION_TOOLS: &[&str] = &[
+    "memory_query",
+    "memory_recent",
+    "memory_read_page",
+    "memory_read_session_observations",
+    "memory_status",
+    "memory_briefing",
+    "memory_explore",
+    "memory_feedback",
+    "memory_write_page",
+    "memory_handoff_begin",
+    "memory_handoff_accept",
+    "memory_handoff_cancel",
+];
+
+impl McpToolProfile {
+    fn allows(self, tool_name: &str) -> bool {
+        match self {
+            Self::Full => true,
+            Self::Recall => RECALL_TOOLS.contains(&tool_name),
+            Self::Session => SESSION_TOOLS.contains(&tool_name),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScopePin {
@@ -96,6 +131,7 @@ struct HttpBridge {
     upstream: Peer<RoleClient>,
     server_info: ServerInfo,
     scope_policy: ScopePolicy,
+    tool_profile: McpToolProfile,
 }
 
 impl ServerHandler for HttpBridge {
@@ -108,10 +144,12 @@ impl ServerHandler for HttpBridge {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        self.upstream
+        let result = self
+            .upstream
             .list_tools(request)
             .await
-            .map_err(upstream_error)
+            .map_err(upstream_error)?;
+        Ok(filter_tool_list(result, self.tool_profile))
     }
 
     async fn call_tool(
@@ -119,12 +157,30 @@ impl ServerHandler for HttpBridge {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        enforce_tool_profile(request.name.as_ref(), self.tool_profile)?;
         let request = enforce_scope_policy(request, &self.scope_policy)?;
         self.upstream
             .call_tool(request)
             .await
             .map_err(upstream_error)
     }
+}
+
+fn enforce_tool_profile(tool_name: &str, profile: McpToolProfile) -> Result<(), McpError> {
+    if profile.allows(tool_name) {
+        Ok(())
+    } else {
+        Err(scope_error(format!(
+            "tool {tool_name} is disabled by the {profile} MCP tool profile"
+        )))
+    }
+}
+
+fn filter_tool_list(mut result: ListToolsResult, profile: McpToolProfile) -> ListToolsResult {
+    result
+        .tools
+        .retain(|tool| profile.allows(tool.name.as_ref()));
+    result
 }
 
 fn enforce_scope_policy(
@@ -419,6 +475,7 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         upstream: upstream.peer().clone(),
         server_info,
         scope_policy,
+        tool_profile: args.tool_profile,
     };
     let downstream = bridge
         .serve(stdio())
@@ -539,6 +596,42 @@ mod tests {
         assert!(!config.custom_headers.contains_key(&ACTOR_SESSION_HEADER));
     }
 
+    #[test]
+    fn tool_profiles_filter_discovery_and_reject_direct_calls() {
+        let listed = ListToolsResult {
+            tools: vec![
+                Tool::new("memory_query", "Recall", Arc::new(Default::default())),
+                Tool::new("memory_write_page", "Write", Arc::new(Default::default())),
+                Tool::new("memory_delete_page", "Delete", Arc::new(Default::default())),
+            ],
+            ..Default::default()
+        };
+
+        let recall = filter_tool_list(listed.clone(), McpToolProfile::Recall);
+        assert_eq!(
+            recall
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["memory_query"]
+        );
+        assert!(enforce_tool_profile("memory_write_page", McpToolProfile::Recall).is_err());
+
+        let session = filter_tool_list(listed, McpToolProfile::Session);
+        assert_eq!(
+            session
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["memory_query", "memory_write_page"]
+        );
+        assert!(enforce_tool_profile("memory_write_page", McpToolProfile::Session).is_ok());
+        assert!(enforce_tool_profile("memory_delete_page", McpToolProfile::Session).is_err());
+        assert!(enforce_tool_profile("memory_future_tool", McpToolProfile::Full).is_ok());
+    }
+
     fn bridge_args(
         workspace: Option<&str>,
         project: Option<&str>,
@@ -550,6 +643,7 @@ mod tests {
             project: project.map(str::to_string),
             require_scope_pin,
             read_project: Vec::new(),
+            tool_profile: McpToolProfile::Full,
         }
     }
 
@@ -894,6 +988,7 @@ mod tests {
             upstream: upstream.peer().clone(),
             server_info: upstream.peer_info().map(|info| (*info).clone()).unwrap(),
             scope_policy,
+            tool_profile: McpToolProfile::Full,
         };
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let downstream_server = tokio::spawn(async move { bridge.serve(server_io).await.unwrap() });

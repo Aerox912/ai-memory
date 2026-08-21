@@ -41,7 +41,8 @@ pub struct DrainCommandSpec {
 /// Unit-testable stdio/detach configuration for a drainer process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnConfig {
-    /// stdin is redirected to null.
+    /// stdin is redirected to null unless a bearer is supplied through an
+    /// anonymous secret file.
     pub stdin_null: bool,
     /// stdout is redirected to null.
     pub stdout_null: bool,
@@ -125,11 +126,8 @@ fn spawn_spec(spec: &DrainCommandSpec, auth_token: Option<&str>) -> io::Result<(
         .open(&config.stderr_file)?;
 
     let mut command = command_for_spec(spec, &config.detach);
-    apply_runtime_auth(&mut command, auth_token);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr));
+    apply_runtime_auth(&mut command, auth_token)?;
+    command.stdout(Stdio::null()).stderr(Stdio::from(stderr));
 
     match command.spawn() {
         Ok(_child) => Ok(()),
@@ -148,20 +146,19 @@ fn spawn_spec(spec: &DrainCommandSpec, auth_token: Option<&str>) -> io::Result<(
                 .append(true)
                 .open(&config.stderr_file)?;
             let mut retry = command_for_spec(spec, &config.detach);
-            apply_runtime_auth(&mut retry, auth_token);
-            retry
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(stderr));
+            apply_runtime_auth(&mut retry, auth_token)?;
+            retry.stdout(Stdio::null()).stderr(Stdio::from(stderr));
             retry.spawn().map(|_| ())
         }
         Err(err) => Err(err),
     }
 }
 
-fn apply_runtime_auth(command: &mut Command, auth_token: Option<&str>) {
+fn apply_runtime_auth(command: &mut Command, auth_token: Option<&str>) -> io::Result<()> {
     for name in [
         "AI_MEMORY_AUTH_TOKEN",
+        "AI_MEMORY_AUTH_TOKEN_FILE",
+        "AI_MEMORY_TOKEN_PEPPER_FILE",
         "AI_MEMORY_DATA_DIR",
         "AI_MEMORY_SERVER_URL",
         "AI_MEMORY_HOOK_POOL",
@@ -173,8 +170,14 @@ fn apply_runtime_auth(command: &mut Command, auth_token: Option<&str>) {
         command.env_remove(name);
     }
     if let Some(token) = auth_token {
-        command.env("AI_MEMORY_AUTH_TOKEN", token);
+        let secret_file = crate::secret_input::anonymous_file(token, "hook drainer bearer token")
+            .map_err(io::Error::other)?;
+        command.arg("--auth-token-stdin");
+        command.stdin(Stdio::from(secret_file));
+    } else {
+        command.stdin(Stdio::null());
     }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -337,6 +340,8 @@ mod tests {
         let mut command = Command::new("ai-memory-test");
         for name in [
             "AI_MEMORY_AUTH_TOKEN",
+            "AI_MEMORY_AUTH_TOKEN_FILE",
+            "AI_MEMORY_TOKEN_PEPPER_FILE",
             "AI_MEMORY_DATA_DIR",
             "AI_MEMORY_SERVER_URL",
             "AI_MEMORY_HOOK_POOL",
@@ -348,7 +353,7 @@ mod tests {
             command.env(name, "attacker-controlled");
         }
 
-        apply_runtime_auth(&mut command, Some("runtime-secret"));
+        apply_runtime_auth(&mut command, Some("runtime-secret")).unwrap();
         let env = command
             .get_envs()
             .map(|(name, value)| {
@@ -359,11 +364,10 @@ mod tests {
             })
             .collect::<std::collections::HashMap<_, _>>();
 
-        assert_eq!(
-            env.get("AI_MEMORY_AUTH_TOKEN"),
-            Some(&Some("runtime-secret".into()))
-        );
         for name in [
+            "AI_MEMORY_AUTH_TOKEN",
+            "AI_MEMORY_AUTH_TOKEN_FILE",
+            "AI_MEMORY_TOKEN_PEPPER_FILE",
             "AI_MEMORY_DATA_DIR",
             "AI_MEMORY_SERVER_URL",
             "AI_MEMORY_HOOK_POOL",
@@ -374,6 +378,11 @@ mod tests {
         ] {
             assert_eq!(env.get(name), Some(&None), "{name} was not scrubbed");
         }
+        assert!(
+            command
+                .get_args()
+                .any(|argument| argument == "--auth-token-stdin")
+        );
     }
 
     #[cfg(unix)]

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.29.1-aerox.3] - 2026-08-21
+
+### Added
+- Add `recall` and `session` MCP bridge tool profiles that filter both tool
+  discovery and direct calls while retaining `full` as the compatibility
+  default. (#2)
+
+### Security
+- Allow managed services and hooks to load bearer tokens and the multi-user
+  token pepper from bounded file or pipe inputs. Detached hook drainers now
+  transfer runtime bearer material over anonymous stdin instead of argv or
+  environment. (#2)
+
 ## [1.29.1-aerox.2] - 2026-08-21
 
 ### Added
@@ -3495,7 +3508,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.2...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.3...HEAD
+[1.29.1-aerox.3]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.2...v1.29.1-aerox.3
 [1.29.1-aerox.2]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.1...v1.29.1-aerox.2
 [1.29.1-aerox.1]: https://github.com/Aerox912/ai-memory/compare/805fa4b17d575dadcd9cc9064aad42975e59e04e...v1.29.1-aerox.1
 [1.29.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.29.0

@@ -288,6 +288,8 @@ pub struct RuntimeEnv {
     home_dir: Option<String>,
     server_url: Option<String>,
     auth_token: Option<String>,
+    auth_token_file: Option<PathBuf>,
+    token_pepper_file: Option<PathBuf>,
     host_cwd: Option<String>,
     scope_cwd: Option<String>,
     ignore_marker: bool,
@@ -314,6 +316,8 @@ impl RuntimeEnv {
             home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
+            auth_token_file: env_path("AI_MEMORY_AUTH_TOKEN_FILE"),
+            token_pepper_file: env_path("AI_MEMORY_TOKEN_PEPPER_FILE"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
             scope_cwd: env_string("AI_MEMORY_SCOPE_CWD"),
             // One-invocation escape hatch: run a command against the fallback
@@ -863,9 +867,7 @@ impl Config {
             )
         })?;
 
-        if let Some(token) = runtime_env.auth_token.clone() {
-            config.auth.bearer_token = Some(token);
-        }
+        apply_runtime_auth_settings(&mut config, &runtime_env)?;
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
         }
@@ -1230,6 +1232,24 @@ impl Config {
     }
 }
 
+fn apply_runtime_auth_settings(config: &mut Config, runtime_env: &RuntimeEnv) -> Result<()> {
+    let bearer_token = crate::secret_input::resolve(
+        runtime_env.auth_token.clone(),
+        runtime_env.auth_token_file.as_deref(),
+        "AI_MEMORY bearer token",
+    )?;
+    if let Some(token) = bearer_token {
+        config.auth.bearer_token = Some(token);
+    }
+    if let Some(path) = runtime_env.token_pepper_file.as_deref() {
+        config.auth.token_pepper = Some(crate::secret_input::read_file(
+            path,
+            "AI_MEMORY token pepper",
+        )?);
+    }
+    Ok(())
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name).ok().and_then(|s| {
         let trimmed = s.trim();
@@ -1315,6 +1335,49 @@ mod tests {
                 assert!(!rendered.contains(secret), "Debug output exposed {secret}");
             }
         }
+    }
+
+    #[test]
+    fn runtime_secret_files_override_config_without_exposing_values() {
+        let tmp = TempDir::new().unwrap();
+        let bearer_path = tmp.path().join("bearer");
+        let pepper_path = tmp.path().join("pepper");
+        std::fs::write(&bearer_path, " routine-token\n").unwrap();
+        std::fs::write(&pepper_path, " pepper-value\n").unwrap();
+        let runtime = RuntimeEnv {
+            auth_token_file: Some(bearer_path),
+            token_pepper_file: Some(pepper_path),
+            ..RuntimeEnv::default()
+        };
+        let mut config = Config {
+            auth: AuthSettings {
+                bearer_token: Some("stale-root-token".into()),
+                token_pepper: Some("stale-pepper".into()),
+                ..AuthSettings::default()
+            },
+            ..Config::default()
+        };
+
+        apply_runtime_auth_settings(&mut config, &runtime).unwrap();
+        assert_eq!(config.auth.bearer_token.as_deref(), Some("routine-token"));
+        assert_eq!(config.auth.token_pepper.as_deref(), Some("pepper-value"));
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("routine-token"));
+        assert!(!rendered.contains("pepper-value"));
+    }
+
+    #[test]
+    fn runtime_direct_and_file_bearers_fail_closed() {
+        let tmp = TempDir::new().unwrap();
+        let bearer_path = tmp.path().join("bearer");
+        std::fs::write(&bearer_path, "file-token").unwrap();
+        let runtime = RuntimeEnv {
+            auth_token: Some("direct-token".into()),
+            auth_token_file: Some(bearer_path),
+            ..RuntimeEnv::default()
+        };
+        let mut config = Config::default();
+        assert!(apply_runtime_auth_settings(&mut config, &runtime).is_err());
     }
 
     #[test]

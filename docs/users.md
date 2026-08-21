@@ -67,6 +67,12 @@ applies, never escalates. Startup rejects equal root and proxy credentials;
 root and proxy credentials take precedence over any accidental DB-token
 collision.
 
+For managed services, keep the root bearer and token pepper outside tracked
+configuration. `AI_MEMORY_AUTH_TOKEN_FILE` loads the bearer from a file or pipe
+path and `AI_MEMORY_TOKEN_PEPPER_FILE` does the same for the pepper. Inputs are
+bounded, trimmed, required to be non-empty UTF-8, and read once during startup.
+Supplying both `AI_MEMORY_AUTH_TOKEN` and its file-backed form fails closed.
+
 ## Trusted proxy identity
 
 A deployment that terminates SSO validates the end user's credential, then

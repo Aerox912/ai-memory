@@ -148,8 +148,15 @@ The generated entry runs `ai-memory mcp-bridge`, connects to the same configured
 local or remote `/mcp` endpoint, preserves bearer authentication, and adds
 `X-Memory-Actor-Session-Id: <CLAUDE_CODE_SESSION_ID>` to every upstream request.
 It supports ai-memory's default stateless HTTP mode and opt-in stateful mode.
-The command fails closed if Claude did not supply a session id rather than
-silently falling back to the shared single slot.
+The same bridge can run for stdio-only clients without a Claude session header;
+only Claude's per-session auto-scope depends on that inherited identifier.
+
+Operator-managed bridge entries may also use `--tool-profile recall` for a
+read-only tool surface or `--tool-profile session` for recall plus scoped page
+writes, feedback, and handoffs. The restricted profiles filter tool discovery
+and reject direct calls to hidden tools. `full` remains the default. Managed
+wrappers can provide bearer material through `AI_MEMORY_AUTH_TOKEN_FILE`
+instead of placing it in the process environment or tracked configuration.
 
 Pair the bridge with this server setting:
 

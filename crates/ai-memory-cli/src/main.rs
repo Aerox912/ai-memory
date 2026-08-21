@@ -21,6 +21,7 @@ mod http_client;
 mod logging;
 mod marker;
 mod process_guard;
+mod secret_input;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -40,8 +41,29 @@ async fn main() -> Result<()> {
     // a stored OIDC token when no explicit `--auth-token` is given, so we pass
     // the bare path rather than loading the full config.
     let command = match command {
-        Command::Hook(args) => return commands::hook::run(data_dir, args).await,
-        Command::HookDrain(args) => return commands::hook::run_drain(data_dir, args).await,
+        Command::Hook(mut args) => {
+            args.auth_token = secret_input::resolve(
+                args.auth_token.take(),
+                args.auth_token_file.as_deref(),
+                "hook bearer token",
+            )?;
+            return commands::hook::run(data_dir, args).await;
+        }
+        Command::HookDrain(mut args) => {
+            args.auth_token = if args.auth_token_stdin {
+                if args.auth_token.is_some() || args.auth_token_file.is_some() {
+                    anyhow::bail!("hook drainer bearer token has more than one configured source");
+                }
+                Some(secret_input::read_stdin("hook drainer bearer token")?)
+            } else {
+                secret_input::resolve(
+                    args.auth_token.take(),
+                    args.auth_token_file.as_deref(),
+                    "hook drainer bearer token",
+                )?
+            };
+            return commands::hook::run_drain(data_dir, args).await;
+        }
         // Completions are pure text derived from the command tree. Emitting
         // them must not require a loadable config or an initialised data dir
         // (they are typically generated before `init`, or in a packaging

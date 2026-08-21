@@ -1537,6 +1537,9 @@ pub struct HookArgs {
     /// Optional bearer token (`Authorization: Bearer <token>`).
     #[arg(long, env = "AI_MEMORY_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
+    /// Read the bearer token from a process-only file or pipe path.
+    #[arg(long, env = "AI_MEMORY_AUTH_TOKEN_FILE", conflicts_with = "auth_token")]
+    pub auth_token_file: Option<PathBuf>,
     /// Optional deployment pool identity. When set, the identity is persisted
     /// with the event and must match the pool-specific drainer.
     #[arg(long, env = "AI_MEMORY_HOOK_POOL")]
@@ -1571,6 +1574,16 @@ pub struct HookDrainArgs {
     /// Runtime-only static bearer. Never serialized into the spool or command arguments.
     #[arg(long, env = "AI_MEMORY_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
+    /// Read the bearer token from a process-only file or pipe path.
+    #[arg(
+        long,
+        env = "AI_MEMORY_AUTH_TOKEN_FILE",
+        conflicts_with_all = ["auth_token", "auth_token_stdin"]
+    )]
+    pub auth_token_file: Option<PathBuf>,
+    /// Read the bearer token from stdin. Reserved for the detached drainer.
+    #[arg(long, hide = true, conflicts_with = "auth_token")]
+    pub auth_token_stdin: bool,
     /// Pool identity accepted by this drainer. Entries from another pool stay queued.
     #[arg(long, env = "AI_MEMORY_HOOK_POOL")]
     pub pool_id: Option<String>,
@@ -1719,6 +1732,32 @@ pub struct McpBridgeArgs {
     /// tools remain pinned to the exact `--project`.
     #[arg(long, requires_all = ["workspace", "project"])]
     pub read_project: Vec<String>,
+    /// Restrict the exposed MCP tools to an operator-selected capability set.
+    #[arg(long, value_enum, default_value_t = McpToolProfile::Full)]
+    pub tool_profile: McpToolProfile,
+}
+
+/// Capability profiles exposed by the stdio-to-HTTP MCP bridge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum McpToolProfile {
+    /// Preserve the upstream tool surface. Scope pinning still applies.
+    #[default]
+    Full,
+    /// Expose only memory recall and read-only inspection tools.
+    Recall,
+    /// Expose recall plus scoped page writes, feedback, and handoffs.
+    Session,
+}
+
+impl std::fmt::Display for McpToolProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Full => "full",
+            Self::Recall => "recall",
+            Self::Session => "session",
+        };
+        formatter.write_str(value)
+    }
 }
 
 /// Transport for the MCP server.
@@ -2021,6 +2060,8 @@ mod tests {
             "--require-scope-pin",
             "--read-project",
             "rws-shared",
+            "--tool-profile",
+            "session",
         ])
         .unwrap();
 
@@ -2035,6 +2076,7 @@ mod tests {
         assert_eq!(args.project.as_deref(), Some("agent-system"));
         assert!(args.require_scope_pin);
         assert_eq!(args.read_project, vec!["rws-shared"]);
+        assert_eq!(args.tool_profile, McpToolProfile::Session);
     }
 
     #[test]

@@ -423,8 +423,17 @@ project plus those named projects, and `memory_read_page` may read them, while
 writes and every other tool remain pinned to the current project. No workspace
 wildcard or server-global query is introduced.
 
-The bearer token remains an environment input for the generic bridge and must
-not be rendered into tracked MCP configuration. Automatic multi-pool
+`--tool-profile recall` exposes only query, recent, status, briefing, explore,
+page reads, and session-observation reads. `--tool-profile session` adds scoped
+page writes, feedback, and handoff begin/accept/cancel. The bridge filters both
+`tools/list` and `tools/call`, so a client cannot bypass a hidden capability by
+calling its name directly. `full` is the compatibility default and still
+obeys any configured scope pin.
+
+The bearer token must not be rendered into tracked MCP configuration. Generic
+installs can use `AI_MEMORY_AUTH_TOKEN`; managed process supervisors can use
+`AI_MEMORY_AUTH_TOKEN_FILE` with a file or pipe path. A server can likewise use
+`AI_MEMORY_TOKEN_PEPPER_FILE` for its multi-user token pepper. Automatic multi-pool
 deployments should instead put each token in a one-pool local ingress/drainer
 and submit non-secret hook envelopes to it. Hook spool files never serialize a
 static bearer. A deployment can also set `--pool-id`: the identity is persisted
@@ -432,7 +441,8 @@ with each event, and a pool-bound drainer leaves mismatched entries queued
 without a network request or retry charge. Production drains rebind every
 queued URL to the server selected by the token-owning ingress before attaching
 runtime authentication. Detached drainers scrub inherited ai-memory auth,
-server, data, pool, and scope variables before setting their one runtime token.
+secret-file, server, data, pool, and scope variables and transfer their one
+runtime token over anonymous stdin rather than argv or environment.
 Legacy spool files that contain a `token` field are deleted locally. The parent
 deployment must keep the ingress destination and pool identity immutable to
 tokenless hook callers. Built-in `install-mcp --session-aware` registration
