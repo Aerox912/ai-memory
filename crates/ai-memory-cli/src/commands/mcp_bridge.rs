@@ -41,6 +41,7 @@ const SCOPED_TOOLS: &[&str] = &[
 struct ScopePin {
     workspace: String,
     project: String,
+    read_projects: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,10 +59,30 @@ impl ScopePolicy {
                 if workspace.is_empty() || project.is_empty() {
                     bail!("--workspace and --project must not be empty");
                 }
+                let mut read_projects = args
+                    .read_project
+                    .iter()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty() && *value != project)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                read_projects.sort();
+                read_projects.dedup();
+                if args
+                    .read_project
+                    .iter()
+                    .any(|value| value.trim().is_empty())
+                {
+                    bail!("--read-project must not be empty");
+                }
                 Ok(Self::Pinned(ScopePin {
                     workspace: workspace.to_string(),
                     project: project.to_string(),
+                    read_projects,
                 }))
+            }
+            (None, None) if !args.read_project.is_empty() => {
+                bail!("--read-project requires both --workspace and --project")
             }
             (None, None) if !args.require_scope_pin => Ok(Self::Passthrough),
             (None, None) => bail!("--require-scope-pin requires both --workspace and --project"),
@@ -131,7 +152,11 @@ fn enforce_scope_policy(
 
     let mut arguments = request.arguments.take().unwrap_or_default();
     if tool_name == "memory_query" {
-        validate_query_scope(&mut arguments, pin)?;
+        if pin.read_projects.is_empty() {
+            validate_query_scope(&mut arguments, pin)?;
+        } else {
+            validate_allowlisted_query_scope(&mut arguments, pin)?;
+        }
     }
     if tool_name == "memory_write_page"
         && arguments.get("scope").and_then(serde_json::Value::as_str) == Some("global")
@@ -140,10 +165,135 @@ fn enforce_scope_policy(
             "global page writes are disabled by a pinned bridge",
         ));
     }
-    enforce_exact_argument(&mut arguments, "workspace", &pin.workspace)?;
-    enforce_exact_argument(&mut arguments, "project", &pin.project)?;
+    if !pin.read_projects.is_empty() && tool_name == "memory_query" {
+        // The query validator leaves or injects a complete allowlisted scope set.
+    } else if !pin.read_projects.is_empty() && tool_name == "memory_read_page" {
+        enforce_allowlisted_read_arguments(&mut arguments, pin)?;
+    } else {
+        enforce_exact_argument(&mut arguments, "workspace", &pin.workspace)?;
+        enforce_exact_argument(&mut arguments, "project", &pin.project)?;
+    }
     request.arguments = Some(arguments);
     Ok(request)
+}
+
+fn validate_allowlisted_query_scope(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+    pin: &ScopePin,
+) -> Result<(), McpError> {
+    if arguments.get("global").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(scope_error(
+            "global memory queries are disabled by an allowlisted bridge",
+        ));
+    }
+
+    if let Some(scopes) = arguments.get("scopes") {
+        if arguments
+            .get("workspace")
+            .is_some_and(|value| !value.is_null())
+            || arguments
+                .get("project")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(scope_error(
+                "memory_query scopes cannot be combined with workspace or project",
+            ));
+        }
+        let serde_json::Value::Array(scopes) = scopes else {
+            return Err(scope_error("memory_query scopes must be an array"));
+        };
+        if !scopes.is_empty() {
+            if !scopes
+                .iter()
+                .all(|scope| read_scope_value_allowed(scope, pin))
+            {
+                return Err(scope_error(
+                    "memory_query scopes are outside the bridge's read allowlist",
+                ));
+            }
+            arguments.remove("global");
+            return Ok(());
+        }
+        arguments.remove("scopes");
+    }
+
+    let has_workspace = arguments
+        .get("workspace")
+        .is_some_and(|value| !value.is_null());
+    let has_project = arguments
+        .get("project")
+        .is_some_and(|value| !value.is_null());
+    if has_workspace || has_project {
+        if !has_workspace || !has_project {
+            return Err(scope_error(
+                "workspace and project must be supplied together for an exact query",
+            ));
+        }
+        enforce_exact_argument(arguments, "workspace", &pin.workspace)?;
+        let project = arguments
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| scope_error("project must be a non-empty string"))?;
+        if !read_project_allowed(project, pin) {
+            return Err(scope_error(
+                "project is outside the bridge's read allowlist",
+            ));
+        }
+        arguments.remove("global");
+        return Ok(());
+    }
+
+    // A missing scope means current project plus the explicit shared/read
+    // projects. There is no workspace wildcard and no server-global query.
+    let scopes = std::iter::once(pin.project.as_str())
+        .chain(pin.read_projects.iter().map(String::as_str))
+        .map(|project| {
+            serde_json::json!({
+                "workspace": pin.workspace,
+                "project": project,
+            })
+        })
+        .collect();
+    arguments.insert("scopes".into(), serde_json::Value::Array(scopes));
+    arguments.remove("global");
+    Ok(())
+}
+
+fn read_scope_value_allowed(value: &serde_json::Value, pin: &ScopePin) -> bool {
+    let Some(scope) = value.as_object() else {
+        return false;
+    };
+    scope.len() == 2
+        && scope.get("workspace").and_then(serde_json::Value::as_str)
+            == Some(pin.workspace.as_str())
+        && scope
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|project| read_project_allowed(project, pin))
+}
+
+fn read_project_allowed(project: &str, pin: &ScopePin) -> bool {
+    project == pin.project || pin.read_projects.iter().any(|allowed| allowed == project)
+}
+
+fn enforce_allowlisted_read_arguments(
+    arguments: &mut serde_json::Map<String, serde_json::Value>,
+    pin: &ScopePin,
+) -> Result<(), McpError> {
+    enforce_exact_argument(arguments, "workspace", &pin.workspace)?;
+    match arguments.get("project") {
+        None | Some(serde_json::Value::Null) => {
+            arguments.insert(
+                "project".into(),
+                serde_json::Value::String(pin.project.clone()),
+            );
+            Ok(())
+        }
+        Some(serde_json::Value::String(project)) if read_project_allowed(project, pin) => Ok(()),
+        Some(_) => Err(scope_error(
+            "project is outside the bridge's read allowlist",
+        )),
+    }
 }
 
 fn validate_query_scope(
@@ -399,6 +549,7 @@ mod tests {
             workspace: workspace.map(str::to_string),
             project: project.map(str::to_string),
             require_scope_pin,
+            read_project: Vec::new(),
         }
     }
 
@@ -406,6 +557,15 @@ mod tests {
         ScopePolicy::Pinned(ScopePin {
             workspace: "personal".into(),
             project: "agent-system".into(),
+            read_projects: Vec::new(),
+        })
+    }
+
+    fn allowlisted_read_policy() -> ScopePolicy {
+        ScopePolicy::Pinned(ScopePin {
+            workspace: "rws".into(),
+            project: "current-repo".into(),
+            read_projects: vec!["rws-shared".into()],
         })
     }
 
@@ -440,6 +600,17 @@ mod tests {
             .unwrap(),
             pinned_policy()
         );
+
+        let mut args = bridge_args(Some("rws"), Some("current-repo"), true);
+        args.read_project = vec!["rws-shared".into()];
+        assert_eq!(
+            ScopePolicy::from_args(&args).unwrap(),
+            allowlisted_read_policy()
+        );
+
+        let mut unpinned = bridge_args(None, None, false);
+        unpinned.read_project = vec!["rws-shared".into()];
+        assert!(ScopePolicy::from_args(&unpinned).is_err());
     }
 
     #[test]
@@ -530,6 +701,114 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn allowlisted_read_bridge_defaults_queries_to_current_and_shared_projects() {
+        let request = enforce_scope_policy(
+            request_with_arguments("memory_query", serde_json::json!({"query": "routing"})),
+            &allowlisted_read_policy(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(request.arguments.unwrap()),
+            serde_json::json!({
+                "query": "routing",
+                "scopes": [
+                    {"workspace": "rws", "project": "current-repo"},
+                    {"workspace": "rws", "project": "rws-shared"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn allowlisted_read_bridge_accepts_only_named_query_scopes() {
+        let allowed = request_with_arguments(
+            "memory_query",
+            serde_json::json!({
+                "query": "routing",
+                "scopes": [
+                    {"workspace": "rws", "project": "current-repo"},
+                    {"workspace": "rws", "project": "rws-shared"}
+                ]
+            }),
+        );
+        assert!(enforce_scope_policy(allowed, &allowlisted_read_policy()).is_ok());
+
+        for arguments in [
+            serde_json::json!({
+                "query": "routing",
+                "scopes": [{"workspace": "personal", "project": "repo-a"}]
+            }),
+            serde_json::json!({
+                "query": "routing",
+                "global": true
+            }),
+            serde_json::json!({
+                "query": "routing",
+                "workspace": "rws",
+                "project": "unlisted-repo"
+            }),
+        ] {
+            assert!(
+                enforce_scope_policy(
+                    request_with_arguments("memory_query", arguments),
+                    &allowlisted_read_policy(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn allowlisted_read_bridge_allows_shared_page_reads_but_not_writes() {
+        let read = enforce_scope_policy(
+            request_with_arguments(
+                "memory_read_page",
+                serde_json::json!({
+                    "workspace": "rws",
+                    "project": "rws-shared",
+                    "path": "decisions/routing.md"
+                }),
+            ),
+            &allowlisted_read_policy(),
+        )
+        .unwrap();
+        assert_eq!(
+            read.arguments.unwrap().get("project"),
+            Some(&serde_json::Value::String("rws-shared".into()))
+        );
+
+        assert!(
+            enforce_scope_policy(
+                request_with_arguments(
+                    "memory_read_page",
+                    serde_json::json!({
+                        "workspace": "rws",
+                        "project": "unlisted-repo",
+                        "path": "decisions/routing.md"
+                    }),
+                ),
+                &allowlisted_read_policy(),
+            )
+            .is_err()
+        );
+        assert!(
+            enforce_scope_policy(
+                request_with_arguments(
+                    "memory_write_page",
+                    serde_json::json!({
+                        "workspace": "rws",
+                        "project": "rws-shared",
+                        "path": "decisions/routing.md",
+                        "body": "# Routing"
+                    }),
+                ),
+                &allowlisted_read_policy(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

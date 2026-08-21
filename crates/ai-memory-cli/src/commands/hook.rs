@@ -21,7 +21,7 @@ use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{CaptureDisposition, HookEvent, PolicyState};
 use ai_memory_llm::OidcToken;
 
-use crate::cli::HookArgs;
+use crate::cli::{HookArgs, HookDrainArgs};
 
 use sha2::{Digest as _, Sha256};
 
@@ -52,6 +52,10 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+const STATIC_AUTH_ENV: &str = "AI_MEMORY_HOOK_STATIC_AUTH";
+const REQUIRE_PINNED_SCOPE_ENV: &str = "AI_MEMORY_HOOK_REQUIRE_PINNED_SCOPE";
+const PINNED_WORKSPACE_ENV: &str = "AI_MEMORY_HOOK_WORKSPACE";
+const PINNED_PROJECT_ENV: &str = "AI_MEMORY_HOOK_PROJECT";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
@@ -122,8 +126,13 @@ fn should_incremental_drain(event: &str, spool_len: usize, threshold: usize) -> 
     event == "post-tool-use" && spool_len >= threshold
 }
 
-fn spawn_background_drainer(data_dir: &Path) -> std::io::Result<()> {
-    hook_drain_process::spawn(data_dir)
+fn spawn_background_drainer(
+    data_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    pool_id: Option<&str>,
+) -> std::io::Result<()> {
+    hook_drain_process::spawn(data_dir, server_url, auth_token, pool_id)
 }
 
 fn should_spawn_background_drainer(event: &str) -> bool {
@@ -303,18 +312,41 @@ fn after_background_drain_event_enqueue(
 }
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
-pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
+pub async fn run_drain(data_dir: Option<PathBuf>, args: HookDrainArgs) -> anyhow::Result<()> {
     let dd = resolve_data_dir(data_dir.as_deref());
     let spool = hook_spool::spool_dir(&dd);
-    match hook_spool::drain_until_quiescent(
-        &spool,
-        &dd,
-        background_drain_budget(),
-        drain_event_timeout(),
-        hook_spool::DrainLockWait::Bounded(Duration::from_secs(30)),
-    )
-    .await
-    {
+    let pool_id = args.pool_id.as_deref().map(str::trim);
+    if pool_id.is_some_and(|value| !safe_scope_component(value)) {
+        eprintln!("ai-memory hook-drain warning: invalid pool identity; spool was not drained");
+        return Ok(());
+    }
+    let result = if let Some(pool_id) = pool_id {
+        hook_spool::drain_until_quiescent_trusted_pool(
+            &spool,
+            &dd,
+            background_drain_budget(),
+            drain_event_timeout(),
+            hook_spool::DrainLockWait::Bounded(Duration::from_secs(30)),
+            hook_spool::TrustedPool {
+                server_url: &args.server_url,
+                static_bearer: args.auth_token.as_deref(),
+                pool_id,
+            },
+        )
+        .await
+    } else {
+        hook_spool::drain_until_quiescent_trusted(
+            &spool,
+            &dd,
+            background_drain_budget(),
+            drain_event_timeout(),
+            hook_spool::DrainLockWait::Bounded(Duration::from_secs(30)),
+            &args.server_url,
+            args.auth_token.as_deref(),
+        )
+        .await
+    };
+    match result {
         Ok(hook_spool::LockedDrainResult::Drained(_))
         | Ok(hook_spool::LockedDrainResult::LockBusy) => {}
         Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
@@ -324,6 +356,38 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
 
 fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+fn pinned_scope_query_suffix_with(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<Option<String>, &'static str> {
+    let required = lookup(REQUIRE_PINNED_SCOPE_ENV).as_deref() == Some("1");
+    let workspace = lookup(PINNED_WORKSPACE_ENV);
+    let project = lookup(PINNED_PROJECT_ENV);
+    if !required && workspace.is_none() && project.is_none() {
+        return Ok(None);
+    }
+    let (Some(workspace), Some(project)) = (workspace, project) else {
+        return Err("pinned hook scope is incomplete");
+    };
+    let workspace = workspace.trim();
+    let project = project.trim();
+    if !safe_scope_component(workspace) || !safe_scope_component(project) {
+        return Err("pinned hook scope contains an invalid workspace or project");
+    }
+    Ok(Some(format!(
+        "&workspace={}&project={}",
+        url_encode(workspace),
+        url_encode(project)
+    )))
+}
+
+fn safe_scope_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
@@ -410,13 +474,17 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     let mut payload = String::new();
     std::io::stdin().read_to_string(&mut payload).ok();
     let mut stdout = std::io::stdout();
-    run_with_payload(
-        data_dir,
-        args,
-        payload,
-        &mut stdout,
-        spawn_background_drainer,
-    )
+    let drain_server_url = args.server_url.clone();
+    let drain_auth_token = args.auth_token.clone();
+    let drain_pool_id = args.pool_id.clone();
+    run_with_payload(data_dir, args, payload, &mut stdout, move |path| {
+        spawn_background_drainer(
+            path,
+            &drain_server_url,
+            drain_auth_token.as_deref(),
+            drain_pool_id.as_deref(),
+        )
+    })
     .await
 }
 
@@ -526,11 +594,28 @@ where
         }
     }
 
-    let qs = cwd_query_suffix(
-        &args.agent,
-        &json,
-        args.project_strategy.and_then(|s| s.baked()),
-    );
+    let qs = match pinned_scope_query_suffix_with(env_lookup) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => cwd_query_suffix(
+            &args.agent,
+            &json,
+            args.project_strategy.and_then(|s| s.baked()),
+        ),
+        Err(message) => {
+            eprintln!("ai-memory hook warning: {message}; capture was skipped");
+            write_success_response(stdout, agent_kind, hook_event)?;
+            return Ok(());
+        }
+    };
+    let pool_id = match args.pool_id.as_deref().map(str::trim) {
+        Some(value) if safe_scope_component(value) => Some(value.to_owned()),
+        Some(_) => {
+            eprintln!("ai-memory hook warning: invalid pool identity; capture was skipped");
+            write_success_response(stdout, agent_kind, hook_event)?;
+            return Ok(());
+        }
+        None => None,
+    };
     let base = args.server_url.trim_end_matches('/');
     let dd = resolve_data_dir(data_dir.as_deref());
     let spool = hook_spool::spool_dir(&dd);
@@ -539,10 +624,12 @@ where
     let hook_qs = format!("{qs}{session_qs}{managed_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
-    // mode is decided without a round-trip: an explicit `--auth-token` is
-    // stored inline; otherwise a present OIDC token marks the event `oidc`
-    // (resolved + refreshed at drain time); otherwise anonymous.
-    let oidc_present = args.auth_token.is_none()
+    // mode is decided without a round-trip. Static bearer bytes remain only in
+    // this process and are supplied to drainers at runtime; OIDC is resolved +
+    // refreshed at drain time; otherwise the event is anonymous.
+    let static_auth =
+        args.auth_token.is_some() || env_lookup(STATIC_AUTH_ENV).as_deref() == Some("1");
+    let oidc_present = !static_auth
         && OidcToken::load(&dd.join("auth.json"))
             .ok()
             .flatten()
@@ -565,11 +652,12 @@ where
         "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
         args.event, args.agent, hook_qs, capture_qs
     );
-    let entry = hook_spool::entry_for(
+    let entry = hook_spool::entry_for_pool(
         event_url,
         payload.clone(),
-        args.auth_token.as_deref(),
+        static_auth.then_some("runtime-only"),
         oidc_present,
+        pool_id.as_deref(),
     );
     if hook_spool::enqueue(&spool, &entry).is_err() {
         eprintln!(
@@ -590,26 +678,61 @@ where
         hook_spool::spool_len(&spool),
         incremental_drain_threshold(),
     ) {
-        let _ = hook_spool::drain_exclusive(
-            &spool,
-            &dd,
-            INCREMENTAL_DRAIN_BUDGET,
-            INCREMENTAL_DRAIN_BUDGET,
-            hook_spool::DrainLockWait::NoWait,
-        )
-        .await;
+        if let Some(pool_id) = pool_id.as_deref() {
+            let _ = hook_spool::drain_exclusive_trusted_pool(
+                &spool,
+                &dd,
+                INCREMENTAL_DRAIN_BUDGET,
+                INCREMENTAL_DRAIN_BUDGET,
+                hook_spool::DrainLockWait::NoWait,
+                hook_spool::TrustedPool {
+                    server_url: &args.server_url,
+                    static_bearer: args.auth_token.as_deref(),
+                    pool_id,
+                },
+            )
+            .await;
+        } else {
+            let _ = hook_spool::drain_exclusive_trusted(
+                &spool,
+                &dd,
+                INCREMENTAL_DRAIN_BUDGET,
+                INCREMENTAL_DRAIN_BUDGET,
+                hook_spool::DrainLockWait::NoWait,
+                &args.server_url,
+                args.auth_token.as_deref(),
+            )
+            .await;
+        }
     }
 
     // session-start: drain any backlog (e.g. from a previous session that ended
     // abruptly), then fetch + inject the pending handoff for the resuming agent.
     if args.event == "session-start" {
-        let _ = hook_spool::drain_exclusive_within_budget(
-            &spool,
-            &dd,
-            start_drain_budget(),
-            drain_event_timeout(),
-        )
-        .await;
+        if let Some(pool_id) = pool_id.as_deref() {
+            let _ = hook_spool::drain_exclusive_within_budget_trusted_pool(
+                &spool,
+                &dd,
+                start_drain_budget(),
+                drain_event_timeout(),
+                hook_spool::TrustedPool {
+                    server_url: &args.server_url,
+                    static_bearer: args.auth_token.as_deref(),
+                    pool_id,
+                },
+            )
+            .await;
+        } else {
+            let _ = hook_spool::drain_exclusive_within_budget_trusted(
+                &spool,
+                &dd,
+                start_drain_budget(),
+                drain_event_timeout(),
+                &args.server_url,
+                args.auth_token.as_deref(),
+            )
+            .await;
+        }
         // Only fetch the handoff for agents that inject the session-start
         // hook's stdout as context. Grok ignores it, so fetching here would
         // consume the handoff server-side (the GET is destructive) and then
@@ -805,6 +928,7 @@ mod tests {
             agent: "devin".into(),
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
@@ -830,6 +954,37 @@ mod tests {
             .split('&')
             .filter_map(|part| part.split_once('='))
             .find_map(|(name, value)| (name == key).then_some(value))
+    }
+
+    #[test]
+    fn pinned_scope_env_is_complete_valid_and_fail_closed() {
+        let values = std::collections::HashMap::from([
+            (REQUIRE_PINNED_SCOPE_ENV, "1"),
+            (PINNED_WORKSPACE_ENV, "rws"),
+            (PINNED_PROJECT_ENV, "bridge-service"),
+        ]);
+        assert_eq!(
+            pinned_scope_query_suffix_with(|name| values.get(name).map(ToString::to_string))
+                .unwrap()
+                .as_deref(),
+            Some("&workspace=rws&project=bridge-service")
+        );
+
+        assert!(
+            pinned_scope_query_suffix_with(|name| {
+                (name == REQUIRE_PINNED_SCOPE_ENV).then(|| "1".to_string())
+            })
+            .is_err()
+        );
+        assert!(
+            pinned_scope_query_suffix_with(|name| match name {
+                REQUIRE_PINNED_SCOPE_ENV => Some("1".into()),
+                PINNED_WORKSPACE_ENV => Some("personal".into()),
+                PINNED_PROJECT_ENV => Some("../rws".into()),
+                _ => None,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1447,6 +1602,7 @@ mod tests {
             agent: "claude-code".into(),
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
@@ -1489,6 +1645,7 @@ mod tests {
                 agent: "claude-code".into(),
                 server_url: "http://127.0.0.1:1".into(),
                 auth_token: None,
+                pool_id: None,
                 project_strategy: None,
                 check_capture: false,
                 capture_assistant: false,
@@ -1530,6 +1687,7 @@ mod tests {
             agent: "claude-code".into(),
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
@@ -1557,6 +1715,7 @@ mod tests {
             agent: "devin".into(),
             server_url: "http://127.0.0.1:1".into(),
             auth_token: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
@@ -1898,6 +2057,7 @@ mod tests {
             agent: "kimi-code".into(),
             server_url: server_url.into(),
             auth_token: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
@@ -1910,6 +2070,7 @@ mod tests {
             agent: "kiro-cli".into(),
             server_url: server_url.into(),
             auth_token: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
@@ -1922,6 +2083,7 @@ mod tests {
             agent: "antigravity-cli".into(),
             server_url: server_url.into(),
             auth_token: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,

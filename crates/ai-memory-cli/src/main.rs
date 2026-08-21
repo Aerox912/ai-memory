@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // the bare path rather than loading the full config.
     let command = match command {
         Command::Hook(args) => return commands::hook::run(data_dir, args).await,
-        Command::HookDrain(_args) => return commands::hook::run_drain(data_dir).await,
+        Command::HookDrain(args) => return commands::hook::run_drain(data_dir, args).await,
         // Completions are pure text derived from the command tree. Emitting
         // them must not require a loadable config or an initialised data dir
         // (they are typically generated before `init`, or in a packaging
@@ -112,7 +112,9 @@ async fn main() -> Result<()> {
         // `Hook` is handled in the fast-path above (before config/tracing).
         Command::Hook(args) => commands::hook::run(Some(config.data_dir.clone()), args).await,
         // `HookDrain` is handled in the fast-path above (before config/tracing).
-        Command::HookDrain(_args) => commands::hook::run_drain(Some(config.data_dir.clone())).await,
+        Command::HookDrain(args) => {
+            commands::hook::run_drain(Some(config.data_dir.clone()), args).await
+        }
         Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
         Command::McpBridge(args) => commands::mcp_bridge::run(&config, args).await,
         Command::Commit(args) => commands::commit::run(&config, args).await,

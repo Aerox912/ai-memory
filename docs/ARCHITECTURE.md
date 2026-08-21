@@ -417,10 +417,27 @@ Installer-owned wrappers can add `--require-scope-pin`, `--workspace <name>`,
 and `--project <name>`. A pinned bridge injects that exact pair into every
 supported memory call, permits only exact matches, rejects global and
 cross-project queries or writes, and fails closed for unscoped or unknown
-tools. The bearer token remains an environment input and must not be rendered
-into tracked MCP configuration. Built-in `install-mcp --session-aware`
-registration remains a Claude Code option; multi-client deployment wrappers
-own their own registration and verified project selection.
+tools. Repeated `--read-project <name>` flags form a narrow read-only allowlist
+inside the pinned workspace: an unscoped query is rewritten to the current
+project plus those named projects, and `memory_read_page` may read them, while
+writes and every other tool remain pinned to the current project. No workspace
+wildcard or server-global query is introduced.
+
+The bearer token remains an environment input for the generic bridge and must
+not be rendered into tracked MCP configuration. Automatic multi-pool
+deployments should instead put each token in a one-pool local ingress/drainer
+and submit non-secret hook envelopes to it. Hook spool files never serialize a
+static bearer. A deployment can also set `--pool-id`: the identity is persisted
+with each event, and a pool-bound drainer leaves mismatched entries queued
+without a network request or retry charge. Production drains rebind every
+queued URL to the server selected by the token-owning ingress before attaching
+runtime authentication. Detached drainers scrub inherited ai-memory auth,
+server, data, pool, and scope variables before setting their one runtime token.
+Legacy spool files that contain a `token` field are deleted locally. The parent
+deployment must keep the ingress destination and pool identity immutable to
+tokenless hook callers. Built-in `install-mcp --session-aware` registration
+remains a Claude Code option; multi-client deployment wrappers own their own
+registration and verified project selection.
 
 ## CLI subcommand surface
 
