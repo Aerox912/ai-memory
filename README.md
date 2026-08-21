@@ -522,8 +522,17 @@ implicit-resume limitations.
 The same bridge can serve stdio-only Codex or Antigravity clients without a
 Claude session id. Deployment wrappers that already resolved a repository can
 run it with `--require-scope-pin --workspace <name> --project <name>` so every
-memory call is constrained to that exact scope. Keep bearer tokens in
-`AI_MEMORY_AUTH_TOKEN`; do not place them in tracked MCP configuration.
+memory call is constrained to that exact scope. Add `--tool-profile recall`
+for read-only clients or `--tool-profile session` for recall plus scoped page
+writes, feedback, and handoffs. Both discovery and direct calls are filtered;
+maintenance, deletion, self-routing, and automatic-improvement tools stay
+hidden in these restricted profiles. `full` preserves the upstream surface.
+
+Keep bearer tokens out of tracked MCP configuration. Generic installs can use
+`AI_MEMORY_AUTH_TOKEN`; process supervisors and secret-store wrappers can use
+`AI_MEMORY_AUTH_TOKEN_FILE` with a file or pipe path instead. Servers can also
+load the multi-user token pepper from `AI_MEMORY_TOKEN_PEPPER_FILE`. Direct and
+file-backed bearer inputs together are rejected as ambiguous.
 
 The `install-mcp` / `install-hooks` commands use
 `AI_MEMORY_SERVER_URL` / `AI_MEMORY_AUTH_TOKEN` when set; otherwise

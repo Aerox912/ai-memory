@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add `recall` and `session` MCP bridge tool profiles that filter both tool
+  discovery and direct calls while retaining `full` as the compatibility
+  default. (#2)
+
+### Security
+- Allow managed services and hooks to load bearer tokens and the multi-user
+  token pepper from bounded file or pipe inputs. Detached hook drainers now
+  transfer runtime bearer material over anonymous stdin instead of argv or
+  environment. (#2)
+
 ## [1.29.1-aerox.2] - 2026-08-21
 
 ### Added
