@@ -187,7 +187,7 @@ fn docker_context_excludes_operator_deployment_files() {
 }
 
 #[test]
-fn docker_publish_jobs_use_prebuilt_binaries() {
+fn docker_sources_stay_supported_while_releases_target_managed_hosts() {
     let dockerfile = read_repo("docker/Dockerfile");
     assert!(dockerfile.contains("FROM runtime-base AS runtime-prebuilt-amd64"));
     assert!(dockerfile.contains("FROM runtime-base AS runtime-prebuilt-arm64"));
@@ -196,12 +196,22 @@ fn docker_publish_jobs_use_prebuilt_binaries() {
 
     let release = read_repo(".github/workflows/release.yml");
     assert!(release.contains("artifact: ai-memory-linux-x86_64"));
-    assert!(release.contains("artifact: ai-memory-linux-aarch64"));
-    assert!(release.contains("artifact: ai-memory-macos-aarch64"));
-    assert!(release.contains("artifact: ai-memory-macos-x86_64"));
-    assert!(release.contains("needs: [binary, docker-manifest, macos, windows, validate-version]"));
-    assert!(release.contains("target: runtime-prebuilt-amd64"));
-    assert!(release.contains("target: runtime-prebuilt-arm64"));
+    assert!(release.contains("ai-memory-windows-x86_64"));
+    assert!(release.contains("needs: [binary, windows, validate-version]"));
+    for omitted in [
+        "artifact: ai-memory-linux-aarch64",
+        "artifact: ai-memory-macos-aarch64",
+        "artifact: ai-memory-macos-x86_64",
+        "\n  docker-amd64:",
+        "\n  docker-arm64:",
+        "\n  docker-manifest:",
+        "\n  aur:",
+    ] {
+        assert!(
+            !release.contains(omitted),
+            "workstation release must omit {omitted}"
+        );
+    }
 
     let ci = read_repo(".github/workflows/ci.yml");
     assert!(ci.contains("ci-ai-memory-${{ matrix.artifact }}"));
@@ -219,13 +229,11 @@ fn prerelease_tags_do_not_replace_stable_release_channels() {
 
     assert!(release.contains("prerelease: ${{ steps.version.outputs.prerelease }}"));
     assert!(release.contains("if [[ \"$tag_version\" == *-* ]]"));
-    assert!(
-        release
-            .contains("tag_args=(-t \"${image}:${{ needs.validate-version.outputs.version }}\")")
-    );
     assert!(release.contains("release_flags=(--prerelease)"));
     assert!(release.contains("release_flags=(--latest)"));
-    assert!(release.contains("needs.validate-version.outputs.prerelease == 'false'"));
+    assert!(!release.contains("CONTAINER_IMAGE"));
+    assert!(!release.contains("\n  docker-manifest:"));
+    assert!(!release.contains("\n  aur:"));
 }
 
 #[cfg(unix)]
@@ -459,7 +467,7 @@ fn github_actions_are_pinned_to_full_commits() {
 fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
     for (path, expected_fixed_jobs) in [
         (".github/workflows/ci.yml", 1),
-        (".github/workflows/release.yml", 3),
+        (".github/workflows/release.yml", 2),
     ] {
         let workflow = read_repo(path);
         let lines = workflow.lines().collect::<Vec<_>>();
@@ -1640,7 +1648,7 @@ fn custom_data_dir_makes_thin_commands_touch_host_files() {
 }
 
 #[test]
-fn macos_docs_use_valid_install_commands_and_release_body_points_to_them() {
+fn macos_docs_use_valid_install_commands() {
     let docs = read_repo("docs/macos.md");
     assert!(docs.contains("install-hooks --agent claude-code --apply"));
     assert!(docs.contains("install-mcp --client claude-code --apply"));
@@ -1654,7 +1662,4 @@ fn macos_docs_use_valid_install_commands_and_release_body_points_to_them() {
     );
     assert!(docs.contains("Host-side agent config should use"));
     assert!(docs.contains("Tagged releases publish a multi-arch manifest"));
-
-    let release = read_repo(".github/workflows/release.yml");
-    assert!(release.contains("follow the bundled docs/macos.md"));
 }
