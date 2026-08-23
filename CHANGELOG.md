@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.29.1-aerox.4] - 2026-08-24
+
+### Changed
+- Fork releases now publish only the native Linux x86_64 bundle used by WSL
+  and the native Windows x86_64 bundle, while retaining smoke tests, checksums,
+  SBOM generation, and provenance attestations. Unused macOS, ARM Linux,
+  container, and AUR publication jobs were removed. (#3)
+
 ## [1.29.1-aerox.3] - 2026-08-21
 
 ### Added
@@ -3508,7 +3516,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.3...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.4...HEAD
+[1.29.1-aerox.4]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.3...v1.29.1-aerox.4
 [1.29.1-aerox.3]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.2...v1.29.1-aerox.3
 [1.29.1-aerox.2]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.1...v1.29.1-aerox.2
 [1.29.1-aerox.1]: https://github.com/Aerox912/ai-memory/compare/805fa4b17d575dadcd9cc9064aad42975e59e04e...v1.29.1-aerox.1
