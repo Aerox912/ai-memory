@@ -708,12 +708,23 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 `Authorization` + `Content-Type` headers, and credentials, with a
 10-minute preflight cache.
 
-## 10. Known gaps (planned iterations, not blockers)
+## 10. Known gaps and deliberate non-goals
 
-- **Write surface.** Browsers can't mutate today (notes, consolidate,
-  lint, purge — all live under `/admin/*` for the CLI or under MCP
-  tools for agents). A thin authenticated write surface ("edit this
-  page" from the browser) is a deliberate v2 conversation.
+- **No write surface, by design — not a pending iteration.** Browsers
+  can't mutate, and won't. The wiki is a record of what a project
+  produced, authored by automated summarisation over captured
+  observations; retrieval, provenance and the audit trail all rest on
+  nobody having gone back and adjusted it. Hand-editing a page stops it
+  answering "what did this project produce" and starts it answering
+  "what did someone want it to say", with no way to tell the two apart
+  afterwards.
+
+  This is not a ban on human input. `memory_write_page` exists for
+  durable human annotations and lands them in the same lineage as
+  everything else (pages supersede on body change). The line is between
+  adding to the record through the normal path and editing it from
+  outside. A human-editable wiki is a reasonable thing to want and a
+  separate product — see #482.
 - **Rate limiting** is shared with `/mcp` + `/admin` (only the body
   cap is enforced today). A future global limiter would tighten the
   authenticated-misbehaviour case.

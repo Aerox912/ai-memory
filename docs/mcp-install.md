@@ -799,6 +799,36 @@ rejects root-level `anyOf`/`oneOf`/`allOf` combinators — including the
 with flat schemas; every other client keeps receiving the upstream schemas
 unchanged.
 
+> **Do not register ai-memory with Kimi's own `mcp add`.** Kimi Code's
+> documented command —
+>
+> ```bash
+> kimi mcp add --transport http ai-memory http://127.0.0.1:49374/mcp
+> ```
+>
+> writes the plain URL, with no `?flavor=moonshot`. The server then serves
+> the upstream schemas, Moonshot rejects `memory_read_page`'s root-level
+> `anyOf`, and **every model turn fails with a 400** — including turns that
+> use no tools at all, because tool schemas ship with each request. Use
+> `ai-memory install-mcp --client kimi-code --apply` instead, which writes
+> the flavored URL for you.
+>
+> The failure is unusually hard to attribute: `kimi mcp test ai-memory`
+> **passes**, because it only lists tools and never sends them upstream. The
+> server looks healthy while every real turn dies.
+>
+> Already registered that way? Either re-run `install-mcp` as above, or set
+> the server-side floor and leave the client entry alone:
+>
+> ```bash
+> AI_MEMORY_STRIP_ROOT_COMBINATORS=true   # or `strip_root_combinators = true`
+> ```
+>
+> That serves the restricted dialect on every `tools/list` regardless of the
+> `?flavor=` marker, so any strict client that skips the marker is covered —
+> not just Kimi. A request's marker can only raise the dialect further, never
+> lower it. Reported in #474.
+
 **Config file (hooks):** `~/.kimi-code/config.toml` (same `$KIMI_CODE_HOME`
 base). Kimi Code stores hooks as `[[hooks]]` array entries in the same TOML
 file that holds its provider/model settings; `install-hooks` merges
@@ -1089,6 +1119,71 @@ ignored `~/.pi/agent/mcp.json`.
 
 OMP / Oh My Pi remains separate: use `--client omp` / `--agent omp` (or
 `oh-my-pi`) for `.omp` paths.
+
+---
+
+## Schema dialects for strict upstreams
+
+Some model APIs validate MCP tool parameter schemas against a narrower dialect
+than JSON Schema and reject the whole `tools/list` with a 400. ai-memory can
+serve a relaxed dialect per request, via a `?flavor=` query on the MCP URL, or
+server-wide via config for clients that cannot carry one. Runtime argument
+validation is identical in every dialect — only the advertised schema changes.
+
+| Marker | Config key | What it changes | Who needs it |
+| --- | --- | --- | --- |
+| `?flavor=moonshot` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kimi Code (Moonshot); appended by `install-mcp` |
+| `?flavor=bedrock` | `strip_root_combinators` | Same as above | Kiro CLI (Bedrock); appended by `install-mcp` |
+| `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | The above, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
+
+The Gemini dialect exists because `schemars` renders every optional tool
+argument as a nullable union:
+
+```json
+"max_proposals": {
+  "description": "Override the maximum validated proposal count for this run.",
+  "type": ["integer", "null"], "format": "uint", "minimum": 0
+}
+```
+
+Google's `Schema` (Vertex/Gemini `functionDeclaration.parameters`) takes one
+`type` and treats `any_of` as exclusive with every sibling key, so a converter
+that forwards this untouched produces `any_of` with `description` next to it and
+Vertex refuses the request:
+
+```
+Unable to submit request because `ai-memory_memory_auto_improve` functionDeclaration
+`parameters.max_proposals` schema specified other fields alongside any_of.
+When using any_of, it must be the only field set.
+```
+
+The dialect collapses it to `"type": "integer"` plus `nullable: true` — the same
+normalization Gemini CLI performs client-side, which is why Gemini CLI and
+Antigravity CLI work on Vertex without any marker and do not need this. Reach
+for it when a pass-through client fails at `tools/list` with that error.
+
+`install-mcp` does not append `?flavor=gemini` for any client: OpenCode is
+provider-agnostic, so the right lever there is the server-side key.
+
+```bash
+# server-wide, for clients that cannot carry a query marker
+AI_MEMORY_GEMINI_SAFE_SCHEMAS=true ai-memory serve
+# or `gemini_safe_schemas = true` in config.toml
+
+# or per client, by hand in its MCP config
+#   "url": "http://homelab:49374/mcp?flavor=gemini"
+```
+
+Confirm which dialect a request gets by inspecting `tools/list` directly:
+
+```bash
+curl -s 'http://127.0.0.1:49374/mcp?flavor=gemini' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  | jq '.result.tools[] | select(.name=="memory_auto_improve")
+        | .inputSchema.properties.max_proposals'
+```
 
 ---
 

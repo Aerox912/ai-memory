@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use ai_memory_core::{
     NewPage, Observation, ObservationKind, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    looks_like_scaffolding,
 };
 use jiff::tz::TimeZone;
 
@@ -28,8 +29,23 @@ pub fn synthesize_session_page(
     session_id: SessionId,
     observations: &[Observation],
 ) -> NewPage {
-    let title = derive_title(observations);
-    let body = render_body(session_id, observations, &title);
+    // One tally for the whole page: the body renderer and the summary builder
+    // describe the same session and must not scan it twice to do so.
+    let tally = tally_session(observations);
+    let title = derive_title(observations, session_id);
+    let body = render_body(session_id, observations, &title, &tally);
+    let mut frontmatter_json = serde_json::json!({
+        "title": title,
+        "session_id": session_id.to_string(),
+        "tier": "episodic",
+    });
+    let summary = session_summary(&tally);
+    if !summary.is_empty() {
+        // Insert only when there is something to say. The store's hit
+        // descriptor prefers `summary` over the body, so writing a blank one
+        // would trade real body text for nothing.
+        frontmatter_json["summary"] = serde_json::Value::String(summary);
+    }
     let path = PagePath::new(format!("sessions/{session_id}.md"))
         .expect("hard-coded sessions/<uuid>.md is always valid");
     NewPage {
@@ -39,11 +55,7 @@ pub fn synthesize_session_page(
         title: title.clone(),
         body,
         tier: Tier::Episodic,
-        frontmatter_json: serde_json::json!({
-            "title": title,
-            "session_id": session_id.to_string(),
-            "tier": "episodic",
-        }),
+        frontmatter_json,
         pinned: false,
         links: Vec::new(),
         author_id: None,
@@ -52,31 +64,96 @@ pub fn synthesize_session_page(
     }
 }
 
-fn derive_title(observations: &[Observation]) -> String {
+/// Title for a synthesised session page.
+///
+/// Prefers the first user prompt that reads as something a person wrote.
+/// A prompt payload is whatever the harness put there, so IDE context
+/// blocks and an echoed shell prompt can arrive in the same field (#484) —
+/// those are skipped rather than becoming the title the page is indexed and
+/// displayed under.
+///
+/// A `SessionStart` is skipped as a source outright. `best_title_hint`
+/// fills its title from `model` before `title` (`payload.rs`), so a bare
+/// model id became the page title whenever the prompts were unusable — and
+/// by the time it is a string it is indistinguishable from a terse human
+/// reference like `pr-477`, so it is excluded here by kind instead.
+///
+/// The skipped field is `["model", "title"]`, so this drops more than a
+/// model id: OpenCode's `session.created` puts `info.title` in the same
+/// slot. Its plugin subscribes to `created`/`idle`/`deleted`/`compacted`
+/// and never `session.updated`, and starts a session once per id, so the
+/// only value that can arrive is the creation-time name — in practice the
+/// shared literal "New session", never a rename. **That last part is an
+/// assumption about an external component, not an invariant:** it is read
+/// off OpenCode's subscription list as of v1.32.1, and if a future release
+/// surfaces a renamed session here, this would discard a good title with
+/// nothing in the tree failing. What a `SessionStart` carries is whatever
+/// the harness *named the session*, and no harness names it with something
+/// a person typed.
+///
+/// Falls through in decreasing order of confidence: a usable prompt, then
+/// any other usable observation title, then the session's own path. The
+/// literal "session" remains only for the case where there is nothing else
+/// at all.
+fn derive_title(observations: &[Observation], session_id: SessionId) -> String {
     for obs in observations {
-        if obs.kind == ObservationKind::UserPrompt && !obs.title.is_empty() {
+        if obs.kind == ObservationKind::UserPrompt
+            && !obs.title.is_empty()
+            && !looks_like_scaffolding(&obs.title)
+        {
             return obs.title.clone();
         }
     }
     for obs in observations {
-        if !obs.title.is_empty() {
+        if obs.kind == ObservationKind::SessionStart {
+            continue;
+        }
+        if !obs.title.is_empty() && !looks_like_scaffolding(&obs.title) {
             return obs.title.clone();
         }
     }
-    "session".to_string()
+    // Every candidate was scaffolding. The page still needs a title, and its
+    // own identity is more use to a reader than the word "session" repeated
+    // across every such page.
+    if observations.is_empty() {
+        return "session".to_string();
+    }
+    format!("Session {session_id}")
 }
 
-fn render_body(session_id: SessionId, observations: &[Observation], title: &str) -> String {
-    let mut tool_counts: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut prompts: Vec<&Observation> = Vec::new();
-    let mut start: Option<&Observation> = None;
-    let mut end: Option<&Observation> = None;
+/// The per-session counts that both the rendered body and the frontmatter
+/// summary are built from.
+struct SessionTally<'a> {
+    /// Completed calls per tool name, keyed for stable ordering.
+    tool_counts: BTreeMap<&'a str, usize>,
+    /// User prompts in arrival order.
+    prompts: Vec<&'a Observation>,
+    /// First `SessionStart`, if the session recorded one.
+    start: Option<&'a Observation>,
+    /// Last `SessionEnd`, if the session recorded one.
+    end: Option<&'a Observation>,
+}
 
+/// Tally a session's observations once.
+///
+/// [`render_body`] and [`session_summary`] both need these counts, and
+/// [`synthesize_session_page`] computes them once and lends them to both — so
+/// a page costs one pass over its observations, not two, and the body and the
+/// summary cannot describe the same session differently. It also keeps the
+/// summary from having to parse the counts back out of the markdown the body
+/// just rendered them into.
+fn tally_session(observations: &[Observation]) -> SessionTally<'_> {
+    let mut tally = SessionTally {
+        tool_counts: BTreeMap::new(),
+        prompts: Vec::new(),
+        start: None,
+        end: None,
+    };
     for obs in observations {
         match obs.kind {
-            ObservationKind::SessionStart => start = Some(obs),
-            ObservationKind::SessionEnd => end = Some(obs),
-            ObservationKind::UserPrompt => prompts.push(obs),
+            ObservationKind::SessionStart => tally.start = Some(obs),
+            ObservationKind::SessionEnd => tally.end = Some(obs),
+            ObservationKind::UserPrompt => tally.prompts.push(obs),
             // Count only PostToolUse — each tool call produces both a
             // PreToolUse and a PostToolUse observation, so counting both
             // doubles every reported number ("Bash: 4" for two real calls).
@@ -84,11 +161,129 @@ fn render_body(session_id: SessionId, observations: &[Observation], title: &str)
             // that never produced a post (cancellations) are intentionally
             // excluded.
             ObservationKind::PostToolUse if !obs.title.is_empty() => {
-                *tool_counts.entry(obs.title.as_str()).or_insert(0) += 1;
+                *tally.tool_counts.entry(obs.title.as_str()).or_insert(0) += 1;
             }
             _ => {}
         }
     }
+    tally
+}
+
+/// How many tools to name individually before summarising the rest as a count.
+const SUMMARY_MAX_NAMED_TOOLS: usize = 3;
+
+/// One line of plain prose describing what the session did, or empty when it
+/// did nothing worth stating.
+///
+/// This lands in `frontmatter.summary`, which the store prefers over the body
+/// when building the descriptor for a non-FTS hit. It is **not** used
+/// verbatim: the reader runs it through the same line filter it applies to a
+/// body, which drops headings, `- **key:** value` metadata bullets, and any
+/// line that merely repeats the title. When every line is dropped the filter
+/// falls back to echoing its raw input, so a summary written in the same house
+/// style as the metadata block above would be reproduced verbatim as the
+/// descriptor — displacing the body text that would otherwise have been used,
+/// silently and with no error anywhere.
+///
+/// Hence: one line, plain prose, no leading marker.
+fn session_summary(tally: &SessionTally<'_>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if !tally.prompts.is_empty() {
+        parts.push(format!(
+            "{} prompt{}",
+            tally.prompts.len(),
+            plural(tally.prompts.len())
+        ));
+    }
+
+    let calls: usize = tally.tool_counts.values().sum();
+    if calls > 0 {
+        // Name the busiest tools first; ties fall back to the map's
+        // alphabetical order so the same session always renders the same way.
+        let mut by_calls: Vec<(&str, usize)> =
+            tally.tool_counts.iter().map(|(k, v)| (*k, *v)).collect();
+        by_calls.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let named: Vec<&str> = by_calls
+            .iter()
+            .take(SUMMARY_MAX_NAMED_TOOLS)
+            .map(|(name, _)| *name)
+            .collect();
+        let tools = if by_calls.len() > SUMMARY_MAX_NAMED_TOOLS {
+            format!(
+                "{} and {} more",
+                join_and(&named),
+                by_calls.len() - SUMMARY_MAX_NAMED_TOOLS
+            )
+        } else {
+            join_and(&named)
+        };
+        parts.push(format!(
+            "{calls} completed tool call{} across {tools}",
+            plural(calls)
+        ));
+    }
+
+    if let (Some(start), Some(end)) = (tally.start, tally.end)
+        && let Some(spent) =
+            format_duration(end.created_at.as_second() - start.created_at.as_second())
+    {
+        parts.push(format!("over {spent}"));
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("{}.", parts.join(", "))
+}
+
+/// `""` or `"s"` for a count.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// `"Bash"`, `"Bash and Edit"`, `"Bash, Edit and Read"`.
+fn join_and(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Human-readable elapsed time, or `None` when the session was not measurably
+/// long (a clock that did not advance, or ran backwards).
+fn format_duration(seconds: i64) -> Option<String> {
+    if seconds <= 0 {
+        return None;
+    }
+    if seconds < 60 {
+        return Some(format!("{seconds}s"));
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return Some(format!("{minutes}m"));
+    }
+    let (hours, rest) = (minutes / 60, minutes % 60);
+    Some(if rest == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {rest}m")
+    })
+}
+
+fn render_body(
+    session_id: SessionId,
+    observations: &[Observation],
+    title: &str,
+    tally: &SessionTally<'_>,
+) -> String {
+    let SessionTally {
+        tool_counts,
+        prompts,
+        start,
+        end,
+    } = tally;
 
     let mut buf = String::with_capacity(2048);
     buf.push_str(&format!("# {title}\n\n"));
@@ -113,7 +308,7 @@ fn render_body(session_id: SessionId, observations: &[Observation], title: &str)
 
     if !tool_counts.is_empty() {
         buf.push_str("## Tool calls\n\n");
-        for (name, count) in &tool_counts {
+        for (name, count) in tool_counts {
             buf.push_str(&format!("- `{name}`: {count}\n"));
         }
         buf.push('\n');
@@ -174,6 +369,12 @@ fn human_ts(ts: &jiff::Timestamp) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One id per call is fine: assertions here never depend on its value,
+    /// only on whether the fallback path was taken at all.
+    fn test_session_id() -> SessionId {
+        SessionId::new()
+    }
     use ai_memory_core::{ObservationId, SessionId};
     use jiff::Timestamp;
 
@@ -193,19 +394,312 @@ mod tests {
         }
     }
 
+    fn obs_at(kind: ObservationKind, title: &str, at: &str) -> Observation {
+        let mut o = obs(kind, title);
+        o.created_at = at.parse::<Timestamp>().expect("fixture timestamp");
+        o
+    }
+
+    #[test]
+    fn the_summary_states_the_shape_of_the_session() {
+        let observations = vec![
+            obs_at(
+                ObservationKind::SessionStart,
+                "session",
+                "2026-08-24T10:00:00Z",
+            ),
+            obs(ObservationKind::UserPrompt, "bound the scheduler queue"),
+            obs(ObservationKind::UserPrompt, "make the test deterministic"),
+            // Pre+Post pairs: three completed calls, not six.
+            obs(ObservationKind::PreToolUse, "Bash"),
+            obs(ObservationKind::PostToolUse, "Bash"),
+            obs(ObservationKind::PreToolUse, "Bash"),
+            obs(ObservationKind::PostToolUse, "Bash"),
+            obs(ObservationKind::PreToolUse, "Edit"),
+            obs(ObservationKind::PostToolUse, "Edit"),
+            obs_at(
+                ObservationKind::SessionEnd,
+                "session",
+                "2026-08-24T10:18:00Z",
+            ),
+        ];
+        assert_eq!(
+            session_summary(&tally_session(&observations)),
+            "2 prompts, 3 completed tool calls across Bash and Edit, over 18m."
+        );
+    }
+
+    #[test]
+    fn the_summary_is_shaped_so_the_reader_does_not_drop_it() {
+        // The store prefers `summary` over the body and then runs it through
+        // the same line filter it applies to a body: headings, `- **key:**
+        // value` metadata bullets, and lines repeating the title are all
+        // dropped, and when nothing survives it echoes its raw input. A
+        // summary shaped like the metadata block this very module renders
+        // would therefore be reproduced verbatim as the descriptor, in place
+        // of body text that would have been usable. Assert the shape that
+        // keeps that from happening.
+        let observations = vec![
+            obs_at(
+                ObservationKind::SessionStart,
+                "session",
+                "2026-08-24T10:00:00Z",
+            ),
+            obs(ObservationKind::UserPrompt, "bound the scheduler queue"),
+            obs(ObservationKind::PostToolUse, "Bash"),
+            obs_at(
+                ObservationKind::SessionEnd,
+                "session",
+                "2026-08-24T10:05:00Z",
+            ),
+        ];
+        let summary = session_summary(&tally_session(&observations));
+
+        assert!(!summary.contains('\n'), "must stay one line: {summary:?}");
+        assert!(
+            !summary.starts_with('#')
+                && !summary.starts_with("---")
+                && !summary.starts_with("___")
+                && !summary.starts_with("***"),
+            "must not read as a structural line: {summary:?}"
+        );
+        assert!(
+            !(summary.starts_with("- **") && summary.contains(":**")),
+            "must not read as a metadata bullet: {summary:?}"
+        );
+        assert!(
+            !summary.starts_with("- ") && !summary.starts_with("* ") && !summary.starts_with("+ "),
+            "must not open with a list marker: {summary:?}"
+        );
+        assert_ne!(
+            summary,
+            derive_title(&observations, test_session_id()),
+            "a summary equal to the title is dropped as a repeat"
+        );
+    }
+
+    #[test]
+    fn a_session_with_nothing_to_report_gets_no_summary() {
+        // An empty summary must stay out of the frontmatter entirely: a blank
+        // one still wins the store's COALESCE and would cost the page its
+        // body-derived descriptor.
+        // Fixed, equal timestamps: `obs` stamps `Timestamp::now()`, so two
+        // calls straddling a second boundary would make this a session that
+        // lasted `1s` and give it a summary after all.
+        let lifecycle_only = vec![
+            obs_at(
+                ObservationKind::SessionStart,
+                "session-start",
+                "2026-08-24T10:00:00Z",
+            ),
+            obs_at(
+                ObservationKind::SessionEnd,
+                "session-end",
+                "2026-08-24T10:00:00Z",
+            ),
+        ];
+        assert_eq!(session_summary(&tally_session(&lifecycle_only)), "");
+
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            &lifecycle_only,
+        );
+        assert!(page.frontmatter_json.get("summary").is_none());
+    }
+
+    #[test]
+    fn the_synthesised_page_carries_the_summary() {
+        let observations = vec![
+            obs_at(
+                ObservationKind::SessionStart,
+                "session",
+                "2026-08-24T10:00:00Z",
+            ),
+            obs(ObservationKind::UserPrompt, "bound the scheduler queue"),
+            obs(ObservationKind::PostToolUse, "Bash"),
+            obs_at(
+                ObservationKind::SessionEnd,
+                "session",
+                "2026-08-24T10:05:00Z",
+            ),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            &observations,
+        );
+        assert_eq!(
+            page.frontmatter_json["summary"],
+            serde_json::json!("1 prompt, 1 completed tool call across Bash, over 5m.")
+        );
+    }
+
+    #[test]
+    fn many_tools_are_named_by_volume_then_counted() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [
+            ("Bash", 5),
+            ("Edit", 4),
+            ("Read", 3),
+            ("Grep", 2),
+            ("Glob", 1),
+        ] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        assert_eq!(
+            session_summary(&tally_session(&observations)),
+            "1 prompt, 15 completed tool calls across Bash, Edit and Read and 2 more."
+        );
+    }
+
+    /// The #484 defect: the three classes measured across a live corpus must
+    /// not become titles, and the page must still get a usable one.
+    #[test]
+    fn harness_scaffolding_does_not_become_the_title() {
+        for scaffold in [
+            "<ide_opened_file>The user opened the file /home/samir/x/main.rs",
+            "\u{250c}\u{2500}[samir@samirb3 12:56:36] ~/x/ai-usagebar",
+        ] {
+            let candidates = vec![
+                obs(ObservationKind::UserPrompt, scaffold),
+                obs(
+                    ObservationKind::UserPrompt,
+                    "Make the backpressure test deterministic",
+                ),
+            ];
+            assert_eq!(
+                derive_title(&candidates, test_session_id()),
+                "Make the backpressure test deterministic",
+                "{scaffold:?} must be skipped in favour of the next real prompt"
+            );
+        }
+    }
+
+    /// Every candidate is scaffolding. The page still needs a title, and
+    /// "session" repeated across every such page is not one.
+    #[test]
+    fn an_all_scaffolding_session_falls_back_to_its_identity() {
+        let sid = test_session_id();
+        // The model id arrives on the `SessionStart`, which is where
+        // `best_title_hint` puts the harness's `model` field — not as a
+        // prompt somebody typed.
+        let candidates = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, "<ide_opened_file>x"),
+        ];
+        let title = derive_title(&candidates, sid);
+        assert_eq!(title, format!("Session {sid}"));
+        assert_ne!(title, "session", "must not collapse to a shared literal");
+    }
+
+    /// The shape measured in production on 2026-08-21: a 17-observation
+    /// session whose `UserPrompt` carried an **empty** title, so the fallback
+    /// loop reached the `SessionStart` and the harness's model id became the
+    /// page title. The prompt was never scaffolding — it was absent, which is
+    /// why no filter on the string could have caught this.
+    #[test]
+    fn a_model_id_on_session_start_never_becomes_the_title() {
+        let sid = test_session_id();
+        let with_a_later_title = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+            obs(ObservationKind::PostToolUse, "tool non-file"),
+        ];
+        assert_eq!(derive_title(&with_a_later_title, sid), "tool non-file");
+
+        let nothing_else = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+        ];
+        assert_eq!(
+            derive_title(&nothing_else, sid),
+            format!("Session {sid}"),
+            "the session's identity, never the model it ran on"
+        );
+    }
+
+    /// Skipping the kind also excludes what the router writes when a harness
+    /// sends neither `model` nor `title`: `title_hint.unwrap_or(kind)`, i.e.
+    /// the literal "session-start". The shape predicate never caught that,
+    /// and it is a string every such page would share.
+    #[test]
+    fn the_routers_default_session_start_title_is_not_a_page_title() {
+        let sid = test_session_id();
+        for stored in ["session-start", "New session"] {
+            let candidates = vec![
+                obs(ObservationKind::SessionStart, stored),
+                obs(ObservationKind::UserPrompt, ""),
+            ];
+            assert_eq!(
+                derive_title(&candidates, sid),
+                format!("Session {sid}"),
+                "{stored:?} is what the harness named the session, not a title"
+            );
+        }
+    }
+
+    /// The cost of the rule this replaces: a terse reference is the same
+    /// string shape as a model id, so filtering one filtered the other.
+    #[test]
+    fn a_terse_reference_is_still_a_usable_title() {
+        let sid = test_session_id();
+        for prompt in ["pr-477", "issue-484", "commit-a0bc43d"] {
+            let candidates = vec![obs(ObservationKind::UserPrompt, prompt)];
+            assert_eq!(
+                derive_title(&candidates, sid),
+                prompt,
+                "{prompt:?} is a plausible prompt and must survive as a title"
+            );
+        }
+    }
+
+    /// The title is also what `page_descriptor` filters against — a body line
+    /// equal to it is dropped as a repeat. Changing which string becomes the
+    /// title therefore changes which body lines survive, so a filtered page
+    /// must still render a body whose prompts are intact.
+    #[test]
+    fn a_filtered_title_still_leaves_the_prompts_in_the_body() {
+        let obs = vec![
+            obs(ObservationKind::UserPrompt, "<ide_opened_file>noise"),
+            obs(
+                ObservationKind::UserPrompt,
+                "Make the backpressure test deterministic",
+            ),
+        ];
+        let title = derive_title(&obs, test_session_id());
+        let tally = tally_session(&obs);
+        let body = render_body(test_session_id(), &obs, &title, &tally);
+        assert!(
+            body.contains("Make the backpressure test deterministic"),
+            "the promoted prompt must still appear in the body: {body}"
+        );
+        assert!(
+            body.contains("<ide_opened_file>noise"),
+            "the skipped prompt is still session history and must be recorded"
+        );
+    }
+
     #[test]
     fn title_falls_back_through_kinds() {
         let no_prompt = vec![obs(ObservationKind::PostToolUse, "Edit")];
-        assert_eq!(derive_title(&no_prompt), "Edit");
+        assert_eq!(derive_title(&no_prompt, test_session_id()), "Edit");
 
         let empty: Vec<Observation> = vec![];
-        assert_eq!(derive_title(&empty), "session");
+        assert_eq!(derive_title(&empty, test_session_id()), "session");
 
         let with_prompt = vec![
             obs(ObservationKind::PostToolUse, "Edit"),
             obs(ObservationKind::UserPrompt, "fix the auth bug"),
         ];
-        assert_eq!(derive_title(&with_prompt), "fix the auth bug");
+        assert_eq!(
+            derive_title(&with_prompt, test_session_id()),
+            "fix the auth bug"
+        );
     }
 
     #[test]

@@ -7,56 +7,327 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.29.1-aerox.4] - 2026-08-24
-
 ### Changed
-- Fork releases now publish only the native Linux x86_64 bundle used by WSL
-  and the native Windows x86_64 bundle, while retaining smoke tests, checksums,
-  SBOM generation, and provenance attestations. Unused macOS, ARM Linux,
-  container, and AUR publication jobs were removed. (#3)
+- Merged canonical ai-memory through v1.32.1, including hook-capture and
+  session-title fixes. The Aerox fork continues to publish only the managed
+  Windows x86_64 and WSL/Linux x86_64 release bundles with checksums,
+  attestations, and smoke tests.
+### Fixed
+- Stopped the scaffolding filter discarding terse prompts. The identifier
+  branch added in #484 fired on any single token carrying a digit and a
+  hyphen, underscore or bracket, which is the shape of a bare model id and
+  equally the shape of `pr-477`, `issue-484` or `commit-a0bc43d`: measured
+  against the two populations, it matched 10 of 10 model ids and 7 of 11
+  plausible terse references, so a page could lose a real title. The class is
+  now excluded at its source instead — `derive_title` skips `SessionStart`
+  outright, the only kind whose title `best_title_hint` fills from the
+  harness's `model` field — and the branch is gone. That also excludes the
+  router's default `title_hint.unwrap_or(kind)`, the literal `session-start`
+  written whenever a harness sends neither `model` nor `title`. The trade is
+  narrower than a shape rule and stated as such: a model id a user *typed* is
+  now kept, because at that point it is what they wrote. Where the prompts
+  are unusable a page falls to the next observation title, which the router
+  defaults to the observation's own kind, so `Session {id}` is reached only
+  by a session carrying nothing else at all — measured over 332 real sessions
+  it never was, and 5 of them landed on `tool file` / `tool non-file` against
+  327 keeping a real title. `looks_like_scaffolding` is re-exported from
+  `ai-memory-core`, so its narrowing is a public-API behaviour change even
+  though `derive_title` is its only caller in tree. (#484)
 
-## [1.29.1-aerox.3] - 2026-08-21
+### Docs
+- Documented why registering ai-memory through Kimi Code's own
+  `kimi mcp add` breaks every model turn: that command writes the plain
+  `/mcp` URL with no `?flavor=moonshot`, so Moonshot rejects
+  `memory_read_page`'s root-level `anyOf` and fails the request — including
+  requests that use no tools, since schemas ship with each one. `kimi mcp
+  test` passes regardless because it never sends schemas upstream, which
+  makes the server look healthy. Records both escapes: re-run `install-mcp
+  --client kimi-code`, or set `strip_root_combinators` server-side to cover
+  any strict client that skips the marker. Reported by @LeandroCorsoOrion
+  (#474).
+- Documented the `os error 4551` build failure on Windows machines with Smart
+  App Control / App Control for Business enforced. Cargo compiles each
+  crate's `build.rs` into an unsigned executable under `target\debug\build\`
+  and those policies block it, so the build dies on `proc-macro2` before
+  reaching any ai-memory code and looks like a broken toolchain. Reported by
+  @CaioCoelhoChaves (#478).
+
+## [1.32.1] - 2026-08-25
+
+### Fixed
+- `memory_forget_sweep`'s tool description claimed "Semantic / procedural /
+  pinned pages are exempt" without qualification. That is true of the decay
+  pass and false of the TTL pass, which hard-deletes any page whose
+  `expires_at` has passed regardless of tier or pin — the check runs three
+  lines before the only pin test. Since the tool is admin-gated and
+  destructive and its description is the only thing an agent can consult, a
+  model asked "is it safe to run, I have pinned pages?" had no way to answer
+  anything but yes. Both surfaces — the `tools/list` description and the
+  `MEMORY_INSTRUCTIONS` line — now name all three passes and scope the pin
+  exemption to the one that honours it. Behaviour is unchanged: an explicit
+  expiry remains a more specific instruction than a pin. A `tools/list`
+  assertion pins the wording so a fourth pass cannot silently make it stale
+  again. Reported by @samirhvbr (#485).
+- Hits ranked by the vector stream returned an empty `title` and `snippet`,
+  even when the entity or graph stream had also found the page and already
+  computed a real descriptor for it. The fusion map is built with
+  `or_insert_with` and the vector loop only has `(PageId, PagePath, f32)` to
+  insert, so first-writer-wins left the entry empty and nothing downstream
+  repaired it. Beyond the empty display, `title` and `snippet` are the
+  reranker's candidate text, so an affected page was scored as an empty
+  document and could then be truncated out of the results a reranker was
+  meant to improve. Fused hits that still lack a title are now hydrated in
+  one bounded lookup; hits another stream already described keep that
+  stream's snippet, so an FTS excerpt centred on the matched term is not
+  downgraded to a generic descriptor. Affects instances with an embedding
+  provider configured. Reported by @samirhvbr (#486).
+- Session page titles were the first user prompt taken verbatim, so whatever
+  the harness put in that payload became the title the page is indexed and
+  displayed under — IDE context blocks, a shell prompt echoed into a paste, a
+  bare model id. Measured across one live instance: 21 of 330 real session
+  pages (6.4%), at a flat rate month over month rather than a decaying legacy
+  population. Titles that read as harness scaffolding are now skipped in
+  favour of the next real prompt, and a session whose every candidate is
+  scaffolding falls back to its own identity rather than a shared literal.
+  The predicate tests the *shape* of the text rather than matching a list of
+  known offenders, since three classes from one corpus is a sample of that
+  operator's harnesses and a blocklist would fail silently on the fourth.
+  New writes only — existing titles are unchanged. Reported by @samirhvbr
+  (#484).
+
+## [1.32.0] - 2026-08-24
 
 ### Added
-- Add `recall` and `session` MCP bridge tool profiles that filter both tool
-  discovery and direct calls while retaining `full` as the compatibility
-  default. (#2)
+- Gave session pages a `summary` in their frontmatter, which the retrieval
+  layer already preferred over the page body when describing a non-FTS hit.
+  #463 made that `COALESCE` prefer a summary, but no write path produced one:
+  measured against a live 1.31.1 instance, 0 of 25 substantive pages had the
+  field, so every descriptor fell back to the body. All three writers now fill
+  it — the zero-LLM `SessionEnd` synthesis, the single-page consolidator, and
+  the batch one — because zero-LLM is the documented default and `multi_page`
+  defaults to false, so covering either alone would have missed the pages most
+  installs actually hold. (#473)
 
-### Security
-- Allow managed services and hooks to load bearer tokens and the multi-user
-  token pepper from bounded file or pipe inputs. Detached hook drainers now
-  transfer runtime bearer material over anonymous stdin instead of argv or
-  environment. (#2)
+  On the zero-LLM path the summary came from counts the renderer already had
+  and was discarding: prompts, completed tool calls per tool, and elapsed time
+  ("2 prompts, 34 completed tool calls across Bash, Edit and Read, over 18m").
+  That is what a page cannot state about itself — a reader deciding whether to
+  open it now sees how much work it holds, not only what it opened with. The
+  page is tallied once and the count lent to both the body renderer and the
+  summary, and `PostToolUse` stays the only counted kind so a completed call is
+  not double-counted.
 
-## [1.29.1-aerox.2] - 2026-08-21
+  On the LLM paths it became an optional field on the consolidator's structured
+  output, costing no additional model call since the call already happens, with
+  `#[serde(default)]` so stored outputs from earlier runs still deserialise.
+  Both system prompts now request it and describe the shape it has to keep; the
+  batch prompt previously forbade the key outright.
+
+  A model-supplied summary is validated before it is written, because the
+  reader prefers `summary` over the body and then drops headings, metadata
+  bullets, list items and title repeats — falling back to echoing its raw
+  input when nothing survives. A structurally wrong summary is therefore not
+  ignored but reproduced verbatim as the descriptor, displacing usable body
+  text with no error anywhere. Anything the reader would discard is dropped at
+  the boundary instead, leaving the page on its body-derived descriptor.
+
+  The fallback is unchanged and still serves hand-written pages and everything
+  written before this. New writes only: no backfill, no migration.
+- Pool (Poolside Agent CLI) is a first-class agent kind. Hook ingestion
+  recognizes `agent=pool` (alias `poolside`) and Pool's documented snake_case
+  `session_id` / `cwd` / `tool_name` / `tool_input` payload for concrete
+  session attribution and tool-family titles, and Pool's five events
+  (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` —
+  verified against Poolside CLI v1.0.16) ship as a `hooks/pool/` bundle.
+  `install-hooks --agent pool` stages the scripts and prints a ready-to-paste
+  `.poolside/settings.yaml` `hooks:` snippet — Pool's hook config is
+  project-scoped YAML at each repo root, so the installer deliberately does
+  not write project-local files. Native hook commands enforce `[capture]
+  ignore_paths` for Pool's `read`/`edit`/`write`/`remove` file tools, with
+  unknown payload shapes degrading to metadata-only capture. Pool has no true
+  session-end event, so `ai-memory finalize-session --agent pool` closes the
+  session (the same class as Codex and Antigravity CLI); a forward migration
+  (V50) rebuilds the sessions constraint and pairing triggers to accept the
+  `pool` kind without losing rows. `SessionStart` stdout injection is not
+  demonstrated, so the session-start hook never fetches the single-use
+  handoff — recover it via MCP `memory_handoff_accept`. No managed
+  workstream (`ai-memory run pool`) is claimed: Pool's native session-store
+  contract is not demonstrated, per docs/managed-harness-contributions.md.
+- `ai-memory status` now reports server-side hook-ingestion counters
+  alongside the client spool section: events accepted, accepted-but-dropped
+  by capture policy, shed because ingest capacity was exhausted, shed by the
+  per-source rate limiter, and how long since the last event reached the
+  writer (#428). Together with the spool numbers this distinguishes the three
+  states that previously looked alike from the outside — hooks not arriving,
+  hooks arriving but shed, and hooks arriving but not landing.
+
+  Deliberately a fixed set of scalars rather than a per-source breakdown:
+  keying counters on a client-supplied value would put unbounded,
+  network-reachable state behind the very queue that exists to bound it. The
+  counters are relaxed atomics, so the hook path pays no lock, and the
+  snapshot is content-free by construction — counts and one timestamp, with a
+  test asserting the field set so a future change cannot quietly add captured
+  text. A newer CLI against an older server renders the rest of `status` and
+  omits the section rather than failing to parse.
+- `install-hooks --capture-mode allowlist` inverts capture scope: a repository
+  with no `.ai-memory.toml` marker emits no lifecycle event at all — prompts,
+  tool calls and session boundaries alike — dropped in the hook process before
+  anything reaches the local spool or the wire. Previously the marker could
+  only narrow what an already-captured repository sent, so forgetting one
+  captured *more*; under this mode forgetting one captures less (#446).
+
+  The gate is deliberately independent of the per-event capture policy, which
+  runs only for tool events: expressing it as a capture disposition would have
+  left prompt text spooling from a repository the CLI reported as opted out.
+  The mode is stored once per install rather than baked into each agent's hook
+  command, so every agent honours it and a bare `--apply` — including the
+  refresh inside `upgrade` — cannot revert it. `--check-capture` now reports
+  `capture_mode`, `marker_present` and `admits_capture` so an opt-out can be
+  verified without sending anything. Default behaviour is unchanged, and
+  `--capture-mode denylist` restores it.
+- Documented allowlist mode in the README feature list beside the existing
+  per-repository capture exclusions, so the two capture controls are
+  discoverable from the same place (#446).
+- Corrected the allowlist-mode documentation, which claimed "every agent's
+  hook honours it". The gate runs inside the native `ai-memory hook` binary
+  before the spool write, so script-based installs — the
+  `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper, and
+  `setup-agent` snippets — POST directly and never read the mode. That is the
+  same boundary `[capture] ignore_paths` already documents. `install-hooks
+  --apply` now warns when the install it is writing cannot enforce the mode it
+  just stored, so the gap is visible where it matters rather than only in a
+  doc (#446).
+- `ai-memory status` now reports the capture mode when it is `allowlist`, in
+  both the human and `--json` renderings. Without it the new ingest counters
+  read identically whether hooks are broken or a repository simply never opted
+  in — the exact ambiguity those counters were added to remove (#428, #446).
+
+### Docs
+- Documented the order of magnitude reported for lifecycle-hook overhead,
+  including the fact that a completed tool call normally pays for both pre- and
+  post-tool hooks, the measured native-versus-script figures, and the host
+  factors that make them reference data rather than a performance guarantee
+  (#446).
+
+## [1.31.1] - 2026-08-23
+
+### Fixed
+- `ai-memory upgrade` now verifies that a discovered Compose project actually
+  owns the running `ai-memory` container before invoking `docker compose up`.
+  A standalone `docker run` install could previously be mistaken for a Compose
+  deployment merely because an unrelated `docker-compose.yml` existed in a
+  conventional search path; Compose then failed with a container-name conflict
+  and the safe standalone recreation-script fallback was skipped. Unowned
+  containers now use that existing fallback, preserving their inspected ports,
+  mounts, restart policy, command, and operator-set environment. (#469)
+- The Windows Docker wrapper's thin-client commands now reach a
+  loopback-published server instead of failing with `Connection refused (os
+  error 111)`. `ai-memory status`, `search`, `bootstrap` and every other
+  thin-client command runs inside a short-lived helper container, where the
+  CLI's default `http://127.0.0.1:49374` resolves to that helper rather than
+  to the Windows host, so a healthy `docker run -p 127.0.0.1:49374:49374`
+  server was unreachable from the wrapper while `curl` from PowerShell worked.
+  The wrapper now injects `AI_MEMORY_SERVER_URL=http://host.docker.internal:49374`
+  for those commands, matching what the POSIX wrapper has done on macOS since
+  (#107) — Docker Desktop gives Linux containers no host networking on either
+  platform. `install-mcp`, `install-hooks` and `setup-agent` still render
+  `http://127.0.0.1:49374` into host-side agent config, because
+  `host.docker.internal` does not resolve on the Windows host, and an explicit
+  `AI_MEMORY_SERVER_URL` (homelab or remote server) is still honoured. (#464)
+- Page paths that cannot be materialised on every supported platform are now
+  refused at write time instead of failing late (#462). `PagePath` accepted
+  DOS device names (`CON.md`, `aux.md`), components ending in a dot or space,
+  the characters `< > : " | ? *`, and control characters. On native Windows
+  some of those failed with a generic HTTP 500, while others were written
+  successfully but could not be checkpointed by libgit2 or deleted through the
+  normal API — silent partial state, which is worse than a clean rejection.
+  The check runs in `Wiki::write_page`, the single funnel every page creation
+  passes through, and returns an error naming the offending component and the
+  reason. It is deliberately **not** in `PagePath::new`: persisted rows are
+  reconstructed through that constructor on every read, so tightening it would
+  make an already-stored non-portable page unreadable and break the whole
+  listing it appears in. The rule is identical on every platform, so a wiki
+  authored on Linux stays usable on Windows.
+- Made non-FTS search hits describe the page instead of repeating its
+  heading. Only the FTS5 path built a real excerpt (`snippet(pages_fts, ...)`,
+  centred on the matched terms); the vector, entity-match, graph-neighbour and
+  recency paths had no matched term to centre on and returned
+  `substr(body, 1, 240)` — on a compiled page that is the `# Title` line plus
+  the following structural heading, which duplicates the `title` field already
+  present on the hit and gives an agent nothing to decide a follow-up
+  `memory_read_page` on. Measured against a live instance over 100 real pages
+  (55 of them substantive, the rest near-empty session stubs), 53% of
+  substantive descriptors opened by repeating the title verbatim, and the
+  median page spent its 240-character budget on 35 characters of prose. Those
+  six queries now prefer the page's own frontmatter `summary`, and otherwise
+  fill the budget from the page's own text, skipping structural lines,
+  `- **key:** value` metadata bullets, and any line that merely repeats the
+  title. On the same sample title repetition drops to 0%, and 71% of session
+  pages land on the prompts after the first — the part the title does not
+  already show. The FTS path is unchanged, response shape is unchanged, and no
+  schema migration is involved.
+
+## [1.31.0] - 2026-08-22
+
+### Fixed
+- Auto-improve no longer rejects every proposal from a model that spells the
+  single supported operation differently (#458). `operation` was a free-form
+  string validated by exact match against `create_or_update`, while the
+  schema carried no constraint and the neighbouring field description — "path
+  that would be created or updated" — actively invited `"create"`. Two local
+  models took the invitation for 6/6 candidates, so with
+  `require_approval = false` the learning loop completed having silently done
+  nothing, and the rejection buffer then fed `unsupported_operation` rows back
+  into later reviewer prompts as noise. The schema now advertises a
+  single-value enum, so providers with constrained decoding cannot emit
+  anything else, and validation normalises the unambiguous spellings
+  (`create`, `update`, `upsert`, `create/update`, …) for providers without it.
+  Operations the pipeline genuinely cannot perform — `delete`, `rename`,
+  `move` — still fail with the same reason as before.
 
 ### Added
-- Allow a pinned MCP bridge to accept repeated `--read-project` values as a
-  narrow read-only allowlist. Unscoped queries search the current project plus
-  those curated projects, while writes and every other tool stay pinned to the
-  current project. (#1)
+- The `gemini` LLM provider now respects the `LLM_BASE_URL` configuration value.
+  Previously, the base URL was hardcoded to `generativelanguage.googleapis.com`.
+  This allows using self-hosted, local Gemini-compatible models (like Gemma 3 hosted via Litert) that expect the native `/v1beta/models/...:generateContent` payload shape.
 
-### Security
-- Keep static hook bearers out of spool files, delete legacy token-bearing
-  entries locally, rebind queued requests to the runtime-selected destination,
-  and optionally bind every event and drainer to an explicit pool identity.
-  Mixed-pool entries remain queued without network access or retry charging,
-  detached drainers scrub inherited ai-memory auth and scope variables, and
-  installer-managed hooks can require a validated workspace/project pin. (#1)
+## [1.30.0] - 2026-08-21
 
-## [1.29.1-aerox.1] - 2026-08-20
+### Fixed
+- Documented the `ai-memory status` hook-spool section in
+  `docs/deploy.md`. It shipped with no operator-facing description, in the
+  one document whose troubleshooting list is where someone looks when
+  capture seems delayed. (#428)
+- The Windows packaging test for the PowerShell wrapper now runs it with
+  `-ExecutionPolicy Bypass`. `-File` loads a script from disk and execution
+  policy governs script files, so on a machine at the Windows client default
+  of `Restricted` the unsigned wrapper was refused and the test failed for a
+  reason unrelated to what it asserts. Test-only; no shipped behaviour
+  changes. (#449)
 
 ### Added
-- Allow the built-in stdio-to-HTTP MCP bridge to run for Codex, Antigravity,
-  and other stdio clients when `CLAUDE_CODE_SESSION_ID` is absent. Claude Code
-  still forwards its lifecycle session header when one is available. The
-  bridge can now require an exact workspace/project pin, inject it into every
-  supported memory call, and reject global, conflicting, unscoped, or unknown
-  calls instead of relying on the server's process-wide active project.
-- Keep prerelease tags isolated from stable publication channels: canary images
-  receive only their versioned GHCR tag, canary GitHub Releases are marked as
-  prereleases, and AUR publishing is skipped. Stable releases continue to
-  update GHCR `latest` and GitHub's latest-release marker.
+- `install-hooks --agent claude-code --no-capture-prompts` can now omit
+  ai-memory's `UserPromptSubmit` hook, preventing prompt text from entering the
+  local spool or wire while leaving session, tool, compaction, and handoff
+  capture active. Re-applying or upgrading preserves the opt-out, third-party
+  hooks under the same event survive, and `--capture-prompts` explicitly
+  enables prompt capture again. Other agents reject both flags because some
+  depend on their prompt hook to inject handoff context. (#446)
+- New `gemini_safe_schemas` config flag (env `AI_MEMORY_GEMINI_SAFE_SCHEMAS`, or
+  `gemini_safe_schemas = true` in config.toml) and a matching `?flavor=gemini`
+  MCP URL marker (alias `?flavor=vertex`) serve tool input schemas in the subset
+  Google's `Schema` accepts. `schemars` renders every optional tool argument as a
+  nullable union (`"type": ["integer", "null"]`), but Vertex/Gemini
+  `functionDeclaration.parameters` takes a single `type` and treats `any_of` as
+  exclusive with every sibling key — so a client that forwards our schema
+  verbatim produced `any_of` with `description` beside it and Vertex failed the
+  whole session at `tools/list` with "specified other fields alongside any_of".
+  The dialect collapses those unions to a single `type` plus `nullable: true`,
+  the same normalization Gemini CLI performs client-side, which is why Gemini CLI
+  and Antigravity CLI never hit this and need no marker; pass-through clients such
+  as OpenCode on a Vertex model did. It implies `strip_root_combinators`, and
+  runtime argument validation is unchanged in every dialect. The key is
+  documented in the generated `config.default.toml`, and `docs/mcp-install.md`
+  now collects all three schema dialects in one table. (#450)
 - Windows tests moved to their own workflow
   (`.github/workflows/windows.yml`), running on every push to `main`,
   nightly, on demand, and on any PR labelled `windows`. They were the
@@ -207,6 +478,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file-tool activity without a subsequent Stop produces an advisory to check
   the working tree; and a mid-task exit (Stop without SessionEnd) is flagged
   so the receiver knows the previous session did not finish cleanly. (#425)
+- Observation bodies that exceed the 16 KiB durable ceiling are now
+  truncated with a **head-tail** strategy instead of head-only: the first
+  and last ~8 KiB are preserved with a `[truncated N bytes]` marker between
+  them. A 50 KB tool output previously lost its tail entirely, so the LLM
+  consolidator saw an incomplete picture; the new truncation keeps the
+  outcome and any trailing error context visible without increasing the
+  storage budget.
 
 ## [1.28.1] - 2026-08-18
 
@@ -3516,11 +3794,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.4...HEAD
-[1.29.1-aerox.4]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.3...v1.29.1-aerox.4
-[1.29.1-aerox.3]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.2...v1.29.1-aerox.3
-[1.29.1-aerox.2]: https://github.com/Aerox912/ai-memory/compare/v1.29.1-aerox.1...v1.29.1-aerox.2
-[1.29.1-aerox.1]: https://github.com/Aerox912/ai-memory/compare/805fa4b17d575dadcd9cc9064aad42975e59e04e...v1.29.1-aerox.1
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.32.1...HEAD
+[1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
+[1.32.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.0
+[1.31.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.31.1
+[1.31.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.31.0
+[1.30.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.30.0
 [1.29.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.29.0
 [1.28.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.28.1
 [1.28.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.28.0
