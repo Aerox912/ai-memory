@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.32.1-aerox.1] - 2026-08-26
+
 ### Changed
 - Merged canonical ai-memory through v1.32.1, including hook-capture and
   session-title fixes. The Aerox fork continues to publish only the managed
@@ -3794,7 +3796,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.32.1...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.32.1-aerox.1...HEAD
+[1.32.1-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.1-aerox.1
 [1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
 [1.32.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.0
 [1.31.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.31.1
