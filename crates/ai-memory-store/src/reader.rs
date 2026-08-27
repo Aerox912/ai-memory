@@ -7045,8 +7045,8 @@ fn dot_embedding_bytes(query: &[f32], bytes: &[u8], dim: u32) -> StoreResult<f32
     }
     Ok(query
         .iter()
-        .zip(bytes.chunks_exact(4))
-        .map(|(q, chunk)| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * q)
+        .zip(bytes.as_chunks::<4>().0)
+        .map(|(q, chunk)| f32::from_le_bytes(*chunk) * q)
         .sum())
 }
 
@@ -7062,8 +7062,8 @@ fn bytes_to_f32_vec(bytes: &[u8], dim: u32) -> StoreResult<Vec<f32>> {
         ));
     }
     let mut out = Vec::with_capacity(dim as usize);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in bytes.as_chunks::<4>().0 {
+        out.push(f32::from_le_bytes(*chunk));
     }
     Ok(out)
 }

@@ -566,7 +566,6 @@ fn extract_account_id_from_jwt(token: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
     use serde_json::json;
 
     use super::*;

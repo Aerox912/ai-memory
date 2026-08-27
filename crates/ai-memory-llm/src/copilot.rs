@@ -635,7 +635,6 @@ fn unix_epoch_to_ms(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
     use serde_json::json;
 
     use super::*;

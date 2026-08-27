@@ -7,14 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.32.1-aerox.1] - 2026-08-26
+## [1.32.2-aerox.1] - 2026-08-27
 
 ### Changed
-- Merged canonical ai-memory through v1.32.1, including hook-capture and
-  session-title fixes. The Aerox fork continues to publish only the managed
-  Windows x86_64 and WSL/Linux x86_64 release bundles with checksums,
+- Merged canonical ai-memory v1.32.2 while retaining the managed Aerox
+  Windows x86_64 and WSL/Linux x86_64 release bundles, checksums,
   attestations, and smoke tests.
+
 ### Fixed
+- The native client now trusts CAs from the platform trust store. It was built
+  with reqwest's `rustls-tls`, which bundles the Mozilla webpki roots and
+  ignores the OS store, so a CA the operator had installed locally — Caddy's
+  `tls internal`, a corporate MITM appliance, any private PKI — was invisible
+  to `ai-memory` even though `curl` and the agent CLIs trusted it. Every HTTPS
+  request failed with `invalid peer certificate: UnknownIssuer`, including
+  `ai-memory hook`, so following this project's own HTTPS-via-proxy Path 2
+  guide left lifecycle capture failing end to end: events spooled locally
+  (queuing touches no network) and the drain could never deliver them.
+  Switched to `rustls-tls-native-roots`; the runtime image installs
+  `ca-certificates`, so the server path keeps a populated store. Reported by
+  @alanmatiasdev (#492).
+
+- Made `hook-drain` say what a pass actually did. The drain already returned
+  `sent`/`remaining`/`dropped` counts and `run_drain` discarded all three, so
+  three passes that mean opposite things — everything delivered, every queued
+  event discarded undelivered at the retry cap or the spool TTL, and nothing
+  attempted at all because another drainer held the lock — were byte-identical
+  on both streams and in the exit code. A drain that silently loses capture was
+  therefore indistinguishable in the field from one that works, which is how
+  #493 was reported: exit 0, no output, an empty `hook-drain.log`, and no way
+  to tell which of the three had happened. A pass that leaves nothing behind
+  stays silent, so `hook-drain.log` keeps receiving only warnings and a healthy
+  instance never grows it; a pass that leaves events queued or drops them, and
+  a pass that found the lock held, now each emit one stderr line. stderr, not
+  stdout: the drainer's stdout is contractually empty and the detached helper
+  already redirects stderr into the log. This changes no delivery behaviour —
+  it only stops the existing behaviour being unfalsifiable. (#493)
 - Stopped the scaffolding filter discarding terse prompts. The identifier
   branch added in #484 fired on any single token carrying a digit and a
   hyphen, underscore or bracket, which is the shape of a bare model id and
@@ -3796,8 +3824,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.32.1-aerox.1...HEAD
-[1.32.1-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.1-aerox.1
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.32.2-aerox.1...HEAD
+[1.32.2-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.2-aerox.1
+[1.32.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.2
 [1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
 [1.32.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.0
 [1.31.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.31.1
