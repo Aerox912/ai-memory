@@ -7,12 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.32.2-aerox.2] - 2026-08-28
+
+### Added
+- Generated `sessions/<id>.md` pages now surface the originating harness as
+  `agent` frontmatter alongside `session_id`. The value comes from the
+  persisted session row, so LLM rewrites, compaction checkpoints, spool
+  drains, and superseding versions do not mistake the later writer for the
+  origin; manual page writes remain unattributed. (#494)
+
+### Fixed
+- Made managed routing `SKILL.md` payloads byte-identical across release
+  platforms. Windows builds previously embedded CRLF from the runner checkout
+  while Linux and macOS builds embedded LF, so one tag returned different
+  bytes through CLI installs and `memory_install_self_routing`. The embedded
+  assets now use LF everywhere without rewriting user-authored files. (#502)
+- PowerShell compatibility hooks no longer assign to a local `$home` variable.
+  PowerShell names are case-insensitive, so that collided with the automatic
+  read-only `$HOME` variable and emitted `VariableNotWritable` for every hook
+  payload carrying a cwd. The marker-boundary helper now uses `$userHome`, with
+  native Windows and static shell regressions covering the error stream and
+  reserved-name contract (#498).
+- PowerShell compatibility hooks now encode JSON request bodies as explicit
+  UTF-8 bytes and declare `charset=utf-8`. Windows PowerShell 5.1 otherwise
+  encoded string bodies using a host-dependent legacy code page, so prompts,
+  paths, or tool content containing non-ASCII text could make `/hook` return
+  HTTP 400 and disappear from memory while ASCII events still worked. A native
+  Windows loopback test now round-trips Chinese and Portuguese text byte for
+  byte (#500).
+
+### Changed
+- Merged canonical ai-memory changes after v1.32.2 while retaining the managed
+  Aerox Windows x86_64 and WSL/Linux x86_64 release bundles, checksums,
+  attestations, and smoke tests.
+
 ## [1.32.2-aerox.1] - 2026-08-27
 
 ### Changed
 - Merged canonical ai-memory v1.32.2 while retaining the managed Aerox
   Windows x86_64 and WSL/Linux x86_64 release bundles, checksums,
   attestations, and smoke tests.
+
+## [1.32.2] - 2026-08-26
 
 ### Fixed
 - The native client now trusts CAs from the platform trust store. It was built
@@ -27,7 +63,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Switched to `rustls-tls-native-roots`; the runtime image installs
   `ca-certificates`, so the server path keeps a populated store. Reported by
   @alanmatiasdev (#492).
-
 - Made `hook-drain` say what a pass actually did. The drain already returned
   `sent`/`remaining`/`dropped` counts and `run_drain` discarded all three, so
   three passes that mean opposite things — everything delivered, every queued
@@ -63,8 +98,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   327 keeping a real title. `looks_like_scaffolding` is re-exported from
   `ai-memory-core`, so its narrowing is a public-API behaviour change even
   though `derive_title` is its only caller in tree. (#484)
-
-### Docs
 - Documented why registering ai-memory through Kimi Code's own
   `kimi mcp add` breaks every model turn: that command writes the plain
   `/mcp` URL with no `?flavor=moonshot`, so Moonshot rejects
@@ -231,6 +264,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both the human and `--json` renderings. Without it the new ingest counters
   read identically whether hooks are broken or a repository simply never opted
   in — the exact ambiguity those counters were added to remove (#428, #446).
+
+### Fixed
+- Prevented stored Markdown from automatically fetching external image URLs
+  when viewed in the web UI, while preserving clickable external links and
+  same-origin relative images (#491).
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,
@@ -3824,7 +3862,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.32.2-aerox.1...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.32.2-aerox.2...HEAD
+[1.32.2-aerox.2]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.2-aerox.2
 [1.32.2-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.2-aerox.1
 [1.32.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.2
 [1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
