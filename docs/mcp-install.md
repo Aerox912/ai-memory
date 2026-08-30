@@ -453,7 +453,7 @@ capture path; `SessionStart` also fetches pending handoffs.
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
 `ai-memory install-hooks --agent antigravity-cli --apply`.
 
-**Config file (MCP):** `~/.gemini/antigravity-cli/mcp_config.json`
+**Config file (MCP):** `~/.gemini/config/mcp_config.json`
 
 Antigravity CLI is the successor to Gemini CLI, built in Go with
 parallel subagent support. It uses a separate `mcp_config.json`
@@ -537,7 +537,7 @@ The rendered hooks config looks like:
 - Antigravity CLI uses `serverUrl` for HTTP MCP endpoints, not `url`
   or `httpUrl`. The `--apply` flag writes the correct key.
 - MCP and hooks use separate files: MCP belongs in
-  `~/.gemini/antigravity-cli/mcp_config.json`, while hooks belong in
+  `~/.gemini/config/mcp_config.json`, while hooks belong in
   `~/.gemini/config/hooks.json`.
 - Hook scripts are staged under `~/.local/share/ai-memory/hooks/antigravity-cli/`.
 - Native Windows Docker-wrapper installs render hook entries as

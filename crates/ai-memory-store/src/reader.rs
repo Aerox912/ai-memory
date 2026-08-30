@@ -36,7 +36,7 @@ use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
 use crate::maintenance::MaintenanceJob;
 use crate::users::TOKEN_HASH_LEN;
-use crate::workstream::{ManagedRunContext, StoredManagedRunStatus};
+use crate::workstream::{ManagedRunContext, StoredManagedRunStatus, StoredWorkstreamSummary};
 
 /// TTL guard for retrieval surfaces (search / recent / embedding hits /
 /// graph neighbours / briefing lists): appended to a WHERE clause that
@@ -1324,6 +1324,28 @@ impl ReaderPool {
     ) -> StoreResult<Vec<WorkstreamEvent>> {
         self.with_conn(move |conn| {
             crate::workstream::search_events(conn, workstream_id, &query, limit)
+        })
+        .await
+    }
+
+    /// List recent managed workstreams for one exact repository/worktree.
+    pub async fn recent_workstreams(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        limit: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        self.with_conn(move |conn| {
+            crate::workstream::list_recent(
+                conn,
+                workspace_id,
+                project_id,
+                &repo_fingerprint,
+                &worktree_fingerprint,
+                limit,
+            )
         })
         .await
     }
@@ -3183,6 +3205,42 @@ impl ReaderPool {
         .await
     }
 
+    /// Count the observations the prune pass would delete for this scope.
+    ///
+    /// Same predicate as
+    /// [`prune_consolidated_observations`](crate::ops::prune_consolidated_observations),
+    /// read-only, so a dry run can report a number without any chance of a
+    /// write. Kept beside the delete rather than derived from it because the
+    /// dry run must never open a write transaction at all.
+    ///
+    /// # Errors
+    /// Propagates SQL errors.
+    pub async fn prunable_observation_count(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        cutoff_us: i64,
+    ) -> StoreResult<usize> {
+        self.with_conn(move |conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM observations o \
+                 WHERE o.workspace_id = ?1 \
+                   AND o.project_id = ?2 \
+                   AND o.created_at < ?3 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM sessions s \
+                       JOIN pages p ON p.id = s.summary_page_id \
+                       WHERE s.id = o.session_id \
+                         AND p.superseded_at IS NULL \
+                   )",
+                params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff_us],
+                |row| row.get(0),
+            )?;
+            Ok(usize::try_from(n).unwrap_or(0))
+        })
+        .await
+    }
+
     /// Return the number of DISTINCT operators that reinforced each
     /// `is_latest = 1` page of a project, for the sweep's breadth term.
     ///
@@ -3564,6 +3622,63 @@ impl ReaderPool {
     /// descriptor column there would compute one for the whole corpus on
     /// every search. Here the input is only the handful of ids that survived
     /// fusion and still lack a title.
+    /// Open handoffs for a project, oldest first (#513).
+    ///
+    /// `memory_handoff_cancel` takes an exact id and nothing exposed one, so a
+    /// backlog could be observed in `status` counts but never addressed. Oldest
+    /// first because the operator's question is "what is stale", and the
+    /// automatic expiry deliberately spares manual and sibling-directory
+    /// handoffs — which is how a months-old entry survives to be listed here.
+    pub async fn open_handoffs_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<OpenHandoff>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, from_agent, to_agent, cwd, created_at \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
+                 ORDER BY created_at ASC, id ASC \
+                 LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                ],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    Ok((
+                        id,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, from_agent, to_agent, cwd, created_at) = row?;
+                let Ok(id) = HandoffId::from_slice(&id) else {
+                    continue;
+                };
+                out.push(OpenHandoff {
+                    id: id.to_string(),
+                    from_agent,
+                    to_agent,
+                    cwd,
+                    created_at_ms: created_at / 1_000,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn page_descriptors_for_ids(
         &self,
         workspace_id: WorkspaceId,
@@ -7405,6 +7520,20 @@ fn slot_exclusion_sql(
 /// a server behind a trusted proxy what follows the prefix is whatever
 /// `X-Memory-Actor-Sub` carried — an OIDC subject the engine never parses — so
 /// nothing upstream constrains its characters.
+/// One open handoff, as an operator needs to see it to decide what to cancel.
+///
+/// Content-free by construction: identity, provenance and age only. The
+/// summary body is deliberately absent — this exists so
+/// `memory_handoff_cancel` has an id to be given, not to render the handoff.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenHandoff {
+    pub id: String,
+    pub from_agent: String,
+    pub to_agent: Option<String>,
+    pub cwd: Option<String>,
+    pub created_at_ms: i64,
+}
+
 fn handoff_owner_sql(filter: &OwnerFilter, param_index: usize) -> (String, Option<String>) {
     match filter {
         OwnerFilter::Any => (String::new(), None),

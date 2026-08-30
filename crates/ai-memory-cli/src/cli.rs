@@ -43,6 +43,10 @@ pub enum Command {
     /// Resume the most recently launched managed checkout from anywhere,
     /// without `cd` and without picking from a list.
     Continue(ContinueArgs),
+    /// List open cross-agent handoffs so a stale one can be cancelled by id.
+    Handoffs(HandoffsArgs),
+    /// List recent managed workstreams selectable from the current checkout.
+    Workstreams(WorkstreamsArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
     /// Audit the store for likely cross-project contamination (read-only,
@@ -303,6 +307,41 @@ pub struct ContinueArgs {
     /// Forwarded to `run`.
     #[arg(long)]
     pub fresh: bool,
+}
+
+/// Arguments for `workstreams`.
+/// Arguments for `handoffs`.
+#[derive(Debug, Args)]
+pub struct HandoffsArgs {
+    /// Workspace to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Maximum handoffs to list.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub limit: u16,
+    /// Emit JSON instead of the human listing.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkstreamsArgs {
+    /// Workspace containing the managed workstreams. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project override. Defaults to the current repository project.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Maximum workstreams to return, current first then newest activity.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub limit: u8,
+    /// Emit JSON instead of readable rows.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `workstream-search`.
@@ -1214,7 +1253,7 @@ pub enum McpClient {
     /// Oh My Pi (`omp`) — `~/.omp/agent/mcp.json`.
     #[value(alias = "oh-my-pi")]
     Omp,
-    /// Google Antigravity CLI (`agy`) — `~/.gemini/antigravity-cli/mcp_config.json`.
+    /// Google Antigravity CLI (`agy`) — `~/.gemini/config/mcp_config.json`.
     #[value(alias = "antigravity", alias = "agy")]
     AntigravityCli,
     /// Zero coding agent (Gitlawb/zero) — `~/.config/zero/config.json`,

@@ -7,6 +7,235 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.36.0-aerox.1] - 2026-08-30
+
+### Changed
+- Merged canonical ai-memory v1.36.0 while retaining the managed Aerox
+  Windows x86_64 and WSL/Linux x86_64 release bundles, checksums, SBOM,
+  attestations, and smoke tests.
+
+## [1.36.0] - 2026-08-29
+
+### Added
+- Bounded raw-observation retention as an opt-in fourth pass of the M8 forget
+  sweep, disabled by default. Nothing in the tree could delete an `observations`
+  row for age: the sweep acts on pages only, so raw capture grew without limit.
+  Measured on a three-month-old install, `observations` plus its FTS shadow and
+  four indexes were ~5.4 GB of a 5.53 GB store (5,236,232 rows), against 0.03 GB
+  of `pages` — the 2,365 compiled pages that hold the durable value. The nightly
+  backup tarball was 2.7 GB, almost all of it capture already distilled into
+  30 MB of Markdown. `decay.observation_retention_days` (default `0` = disabled)
+  now lets an operator bound that, and `decay.observation_prune_batch` (default
+  `5000`) bounds each transaction. (#508)
+
+  The pass deletes an observation only when its session was already consolidated
+  into a summary page that is still live, and the row is older than the
+  configured age. That is three gates on columns the schema already maintains:
+  `sessions.summary_page_id` is written only by the session-end path, so it
+  already implies `ended_at IS NOT NULL`; `pages.superseded_at IS NULL` excludes
+  a session whose page decay has evicted, because that session's raw rows are
+  now the only surviving copy; and a hard-deleted page has already NULLed the
+  pointer through `ON DELETE SET NULL`, so the join finds nothing. The prune
+  therefore runs LAST, after this same run's evictions and hard-deletes, rather
+  than letting raw capture outlive its distillation by one sweep. A session with
+  no `sessions` row, or one still running, matches nothing and can never lose a
+  row.
+
+  Each batch is one transaction sent as its own message to the single-writer
+  actor, so every other pending write interleaves between batches and a
+  multi-million row prune never holds the write lock across the run. Measured on
+  a 300,000-row store built from the shipped migrations: ~23-27 ms per 5,000-row
+  batch including the FTS trigger work, plus ~2-4 ms to commit. The session-end
+  observation watermark (`sessions.ended_observation_count`) is repaired in the
+  same transaction and only downward, so a resumed session's genuinely new work
+  is still read as new work instead of `AlreadyEnded`. One `prune_observations`
+  audit row is written per batch that actually deleted, inside that batch's
+  transaction. Zero migrations: every access is an index seek on
+  `idx_observations_project_created` and `idx_observations_session`, both of
+  which predate this change.
+
+  The cost is stated rather than hidden, and it is not just disk: observations
+  are the input to consolidation, so pruning is irreversible — a pruned session
+  can never be re-consolidated (not with a better model, a better prompt, or a
+  fixed consolidator bug) and its summary page becomes the only surviving
+  account of that session. Concretely: the raw transcript
+  view returns empty, `raw_hits` can no longer match the exact original wording,
+  a manual auto-improve rerun rejects with `too_few_observations`, and a
+  `move_session` with `PagesMode::Regenerate` has nothing left to rebuild the
+  page from. All of it is reachable only by setting a positive age. Note that
+  SQLite does not return freed pages to the OS without `VACUUM`, so the `.db`
+  file will not shrink after the first prune — the `ai-memory backup` tarball
+  will, because it is a fresh online copy.
+
+### Fixed
+- The CHANGELOG frozen-section check no longer fires on a branch that merged
+  `main` after a release. It compared line ranges since the merge base, so a
+  newly released section arriving through the merge read as lines the branch
+  had touched. It now compares the released half of the file directly against
+  the base branch, which is the question it was always asking. Two pipelines
+  also exited 141 under `pipefail` when `head -1` and `grep -q` closed a pipe
+  early, so the check reported "HEAD predates" on a branch that did not.
+- `hook-drain` no longer reports a clean pass when it could not read the spool
+  at all. `list_entries` was `read_dir(spool).ok()?`, so any IO failure —
+  permissions, a missing directory, a transient error — became "no entries" and
+  the drain returned zero sent, zero queued, zero dropped, exit 0, spool files
+  untouched, and not one byte on the wire. That is indistinguishable from a
+  healthy idle queue and cannot be diagnosed from outside the process. The
+  listing error is now reported on stderr, which the detached drainer
+  redirects into `logs/hook-drain.log`, and individual unreadable entries are
+  counted and reported rather than silently shortening the queue (#493).
+- The scheduled embedding backfill now reports how many pages it skipped.
+  It logged `embedded`, `failed` and `errors`, so a tick that passed over
+  every page and a tick with nothing to do produced the same completion
+  line — a page being skipped once an hour was indistinguishable from a
+  quiet, healthy scheduler. The count was already being returned by the
+  backfill and discarded at the caller. Reported by @barrosohub, who also
+  read the source to narrow it down (#509).
+
+
+## [1.35.0] - 2026-08-29
+
+### Added
+- `ai-memory handoffs` lists the open cross-agent handoffs for a project,
+  oldest first, with the id `memory_handoff_cancel` requires. A backlog was
+  previously visible only as a count in `status`: nothing exposed an id, so the
+  one available remedy could not be used. Read-only and content-free —
+  identity, provenance and age, never the handoff body. Automatic expiry
+  deliberately spares manual and sibling-directory handoffs, so a months-old
+  entry appearing here is that policy working as intended; the listing exists
+  so an operator can see it and decide (#513).
+
+### Fixed
+- Documented `ai-memory handoffs`. It shipped listed only in the
+  ARCHITECTURE subcommand block, which a guard test enforces — so the command
+  satisfied the check for being *present* without anyone being told what it
+  does. README and the MCP tool table now name it beside
+  `memory_handoff_cancel`, which is the tool it exists to make usable.
+- Made every "how long ago" in the CLI read the same way. Four separate
+  renderers had accumulated — `show`, `run`, `workstreams` and `handoffs` —
+  so the same elapsed time appeared as `3 hours ago`, `3h ago` or `74 days
+  ago` depending on which command produced it. They now share one helper, and
+  a long-idle native session reads `2 months ago` in `run` as it already did
+  elsewhere. `status`'s spool line is deliberately untouched: it renders a
+  duration (`oldest: 2h 10m`), not an "ago", and answers a different question.
+- `install-mcp --client antigravity-cli` wrote to `~/.gemini/antigravity-cli/mcp_config.json`,
+  but the Antigravity CLI documents its global MCP config at
+  `~/.gemini/config/mcp_config.json`; the `antigravity-cli/` directory is its
+  internal data dir and only holds an internal copy of the file. The default
+  path now targets `~/.gemini/config/mcp_config.json`, which also matches the
+  hooks integration (`~/.gemini/config/hooks.json`) (#510).
+- `install-hooks --agent codex --apply` produced a Windows command every Codex
+  hook rejected. Codex evaluates its `hooks.json` command strings with
+  PowerShell, where a quoted path in command position is a string expression
+  rather than an invocation, so each hook exited 1 with a ParserError and
+  captured nothing. The command now carries PowerShell's `&` call operator.
+  Scoped to Codex deliberately: `&` separates commands under cmd.exe, which is
+  what Claude Code's runner uses, so applying it everywhere would break the
+  integration that works today. A rendering test pins both directions, and
+  `uninstall` still recognises the new form (#515).
+
+## [1.34.0] - 2026-08-28
+
+### Added
+- `EMBEDDING_API_KEY`, an optional embedding-only credential resolved ahead of
+  `OPENAI_API_KEY` and `LLM_API_KEY`. Embeddings are already independently
+  configurable — `AI_MEMORY_EMBEDDING_PROVIDER`, `_MODEL`, `_DIM` and
+  `_BASE_URL` each have their own setting — but there was no key to go with
+  them, so pointing `AI_MEMORY_EMBEDDING_BASE_URL` at a second provider sent it
+  whichever credential the chat model happened to use. `voyage` and
+  `google`/`gemini` were unaffected: they already name their own key. `openai`
+  now resolves `EMBEDDING_API_KEY` → `OPENAI_API_KEY` → `LLM_API_KEY` (the last
+  still only with a custom base URL); `openai-compat` resolves
+  `EMBEDDING_API_KEY` → `LLM_API_KEY` and stays keyless when neither is set.
+  With the new variable absent, resolution is byte-identical to before. Both
+  `NotConfigured` messages name it, since that error is where an operator hits
+  the missing-key path. (#514)
+- The standalone `ai-memory-importer` companion can now replay bounded generic
+  external-conversation JSON into the existing observation/consolidation
+  pipeline. It is dry-run by default; `--apply` sends one ordered `/hook/batch`
+  with the dedicated `external-import` wire identity (stored in core's closed
+  `other` bucket), with extension provenance for assistant and system messages.
+  Full-envelope validation, client-side credential redaction,
+  stable session/event idempotency keys, event/byte caps, and a durable partial
+  failure manifest make interrupted imports safely resumable. Product-specific
+  ChatGPT/Claude export adapters and watch folders remain out of tree. (#483)
+- Added `ai-memory workstreams`, a read-only checkout-local list of recent
+  managed workstreams with the current selection first, linked harnesses,
+  timestamps, and stable ids. Human-readable and `--json` output share the same
+  bounded POST query, which follows `run`'s exact workspace, project,
+  repository, and worktree identity without returning checkout paths,
+  fingerprints, or native session ids. The Docker shell wrapper routes the
+  command through its native host client so repository identity remains
+  correct. (#499)
+### Fixed
+- OpenCode subagent session pages no longer use the fixed `You are a subagent
+  spawned by another session.` preamble as their title. The zero-LLM
+  synthesizer now promotes the first usable task line from the prompt body and
+  falls back to the session identity when the prompt contains only the
+  preamble. Repeated real user requests still remain separate session pages.
+  (#518)
+
+## [1.33.1] - 2026-08-28
+
+### Fixed
+- CI now rejects a change that writes into an already-released CHANGELOG
+  section. `bin/release` renames `## [Unreleased]` to `## [X.Y.Z]`, so a branch
+  opened before a release carries a diff anchored at the old line numbers and
+  git merges it into whatever section now occupies them — silently, with no
+  conflict. Three entries landed in the wrong release this way (#491 into
+  1.32.0, #502 into 1.32.2, #517 into 1.33.0), each claiming a fix shipped in a
+  version that did not contain it while the version that did listed nothing.
+  `scripts/check-changelog-frozen.sh` compares a branch against its merge base
+  and fails on any touched line below `[Unreleased]`.
+- The `ingest (server, this process)` counters in `ai-memory status` now move
+  for events delivered over `POST /hook/batch`. They were instrumented only in
+  the per-event `POST /hook` handler, while the spool drain posts batches and
+  falls back to `/hook` only against a pre-upgrade server, so a current client
+  against a current server left the whole section reading `accepted 0`,
+  `last write: -` and zero sheds while observations were landing normally — the
+  section exists precisely to tell "hooks are not arriving" apart from "hooks
+  are arriving but nothing is stored", and it reported the same thing for both.
+  A batch 429 also now counts every item it rejects, not just the one that
+  found no permit, so shed volume is comparable between the two routes instead
+  of understated by up to the batch size (#516).
+- `last write` in the same section now advances only when an event actually
+  cleared the writer. `handle_hook` stamped it unconditionally after processing
+  returned, and processing swallows its errors, so a store rejecting every
+  event — read-only database, exhausted disk, a failed migration — still
+  reported a fresh write time and looked healthy (#516).
+
+
+## [1.33.0] - 2026-08-28
+
+### Added
+- Generated `sessions/<id>.md` pages now surface the originating harness as
+  `agent` frontmatter alongside `session_id`. The value comes from the
+  persisted session row, so LLM rewrites, compaction checkpoints, spool
+  drains, and superseding versions do not mistake the later writer for the
+  origin; manual page writes remain unattributed. (#494)
+
+### Fixed
+- Prevented stored Markdown from automatically fetching external image URLs
+  when viewed in the web UI, while preserving clickable external links and
+  same-origin relative images (#491).
+- Made managed routing `SKILL.md` payloads byte-identical across release
+  platforms. Windows builds previously embedded CRLF from the runner checkout
+  while Linux and macOS builds embedded LF, so one tag returned different
+  bytes through CLI installs and `memory_install_self_routing`. The embedded
+  assets now use LF everywhere without rewriting user-authored files. (#502)
+- PowerShell compatibility hooks no longer assign to a local `$home` variable.
+  PowerShell names are case-insensitive, so that collided with the automatic
+  read-only `$HOME` variable and emitted `VariableNotWritable` for every hook
+  payload carrying a cwd. The marker-boundary helper now uses `$userHome`, with
+  native Windows and static shell regressions covering the error stream and
+  reserved-name contract (#498).
+- PowerShell compatibility hooks now encode JSON request bodies as explicit
+  UTF-8 bytes and declare `charset=utf-8`. Windows PowerShell 5.1 otherwise
+  encoded string bodies using a host-dependent legacy code page, so prompts,
+  paths, or tool content containing non-ASCII text could make `/hook` return
+  HTTP 400 and disappear from memory while ASCII events still worked. A native
+  Windows loopback test now round-trips Chinese and Portuguese text byte for
+  byte (#500).
 ## [1.32.2-aerox.2] - 2026-08-28
 
 ### Added
@@ -265,10 +494,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read identically whether hooks are broken or a repository simply never opted
   in — the exact ambiguity those counters were added to remove (#428, #446).
 
-### Fixed
-- Prevented stored Markdown from automatically fetching external image URLs
-  when viewed in the web UI, while preserving clickable external links and
-  same-origin relative images (#491).
 
 ### Docs
 - Documented the order of magnitude reported for lifecycle-hook overhead,
@@ -3862,7 +4087,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.32.2-aerox.2...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v1.36.0-aerox.1...HEAD
+[1.36.0-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.36.0-aerox.1
+[1.36.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.36.0
+[1.35.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.35.0
+[1.34.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.34.0
+[1.33.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.1
+[1.33.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.0
 [1.32.2-aerox.2]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.2-aerox.2
 [1.32.2-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.2-aerox.1
 [1.32.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.2
