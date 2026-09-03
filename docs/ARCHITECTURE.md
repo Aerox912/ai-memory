@@ -472,25 +472,44 @@ tokenless hook callers. Built-in `install-mcp --session-aware` registration
 remains a Claude Code option; multi-client deployment wrappers own their own
 registration and verified project selection.
 
+## HTTP authentication classes
+
+The process separates four active credential classes from one transitional
+browser compatibility path:
+
+| Class | Wire | Authorizes |
+|---|---|---|
+| Human password | `POST /auth/login` body | Session issuance only |
+| Web session | `ai_memory_session` cookie + CSRF | `/auth/me`, `/admin/*`, `/api/v1/*` by `AuthLevel`; never `/mcp` or hooks |
+| Recovery | `POST /auth/recovery` body | Root password reset; no session |
+| API key | `Authorization: Bearer` (`aim_`, root `AI_MEMORY_AUTH_TOKEN`, or external `amk_`) | Machine APIs; never a web session |
+| Deprecated browser compatibility | HTTP Basic root bearer, then HttpOnly `ai_memory_auth` cookie | GET-only browser routes until any human password or completed bootstrap exists; never machine routes |
+
+The deprecated Basic/cookie path stops immediately when human auth becomes
+active; restart is not required. `/web` SPA HTML is public static; the builtin
+wiki browser and JSON APIs stay behind the route class above.
+
 ## CLI subcommand surface
 
 ```
 init                 status               run
-show                 continue             workstreams
-workstream-search    audit-contamination  search
-read-page            write-page           delete-page
-serve                reset                backup
-restore              reindex              install-hooks
-hook                 install-mcp          commit
-checkpoints          restore-page         llm-test
-forget-sweep         lint                 curator
-auto-improve-report  auto-improve         finalize-session
-pending-writes       embed                generate-auth-token
-setup-agent          bootstrap            install-instructions
-install-skills       reorg                purge-project
-rename-project       move-project         move-session
-uninstall            auth                 user
-completions          handoffs
+show                 continue             resume
+workstreams          rename-workstream    workstream-search
+audit-contamination  search               read-page
+write-page           delete-page          serve
+reset                backup               restore
+reindex              install-hooks        hook
+install-mcp          commit               checkpoints
+restore-page         llm-test             forget-sweep
+lint                 curator              auto-improve-report
+auto-improve         finalize-session     pending-writes
+embed                generate-auth-token  setup-agent
+bootstrap            install-instructions install-skills
+reorg                purge-project        rename-project
+move-project         move-session         uninstall
+auth                 user                 completions
+handoffs             purge-session        compact
+api-key              export-okf
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -526,8 +545,11 @@ that touch the relevant area.
 8. **`{provider, model, dim}` denormalised next to every embedding.**
    Warn and ignore stale vectors on mismatch until re-embedding completes.
    (agentmemory #469.)
-9. **Live-process check before destructive ops.** `ai-memory reset`,
-   `backup`, `restore` all consult `sysinfo`. (basic-memory #765.)
+9. **Live-process check before direct-disk lifecycle ops.** `ai-memory reset`,
+   `restore`, `reindex`, and `uninstall --purge-data` consult `sysinfo`; the
+   uninstall guard is conditional on `--purge-data`. `backup` is a thin HTTP
+   client instead: the server snapshots SQLite with its online backup API while
+   the writer remains live. (basic-memory #765.)
 10. **Atomic file writes** (tmp + rename + fsync). Watcher ignores
     own writes by filename prefix.
 11. **Absolute canonical data dir** default; logged loudly on
@@ -610,6 +632,14 @@ ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
+AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
+                           (none|minimal|low|medium|high|xhigh|max|ultra|persistent)
+                           mapped per provider: OpenAI `reasoning_effort`,
+                           OpenRouter `reasoning.effort`, xAI Grok
+                           `reasoning_effort`, Anthropic `output_config.effort`,
+                           Codex `reasoning.effort`. Gemini and Copilot
+                           ignore the key. Host-unsupported values are
+                           clamped to each provider's published enum.
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token

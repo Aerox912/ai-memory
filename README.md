@@ -14,8 +14,58 @@
 [![Rust](https://img.shields.io/badge/rust-1.95+-blue)](rust-toolchain.toml)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-## Support Matrix
+## Why ai-memory
 
+Your coding agent already has a memory feature. Claude Code takes its own
+notes, Cursor remembers some things, and every platform is adding more. All
+of them share the same walls: the notes live on one machine, belong to one
+agent, and vanish from view the moment you switch tools — or teammates.
+
+ai-memory is what's on the other side of those walls.
+
+- **It follows you across agents.** Twenty-plus harnesses — Claude Code,
+  Codex, Cursor, Gemini CLI, OpenCode, Grok, Devin, Kimi, Kiro, and more —
+  feed one shared memory. Quit Claude Code mid-task, open Codex in the same
+  directory, and the next agent picks up a real handoff: where you left
+  off, what failed, what's still open. Handoffs are a protocol here, not a
+  convention — typed, owned, claimed exactly once.
+
+- **It follows you across machines.** Memory lives in a server you run —
+  on the same laptop, a homelab box, or wherever — so the project you left
+  on the desktop is the project you resume on the laptop. Same knowledge,
+  same open questions.
+
+- **It works for a team.** Point everyone at one server and what one
+  person's sessions learn, everyone's agents can retrieve. Knowledge is
+  shared per project; personal handoffs stay personal. Multi-user auth,
+  per-person attribution, and an audit log are built in — not a paid tier.
+
+- **Your memory is plain markdown.** The source of truth is a git-backed
+  wiki of ordinary `.md` files: `grep` it, open it in Obsidian, edit it by
+  hand, `rsync` it. The database is a derived index that can always be
+  rebuilt from the files. No vector store to babysit, nothing held hostage
+  in a binary blob.
+
+- **It captures the work itself, silently.** Lifecycle hooks record what
+  actually happened — prompts, tool calls, session boundaries — sanitized
+  at a typed privacy boundary before anything is stored, then consolidated
+  into readable pages. No "remember this" ceremony. And the default path
+  uses **zero LLM calls**: capture, search, and handoffs all work with no
+  API key at all.
+
+- **It tells you the truth about itself.** One self-contained binary.
+  Purge commands that say exactly what "deleted" means. A measured write
+  ceiling (~700/s) instead of a guessed one. An audit log of every
+  mutation. Boring, in the way infrastructure should be.
+
+## How it works
+
+```
+capture ──▶ consolidate ──▶ recall ──▶ handoff
+ hooks        session-end      search     next agent,
+ observe      summaries as     + brief    any harness
+ silently     wiki pages       injection
+```
 | Area | Status | Notes |
 |---|---|---|
 | Linux | Supported | The Aerox912 fork publishes the native `ai-memory-linux-x86_64.tar.gz` bundle used by WSL. Upstream remains the source for ARM Linux, Docker, and AUR artifacts. |
@@ -367,40 +417,54 @@ priors are at the [bottom](#influences-and-prior-art).
   [`docs/auto-improve-eval-gates.md`](docs/auto-improve-eval-gates.md) for
   example executable eval scorers.
 
-  Existing installs do not need per-project migration. The scheduler initializes
-  a per-project first-run watermark so historical sessions are not reviewed
-  automatically on upgrade, then records per-session claims so failed scheduled
-  reviews do not retry forever; use manual auto-improve for old sessions or
-  failed scheduled sessions you want to catch up. Older configs may still contain
-  an `[auto_improve] mode = ...` line; current ai-memory ignores that legacy key,
-  so you can remove it when convenient.
-- **"What housekeeping should I consider?"**
-  `ai-memory curator` runs a no-LLM, rule-based maintenance report over cold
-  episodic pages, stale slots, duplicate exact normalized titles, and dangling
-  cross-project links. It is report-only unless `--stage` is passed; staging
-  queues one report page for approval and still performs no maintenance actions
-  itself. Shared servers can opt into `[decay] breadth_weight` to give pages
-  reinforced by several identified operators a retention bonus; the default
-  `0.0` leaves existing retention scores unchanged.
-- **"Run one ai-memory for the whole household."** Stand the server
-  up on a homelab box at `0.0.0.0:49374` with a bearer token; every
-  laptop/desktop talks to it. Per-cwd routing keeps each project's
-  pages cleanly separated; the `/web` UI is reachable from a
-  browser anywhere on the LAN.
-- **"Audit what landed before sharing with a teammate."** Browse
-  the wiki at `http://<server>:49374/web` - HTTP Basic dialog if
-  auth is on, paste the token as password. Per-project tree view,
-  rendered markdown, supersession chain visible per page.
-- **"Undo one bad page edit without rolling back the whole server."**
-  `ai-memory checkpoints` shows recent wiki commits, then
-  `ai-memory restore-page --path notes/foo.md --from <rev>` restores that one
-  markdown file and reindexes it into SQLite. Full `backup` / `restore` is
-  still the answer for DB-only state such as sessions, observations, handoffs,
-  users, audit rows, and embeddings.
-- **"Drop an experiment, keep the rest."**
-  `ai-memory purge-project --project experimental --confirm`.
-  Atomic: that project's DB rows cascade away, its wiki subdir gets
-  `rm -rf`'d, every sibling project is untouched by construction.
+Agents emit sanitized observations through lifecycle hooks as you work.
+At session end, observations become coherent markdown pages in the
+project's wiki (optionally LLM-written; useful even without). The next
+session — any agent, any machine — gets a bounded brief and can search
+everything: full-text, entities, links, and (optionally) vectors, fused
+into one ranking. Cross-agent handoffs carry the baton explicitly.
+
+The full design, including the invariants that keep multi-user and
+multi-session use safe, is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Support matrix
+
+Every row below is a first-party integration — MCP registration, lifecycle
+hooks, or both — kept honest by CI. The full matrix with per-agent notes and
+caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
+
+| Area | Status |
+| --- | --- |
+| Linux | Supported |
+| macOS | Supported |
+| Windows via WSL2 | Supported |
+| Native Windows | Experimental |
+| Claude Code | Supported |
+| Codex | Supported |
+| Command Code | Supported |
+| Devin CLI | Supported |
+| OpenCode | Supported |
+| Cursor | Supported |
+| Gemini CLI | Supported |
+| Oh My Pi / OMP | Supported |
+| Pi | Supported |
+| Crush | Managed-only |
+| Managed workstreams | Opt-in |
+| Claude Desktop | MCP-only |
+| OpenClaw | Supported |
+| Antigravity CLI | Supported |
+| Grok Build CLI | Supported |
+| Swival CLI | MCP-only |
+| Zero | Supported |
+| ZCode | Supported |
+| Kimi Code | Supported |
+| Kiro CLI | Supported |
+| Pool | Hooks-only |
+| VS Code Copilot | MCP-only |
+| Zed | MCP-only |
+| Hermes Agent | Community |
+| LLM/auth providers | Supported |
+| Embedding providers | Supported |
 
 ## Quick start
 
@@ -494,20 +558,6 @@ docker run -d --name ai-memory \
 #    for additional agents; full list in docs/install.md.
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
-# Grok Build CLI example:
-# ai-memory install-mcp   --client grok --apply
-# ai-memory install-hooks --agent  grok --apply
-# Kiro CLI v2 example (requires an existing Kiro agent config):
-# ai-memory install-mcp   --client kiro-cli --apply
-# ai-memory install-hooks --agent  kiro-cli --apply
-# Kiro CLI v3 example (standalone hook registration):
-# ai-memory install-hooks --agent  kiro-cli-v3 --apply
-# Command Code stable MCP + lifecycle example:
-# ai-memory install-mcp   --client command-code --apply
-# ai-memory install-hooks --agent  command-code --apply
-# Pool (Poolside Agent CLI) example — stages scripts and prints the
-# .poolside/settings.yaml snippet to paste into each repo (no MCP client yet):
-# ai-memory install-hooks --agent  pool --apply
 ```
 
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
@@ -516,26 +566,18 @@ open in this project will see a handoff with where you left off.
 On macOS, the native release binary is also supported and recommended when you
 do not need Docker; see [`docs/macos.md`](docs/macos.md).
 
-If two Claude Code sessions use the same server concurrently, enable
-per-session routing on the server and replace only the `ai-memory` MCP entry
-with the optional bridge:
+Wiring another agent is the same two commands with a different name —
+`--client codex`, `--agent codex`, and so on for every row of the support
+matrix. The full per-agent guide, including Windows and remote servers, is
+[`docs/install.md`](docs/install.md).
 
-```toml
-# <ai-memory data dir>/config.toml
-[auto_scope]
-mode = "per_session"
-```
+Two agents in the same project at once, or teammates on one server? That
+works out of the box: the "current project" pointer is isolated per caller
+by default (v1.39+). See [`docs/auto-scope.md`](docs/auto-scope.md) for the
+optional session-aware Claude Code bridge and the details.
 
-```bash
-ai-memory install-mcp --client claude-code --session-aware --apply
-```
-
-The bridge still connects to the configured local or remote HTTP server and
-forwards its bearer token, but also attaches Claude's lifecycle session id to
-every MCP request. Existing static HTTP installs remain the default. See
-[`docs/auto-scope.md`](docs/auto-scope.md) for Claude's `/clear` and
-implicit-resume limitations.
-
+Managed workstreams are optional and add cross-harness *session* continuity
+on top of shared memory:
 The same bridge can serve stdio-only Codex or Antigravity clients without a
 Claude session id. Deployment wrappers that already resolved a repository can
 run it with `--require-scope-pin --workspace <name> --project <name>` so every
@@ -588,458 +630,66 @@ the server may remain local or remote:
 
 ```bash
 ai-memory run claude
-# later, continue the same workstream in another harness
-ai-memory run codex --yolo
-# omit the name to continue the newest usable local harness session
-ai-memory run
-# or resume the newest managed checkout without changing directories first
-ai-memory continue
+ai-memory run codex --yolo   # later: same workstream, different harness
+ai-memory continue           # resume the newest managed checkout
 ```
 
-To remove ai-memory later, run `ai-memory uninstall --apply` from the
-same host environment. It removes ai-memory-owned config entries, instruction
-blocks, default-root managed skill files, and generated plugin files only after
-matching their ai-memory signatures; custom skill roots installed with
-`--target-dir` are cleaned up manually. Use `--mcp-url` if you installed MCP
-with a custom endpoint, and `--mcp-name` only when you need to narrow removal to
-one matching entry.
+`ai-memory uninstall --apply` removes everything ai-memory installed,
+and only what it installed. Install commands are idempotent and write
+timestamped backups next to any file they touch.
 
-### Install Notes
+## Everyday use
 
-- **SELinux:** on enforcing Linux hosts, the wrapper automatically adds
-  `--security-opt label=disable` only to short-lived helper commands that touch
-  bind-mounted host files. It does not alter the long-lived server container
-  or relabel `$HOME`; do not add `:z`/`:Z` to the whole home bind. Rootless
-  engines also get `-u 0:0` for those commands. Docker and podman report
-  rootless mode and SELinux support under different `info` keys; both are
-  read. The same treatment applies whenever `AI_MEMORY_DATA_DIR` selects a
-  host directory or an explicit `--config` reads a host file. See
-  [`docs/install.md`](docs/install.md#selinux-enforcing-hosts).
-- **Windows:** use the Linux path inside WSL2, or the native Windows wrapper
-  from PowerShell/cmd. Local supported profiles default to host-native commands:
-  Claude Code may use its supported `ai-memory.exe` exec form, while other
-  agents use native single command strings matching their hook schema. The
-  Docker wrapper protects `.ps1` fallback commands from nested PowerShell
-  expansion with `-EncodedCommand`; rerun
-  `install-hooks --agent <agent> --apply` after upgrading so existing hook
-  entries receive the current form.
-  PowerShell/Git Bash script bundles are compatibility fallbacks and do not
-  enforce capture-policy v1. Do not mix path worlds. See
-  [`docs/windows.md`](docs/windows.md).
-- **Docker compose:** `docker compose -f docker/docker-compose.yml up -d`
-  is supported; agent setup is the same as step 3 above.
-- **Remote server:** set `AI_MEMORY_SERVER_URL=http://<server-ip>:49374`
-  and `AI_MEMORY_AUTH_TOKEN=<token>` on the client before installing
-  MCP/hooks. Explicit `--server-url` flags still work, but are no longer
-  required when the env vars are set. Any non-loopback server should use
-  bearer auth.
-- **Managed-launch wrapper:** `ai-memory run`, `ai-memory show`,
-  `ai-memory continue`, and `ai-memory workstreams` must be intercepted by the
-  current host wrapper so local checkouts, native harnesses, and session stores
-  remain accessible. An old wrapper may pass these commands into Docker and
-  fail to find a checkout or host executable. Run
-  `ai-memory upgrade` on the agent machine to refresh it. The host-native runner
-  inherits `AI_MEMORY_SERVER_URL`, `AI_MEMORY_AUTH_TOKEN`, and the host `PATH`.
-- **Upgrades:** for Docker-wrapper installs, run `ai-memory upgrade` on each
-  agent machine. It refreshes the local wrapper, pulls the latest image, and
-  re-stages hook scripts under `~/.local/share/ai-memory/hooks/<agent>/`.
-  Native package/source installs should rerun
-  `ai-memory install-hooks --agent <agent> --apply` after upgrading the binary.
-  Remote/homelab servers must still be redeployed separately; local wrapper
-  upgrade only updates the client machine. Existing project prompt files keep
-  working. Refresh the managed ai-memory routing package
-  (`ai-memory install-instructions`, or `--target AGENTS.md` for AGENTS-based
-  projects) when you want new tool guidance. The refresh writes the slim
-  markered snippet and managed Agent Skills from the same binary-owned assets.
-  Managed skill payloads use LF line endings on every release platform, while
-  user-authored files keep their existing line endings.
-
-For every client in the [Support Matrix](#support-matrix), plus curl-based hook
-installs, source builds, CLI environment variables, and the full subcommand
-reference, see [`docs/install.md`](docs/install.md).
-
-Tab completion for the CLI is available in bash, zsh, fish, PowerShell, and
-elvish:
-
-```bash
-ai-memory completions fish > ~/.config/fish/completions/ai-memory.fish
-```
-
-See [`docs/shell-completions.md`](docs/shell-completions.md) for the other
-shells' install paths.
-
-## Security
-
-Loopback-only (`127.0.0.1:49374`) with no auth is the default because
-it is safe for a single-user laptop: no process outside the machine can
-reach the server.
-
-Unauthenticated non-loopback HTTP now fails closed. Set
-`AI_MEMORY_AUTH_TOKEN` or bind loopback; `--allow-insecure-no-auth` is an
-intentional, dangerous exception for plain HTTP only. Authentication does not
-encrypt bearer tokens: for LAN or remote access, use the ready
-[Caddy](docker/compose.tls.caddy.yml) or
-[Cloudflare Tunnel](docker/compose.tls.cloudflared.yml) templates described in
-the [HTTPS reverse-proxy guide](docs/https-via-proxy.md).
-
-Enable bearer auth when the server is exposed beyond loopback, when
-untrusted local processes share the machine, or when the data dir holds
-sensitive project history:
-
-```bash
-TOKEN=$(ai-memory generate-auth-token)
-
-docker run -d --name ai-memory \
-    --restart unless-stopped \
-    -p 0.0.0.0:49374:49374 \
-    -v ai-memory-data:/data \
-    -e AI_MEMORY_AUTH_TOKEN="$TOKEN" \
-    -e AI_MEMORY_ALLOWED_HOSTS="<server-ip>,localhost,127.0.0.1" \
-    akitaonrails/ai-memory:latest
-
-ai-memory install-mcp   --client claude-code --apply \
-    --server-url "http://<server-ip>:49374/mcp" --auth-token "$TOKEN"
-ai-memory install-hooks --agent  claude-code --apply \
-    --server-url "http://<server-ip>:49374" --auth-token "$TOKEN"
-```
-
-Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/admin/*`, and
-`/web/*`. Browser access to `/web` uses HTTP Basic auth with the token
-as the password. When `/web` is exposed through an HTTPS reverse proxy, set
-`AI_MEMORY_AUTH__SECURE_COOKIE=true`; it makes the browser cookie HTTPS-only.
-Close or redirect direct HTTP access to that hostname. Non-loopback binds should also set
-`AI_MEMORY_ALLOWED_HOSTS` to guard against DNS rebinding.
-
-Busy shared hook servers can also set `AI_MEMORY_HOOK_RATE_PER_SEC` (tokens per
-second per actor/session source) and optionally `AI_MEMORY_HOOK_RATE_BURST` to
-bound one runaway session without blocking unrelated hook sources. Unset or `0`
-rate leaves the limiter disabled.
-
-For shared servers where each developer should authenticate their own hook
-writes, native Claude Code hooks can use a stored OIDC device token instead of
-embedding a shared static token:
-
-```bash
-ai-memory auth login oidc-device \
-    --issuer "https://issuer.example.com/realms/team" \
-    --client-id "ai-memory-cli"
-
-ai-memory install-hooks --agent claude-code --apply \
-    --server-url "http://<server-ip>:49374"
-```
-
-OIDC hook auth requires the native `ai-memory hook ...` command path. The Docker
-wrapper keeps shell-script hooks by default; set up OIDC from a native release
-binary or source install. Thin-client HTTP commands such as `ai-memory status`
-and `ai-memory search` also use the stored OIDC access token when no static
-`AI_MEMORY_AUTH_TOKEN` / `[auth].bearer_token` is configured; the static bearer
-still wins when present. This is for OIDC-aware gateways/bridges; native
-ai-memory server auth still accepts static root bearer / DB-user tokens, and
-`/admin/*` remains root-only unless a gateway translates accepted OIDC auth into
-upstream auth that ai-memory accepts.
-
-OIDC/Keycloak session ids are login-provider sessions, not ai-memory agent
-sessions. Shared servers that rely on `[auto_scope]` session isolation still
-need explicit `workspace` + `project` / `scopes`, or a bridge that forwards the
-real lifecycle-hook session id on MCP requests.
-
-**Want HTTPS?** ai-memory deliberately does not terminate TLS itself —
-the right answer is a battle-tested reverse proxy in front of it.
-[`docs/https-via-proxy.md`](docs/https-via-proxy.md) is the deployment
-guide, with copy-paste docker compose templates in
-[`docker/compose.tls.caddy.yml`](docker/compose.tls.caddy.yml) (Caddy
-with Let's Encrypt or internal CA) and
-[`docker/compose.tls.cloudflared.yml`](docker/compose.tls.cloudflared.yml)
-(Cloudflare Tunnel — no open ports). Both are recommended once you
-turn on multi-user or bind beyond loopback. The Quick Start happy
-path of single-user on loopback doesn't need TLS — that case is
-called out explicitly in the guide so you don't add ceremony where
-it doesn't earn its keep.
-
-**Multi-user attribution (v0.8, optional).** When more than one human
-shares a server, ai-memory can attribute each write to a named user.
-The bearer token continues to authenticate at the wire level; users
-created via `ai-memory user add` get their own tokens that resolve to
-their identity in audit logs, page frontmatter, `/api/v1` responses, and the
-page view UI. Data stays single-tenant — there is no per-page RBAC. A
-`[auth].token_pepper` is required for DB-user authentication, but creating the
-first user row is what immediately switches every `/admin/*` endpoint to
-root-only, including status/search/read-page and user-management routes.
-`ai-memory init` generates a pepper for new installs without changing
-single-user behavior until a user is added. An SSO gateway can instead use a
-dedicated `[auth].actor_proxy_bearer_token` and trusted `X-Memory-Actor-*`
-headers; its credential is deliberately separate from the root bearer so a
-missing identity cannot become root. See
-[`docs/users.md`](docs/users.md) for the full walkthrough and the
-four-rung auth ladder.
-
-See [`docs/deploy.md`](docs/deploy.md) for the full homelab pattern
-with bearer auth, host allowlisting, and TLS/reverse-proxy options.
-
-## Using Memory
-
-Day to day, you mostly do not think about ai-memory. Lifecycle hooks
-capture prompts, tool calls, compaction checkpoints, and session
-boundaries. SessionStart hooks fetch pending handoffs before your first
-prompt in the next agent.
-
-Useful entry points:
+Day to day, you mostly do not think about ai-memory. Hooks capture
+prompts, tool calls, and session boundaries; session end turns them into
+readable wiki pages; the next session starts with a handoff.
 
 - Ask "where did we leave off?" to continue from the pending handoff.
 - Ask "have we discussed X?" or "search memory for Y" to query the wiki.
 - Ask "catch me up" for a prose digest of recent project activity.
-- Run `ai-memory bootstrap` once when adopting ai-memory in an existing
-  project with months of history.
-- Start the server with `--enable-web` and visit `/web` for a read-only
-  browser view of the markdown wiki. `--enable-web` also mounts a
-  read-only JSON frontend API at `/api/v1` (workspaces, projects, pages,
-  recent, briefing, search) so custom web UIs can read the memory without
-  opening SQLite or wiki files directly. Rendered pages keep external links
-  clickable, but image sources must be relative or root-relative; absolute
-  external images are neutralized so viewing stored Markdown cannot act as a
-  remote beacon:
+- Run `ai-memory bootstrap` once when adopting an existing project with
+  months of history.
+- Start the server with `--enable-web` for a read-only browser view of
+  the wiki and a JSON API under `/api/v1`.
 
-  ```text
-  GET  /api/v1/workspaces
-  GET  /api/v1/projects?workspace=...
-  GET  /api/v1/workspaces/{workspace}/projects/{project}/pages
-  GET  /api/v1/workspaces/{workspace}/projects/{project}/pages/{path}
-  GET  /api/v1/workspaces/{workspace}/projects/{project}/recent?limit=...
-  GET  /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=...
-  GET  /api/v1/workspaces/{workspace}/overview?limit=...
-  GET  /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=...
-  GET  /api/v1/workspaces/{workspace}/projects/{project}/handoffs?state=...&limit=...
-  GET  /api/v1/search?q=...&workspace=...&project=...&limit=...
-  POST /api/v1/search   { "q": "...", "scopes": [{ "workspace": "...", "project": "..." }] }
-  ```
+The full tour — search modes, entities, feedback, briefings, the web
+API — is in [`docs/usage.md`](docs/usage.md) and
+[`docs/use-cases.md`](docs/use-cases.md).
 
-  `overview` bundles the open handoff + briefing + memory-health for a workspace
-  or project in one call (the data a project overview screen needs). The
-  handoff history defaults to the caller's own plus shared rows; root can use
-  `all_owners=true` for recovery across operators.
+## Teams and multiple machines
 
-  **Full integration guide:** see [`docs/frontend-api.md`](docs/frontend-api.md)
-  for auth setup, response schemas, error model, limits/pagination,
-  custom-UI hosting, a worked `fetch`/`curl` example, and the canonical
-  source-of-truth files. Read that first if you're building a frontend.
+Run the server somewhere reachable — a homelab box, a LAN host — and
+point every machine and every teammate at it. Knowledge is shared per
+project; personal handoffs stay personal; every write is attributed and
+audited. Multi-user auth (passwords, API credentials) is built in.
 
-  To serve your own static frontend instead of the built-in UI, point
-  `--web-ui-dir` at the frontend's build output (same-origin with
-  `/api/v1`, `/mcp`, `/admin/*`, so the existing auth applies):
+Start with [`docs/users.md`](docs/users.md) for accounts and ownership,
+and [`docs/deploy.md`](docs/deploy.md) for the server itself — including
+capacity numbers measured rather than guessed, and the one rule that
+matters: one server per data directory, never two.
 
-  ```bash
-  ai-memory serve --transport http --bind 127.0.0.1:49374 \
-    --enable-web --web-ui-dir ../ai-memory-ui/dist
-  ```
+## Security
 
-  A reference implementation — a SolidJS knowledge browser with
-  screenshots and e2e tests — lives at
-  [djalmajr/ai-memory-ui](https://github.com/djalmajr/ai-memory-ui).
+The quick-start default is loopback-only with no auth — nothing outside
+your machine can reach it. From there, hardening is incremental: a bearer
+token for the LAN, per-user accounts, OIDC device auth for hooks, TLS via
+a reverse proxy. Capture is sanitized at a typed privacy boundary before
+anything is stored, and per-repository `[capture]` rules can exclude
+paths or invert to allowlist mode.
 
-  Richer products such as import/migration pipelines and write-capable
-  browser chat/editors should live as optional companion crates or projects
-  that call ai-memory's public HTTP/MCP surfaces. The first implemented
-  companion is the standalone OMC wiki importer at
-  [`companions/ai-memory-importer`](companions/ai-memory-importer), which is
-  intentionally not a root workspace member and is not included in root
-  `cargo test --workspace`. See
-  [`docs/companion-crates.md`](docs/companion-crates.md) for the boundary.
+The full model is in [`docs/security.md`](docs/security.md),
+[`docs/users.md`](docs/users.md), and
+[`docs/https-via-proxy.md`](docs/https-via-proxy.md).
 
-  When a reverse proxy hosts ai-memory under a URL subpath, set
-  `--base-path` (or `AI_MEMORY_BASE_PATH`) so every HTTP surface moves
-  together. Example: `--base-path /wiki` serves MCP at `/wiki/mcp`, hooks at
-  `/wiki/hook`, the API at `/wiki/api/v1`, and the default browser at
-  `/wiki/web`. Set `--web-slug /` if you want the browser or custom SPA at
-  `/wiki` itself.
+## LLM providers
 
-Install the managed routing package once so agents proactively call the
-right MCP tool for those prompts:
-
-```bash
-ai-memory install-instructions
-```
-
-That command writes or updates the slim `<!-- ai-memory:start -->` block and
-the managed ai-memory Agent Skills that carry the detailed routing guidance.
-See [`docs/usage.md`](docs/usage.md) for handoff examples, proactive query
-routing, bootstrap details, web UI screenshots, and the raw-wiki inspection
-commands. CLI URL/auth configuration lives in
-[`docs/install.md`](docs/install.md#configuring-the-cli-url-and-auth).
-
-### Entity retrieval
-
-Consolidation extracts specific technologies, components, services, files, and
-domain nouns into each page's canonical frontmatter. Hand-edited wiki pages can
-declare the same bounded index explicitly:
-
-```yaml
----
-title: Queue choice
-entities:
-  - nats jetstream
-  - delivery guarantees
----
-```
-
-Names are lowercased, whitespace-normalized, de-duplicated, capped at 10 per
-page and 64 characters each, and rebuilt from Markdown during a clean-store
-`ai-memory reindex`.
-Entity lookup is project-scoped, ignores expired pages by default, and reports
-`entity_rank`, its raw inverse-frequency `entity_weight`, `matched_entities`,
-and its RRF contribution under
-`memory_query(..., explain: true)`.
-
-## LLM Providers
-
-ai-memory runs without an LLM: hooks still capture sessions, search uses
-FTS5 + declared entities + graph neighbors, and summaries fall back to
-rule-based output. Add an LLM provider
-when you want LLM consolidation (on PreCompact, on demand via
-`memory_consolidate`, or opt-in at session end with
-`AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
-Substantive session ends always write a rule-based summary page + handoff either
-way. A session containing only `SessionStart` / `SessionEnd` boundaries is
-closed without a page, handoff, or provider job. When that empty session had
-accepted startup context, its session-bound handoff is returned to the open
-pool for the next receiver instead of being lost.
-When the session-end opt-in is enabled, provider work is durably queued after
-those deterministic writes and handled by one bounded server worker, so hook
-drain latency does not cancel it. Failed jobs retry with backoff and survive a
-server restart. A resumed native session is ended again only after its
-observation generation advances; the persisted generation watermark makes
-duplicate SessionEnd delivery and system clock skew converge without repeated
-provider work. The end watermark and automatic handoff commit atomically, and
-an interrupted keyed replay finishes the wiki commit, queue insert, and key
-completion without duplicating that handoff. On the next SessionStart, the
-newest cwd-eligible automatic handoff wins; accepting it expires older eligible
-automatic handoffs without consuming manual or sibling-directory work. A new
-automatic handoff also expires prior open automatic handoffs from its exact
-cwd, so repeated SessionEnds cannot accumulate there before a receiver starts.
-
-To keep consolidation style project-specific, write
-`_prompts/consolidation.md` in that project's wiki. Its body can express
-preferences such as "prefer Portuguese titles" or "omit routine CI noise".
-Automatic, single-page, and multi-page consolidation use the page; a manual
-`memory_consolidate` call can pass `instructions` to override it once. ai-memory
-sanitizes and caps the value at 2,000 characters, JSON-encodes it in the user
-message, and treats it as untrusted advisory data. It cannot supply facts,
-request tool use or disclosure, or override the consolidation schema and
-faithfulness rules. TTL-expired preference pages are ignored. With no active
-page or argument, no preference block is appended.
-
-Recommended defaults:
-
-| Provider | Default | Use when |
-|---|---|---|
-| `anthropic` | `claude-haiku-4-5` | Best default for consolidation quality and rule classification. |
-| `anthropic-oauth` | `claude-sonnet-4-6` | Use a Claude Pro/Max subscription via `claude setup-token`, no API key. |
-| `openai` | `gpt-5.4-mini` | Cheaper and faster hosted option. |
-| `openai-oauth` | `gpt-5.5` | ChatGPT Pro/Plus/Codex backend via `ai-memory auth login openai-oauth`; no Platform API key. |
-| `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
-| `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
-| `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Ollama, vLLM, LM Studio, and other compatible endpoints. |
-
-`openai-oauth` stores a refresh token in `<data_dir>/auth.json` and talks to
-the ChatGPT/Codex Responses backend, not `api.openai.com`. For Docker quick
-starts, run `ai-memory auth login openai-oauth` with the wrapper so the token
-lands in the same `ai-memory-data` volume as the server.
-
-`anthropic-oauth` hits the same `/v1/messages` endpoint as `anthropic` but
-authenticates with an OAuth bearer token instead of an API key. Run
-`claude setup-token` once, then set `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` and
-`ANTHROPIC_OAUTH_TOKEN=<token>` (or `CLAUDE_CODE_OAUTH_TOKEN`, which `claude
-setup-token` writes automatically). No `ANTHROPIC_API_KEY` is needed. The Docker
-wrappers forward either token by name to short-lived helper commands such as
-`llm-test`; configure the long-lived server container separately as shown in the
-installation guide.
-
-For both Anthropic providers, ai-memory omits `temperature` for Claude
-4.7 and later models and Claude Mythos Preview because those models reject
-non-default sampling parameters. `llm-test` sends the same representative 0.2
-value as the normal pipeline before the provider applies that compatibility
-rule.
-
-**⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
-it may get your account rate-limited or banned. See
-[the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
-
-`copilot` stores a GitHub user token in the same auth file, exchanges it for a
-short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
-uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
-also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
-
-> [!TIP]
-> **For the OAuth/subscription backends (`anthropic-oauth`, `openai-oauth`,
-> `copilot`), pick a small, fast model** via `AI_MEMORY_LLM_MODEL` — e.g.
-> `claude-haiku-4-5` or `gpt-5-mini`. ai-memory's LLM work (consolidation,
-> lint, explore) is summarisation, not hard reasoning, so a Haiku/mini-class
-> model is plenty and is much easier on subscription rate limits. Save the
-> high-effort thinking models for your coding agent.
-
-> [!TIP]
-> **OpenAI-compatible structured output is schema-constrained by default.**
-> ai-memory sends each operation's JSON Schema through
-> `response_format=json_schema`, which recent Ollama, vLLM, LM Studio, and
-> llama.cpp releases honour. It falls back to the tolerant parser when an
-> endpoint explicitly rejects that field or returns a malformed shape. Set
-> `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
-
-For small-context local models, configure both consolidation limits. The input
-target accounts for the complete rendered prompt, including bounded slot and
-current-page context plus the structured-output schema; the output limit is
-sent to the provider. Their sum must fit the model context window, with extra
-headroom because provider tokenizers differ:
-
-```toml
-[consolidation]
-max_input_tokens = 6500
-max_output_tokens = 1000
-```
-
-The equivalent environment variables are
-`AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` and
-`AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS`. Provider failures during an
-automatic PreCompact/PostCompaction checkpoint fall back to the deterministic
-rule-based page; admission, storage, and scope errors still fail closed. The
-validated minimums are 6,000 input and 1,000 output tokens.
-
-Every chat provider bounds each completion request at 300 seconds
-(`AI_MEMORY_LLM_TIMEOUT_SECS` to override, or `llm_timeout_secs = 900` in
-config.toml; the quick openai-oauth token refresh keeps the default ceiling).
-The default tolerates a local engine cold-loading a large model; slow hosted
-gateways whose long completions exceed the ceiling fail every request with
-`http: error sending request`, so raise the value there instead of watching
-consolidation exhaust its retries.
-
-Reranking is optional and off by default. With an LLM provider configured,
-`AI_MEMORY_RERANKER=llm` makes project and explicit-scope `memory_query`
-calls over-fetch from the hybrid stage, fuse scopes, and make at most one LLM
-call to reorder the best candidates. This can promote a relevant page that
-RRF ranked below the requested cut, at the cost of LLM latency and usage. The
-request sends the query plus at most 30 bounded page titles and search snippets
-to the configured provider; all values are JSON-encoded and treated as
-untrusted data. A timeout, provider error, or incomplete/invalid score set
-preserves the normal order. `global=true` and supplemental global-preference
-hits keep their existing non-RRF ranking. Concurrent provider calls are capped
-at four; saturated queries keep their local ranking without waiting.
-
-Embeddings are optional and separate from the LLM provider. Set
-`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
-`openai-compat` when you want vector retrieval in addition to FTS5 + entity +
-graph-neighbor retrieval. `openai-compat` targets self-hosted engines
-(Ollama, LM Studio, vLLM): it needs no API key and requires explicit
-`AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
-`AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
-embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
-embeddings can run on a different provider than the LLM. Both the FTS-only and
-hybrid paths apply the same bounded page-authority adjustment after candidate
-generation; embeddings improve relevance recall but do not decide which source
-is canonical.
-
-See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
-for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and
-[`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
-for the empirical model comparison.
+Optional. Everything works with zero LLM calls; adding a provider
+upgrades session summaries and enables semantic search. Anthropic,
+OpenAI (incl. OAuth/Codex), GitHub Copilot, Gemini, OpenCode Zen, and
+any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
+for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
+endpoints for embeddings. Configuration lives in
+[`docs/llm-providers.md`](docs/llm-providers.md).
 
 ## Architecture
 
@@ -1077,7 +727,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and current hook/MCP harness caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes, handoff-injection limits, and community bridge guidance. |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
-| [`docs/users.md`](docs/users.md) | **Multi-user attribution (v0.8).** Four-rung auth ladder, `ai-memory user add/list/expire/revive/rotate-token` walkthrough, backward-compat migration for pre-v0.8 installs, token storage rationale. |
+| [`docs/users.md`](docs/users.md) | **Multi-user attribution and human login.** Four-rung bearer ladder, password sessions, `ai-memory user` / `api-key` walkthrough, brownfield `aim_` migration. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS (multi-user, non-loopback) and when you don't (loopback / stdio). Copy-paste docker compose templates for Caddy + Let's Encrypt, Caddy + internal CA (LAN-only), Cloudflare Tunnel (no open ports), and external cert files; plus native-Caddy + nginx recipes. The "thinking you're secure when you're not" failure modes explicitly called out. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset / reindex / restore-page.** Safety matrix for state-touching commands, per-project disk layout (how isolation actually works), checkpoint-based page recovery, and operator workflows for "fresh start", "snapshot before risky op", "drop one project", and rebuilding SQLite from wiki files. |
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: Hermes-inspired scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
@@ -1086,6 +736,19 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
 | Research docs under `docs/` | Karpathy LLM Wiki notes, Hermes Agent, agentmemory / basic-memory / cognee deep-dives, lessons-learned from upstream issues. |
+- [`docs/support-matrix.md`](docs/support-matrix.md) - the full agent/platform matrix with notes.
+- [`docs/use-cases.md`](docs/use-cases.md) - scenario walkthroughs.
+- [`docs/llm-providers.md`](docs/llm-providers.md) - provider configuration.
+- [`docs/security.md`](docs/security.md) - the full security model.
+- [`docs/research-2026-landscape.md`](docs/research-2026-landscape.md) - how the field looks and where we sit in it.
+- [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
+- [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.
+- [`docs/typed-edges.md`](docs/typed-edges.md) - typed relation edges (`causes` / `fixes` / `contradicts`) and how lint uses them.
+- [`docs/temporal.md`](docs/temporal.md) - ingestion-time validity on the entity index and `as_of` time-travel queries.
+- [`docs/local-embeddings.md`](docs/local-embeddings.md) - in-process embeddings with no API key (`embedding_provider = "local"`).
+- [`docs/experience.md`](docs/experience.md) - the opt-in cross-session abstraction pass: knowledge visible only across trajectories.
+- [`docs/MIGRATION-2.0.md`](docs/MIGRATION-2.0.md) - upgrading an existing store to 2.0: the backup-gated automatic migration and how to restore.
+- [`docs/benchmarks/`](docs/benchmarks/README.md) - published retrieval-quality numbers with provenance, reproducible from the in-repo harness.
 
 ## Influences and prior art
 

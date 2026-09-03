@@ -308,9 +308,10 @@ fn cwd_query_suffix(
 
 fn after_background_drain_event_enqueue(
     data_dir: &Path,
-    spawn: impl FnOnce(&Path) -> std::io::Result<()>,
+    live_token: Option<&str>,
+    spawn: impl FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    spawn(data_dir)
+    spawn(data_dir, live_token)
 }
 
 /// Hidden drain-only fast path. Reads no stdin and writes no stdout.
@@ -523,16 +524,21 @@ pub async fn run(data_dir: Option<PathBuf>, args: HookArgs) -> anyhow::Result<()
     std::io::stdin().read_to_string(&mut payload).ok();
     let mut stdout = std::io::stdout();
     let drain_server_url = args.server_url.clone();
-    let drain_auth_token = args.auth_token.clone();
     let drain_pool_id = args.pool_id.clone();
-    run_with_payload(data_dir, args, payload, &mut stdout, move |path| {
-        spawn_background_drainer(
-            path,
-            &drain_server_url,
-            drain_auth_token.as_deref(),
-            drain_pool_id.as_deref(),
-        )
-    })
+    run_with_payload(
+        data_dir,
+        args,
+        payload,
+        &mut stdout,
+        move |path, live_token| {
+            spawn_background_drainer(
+                path,
+                &drain_server_url,
+                live_token,
+                drain_pool_id.as_deref(),
+            )
+        },
+    )
     .await
 }
 
@@ -545,7 +551,7 @@ async fn run_with_payload<W, S>(
 ) -> anyhow::Result<()>
 where
     W: std::io::Write,
-    S: FnOnce(&Path) -> std::io::Result<()>,
+    S: FnOnce(&Path, Option<&str>) -> std::io::Result<()>,
 {
     let agent_kind = AgentKind::from_wire(&args.agent);
     let hook_event = HookEvent::parse(&args.event);
@@ -696,11 +702,17 @@ where
     let hook_qs = format!("{qs}{session_qs}{managed_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
-    // mode is decided without a round-trip. Static bearer bytes remain only in
-    // this process and are supplied to drainers at runtime; OIDC is resolved +
-    // refreshed at drain time; otherwise the event is anonymous.
+    // mode is decided without a round-trip. Static bearer bytes stay in this
+    // process and are supplied to drainers at runtime; otherwise a present
+    // OIDC token marks the event `oidc` (resolved + refreshed at drain time).
+    // #552: the bearer is no longer rendered onto the hook's command line, so
+    // fall back to the copy `install-hooks --apply` persisted under the data
+    // dir. An explicit `--auth-token` still wins, which keeps every config
+    // written before this change working exactly as it did.
+    let persisted_token = crate::config::read_hook_auth_token(&dd);
+    let effective_token = args.auth_token.as_deref().or(persisted_token.as_deref());
     let static_auth =
-        args.auth_token.is_some() || env_lookup(STATIC_AUTH_ENV).as_deref() == Some("1");
+        effective_token.is_some() || env_lookup(STATIC_AUTH_ENV).as_deref() == Some("1");
     let oidc_present = !static_auth
         && OidcToken::load(&dd.join("auth.json"))
             .ok()
@@ -812,7 +824,7 @@ where
         // handoff on demand via the MCP `memory_handoff_accept` tool.
         if agent_kind.session_start_injects_handoff() {
             let client = build_client();
-            let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
                 || session_qs.clone(),
                 |session_id| format!("&session_id={}", url_encode(session_id)),
@@ -850,7 +862,7 @@ where
         && AgentKind::from_wire(&args.agent).user_prompt_injects_handoff()
     {
         let client = build_client();
-        let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
         let native_session_qs = canonical_session_id
             .as_deref()
             .map_or_else(String::new, |session_id| {
@@ -917,7 +929,17 @@ where
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
     if should_spawn_background_drainer(&args.event)
-        && let Err(err) = after_background_drain_event_enqueue(&dd, spawn_background_drainer)
+        && let Err(err) = after_background_drain_event_enqueue(
+            &dd,
+            // The hook's own token, resolved the same way it authenticates
+            // its own request: `--auth-token`, else the environment, else the
+            // copy `install-hooks --apply` persisted under the data dir
+            // (#552). Current by construction either way. The drain uses it
+            // only to retry an entry the server has already rejected with 401
+            // (#542).
+            effective_token,
+            spawn_background_drainer,
+        )
     {
         eprintln!(
             "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
@@ -1347,7 +1369,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1366,7 +1388,7 @@ mod tests {
             antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
             "not-json".into(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1494,7 +1516,7 @@ mod tests {
             devin_hook_args("session-start"),
             payload.to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1534,7 +1556,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1586,7 +1608,7 @@ mod tests {
             devin_hook_args("post-tool-use"),
             payload.to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1624,7 +1646,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1640,7 +1662,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1783,7 +1805,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1796,7 +1818,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1835,7 +1857,7 @@ mod tests {
             args,
             r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
             &mut stdout,
-            |path| {
+            |path, _token| {
                 assert_eq!(path, data_dir.as_path());
                 assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
                 called.set(called.get() + 1);
@@ -1880,7 +1902,7 @@ mod tests {
                 args,
                 r#"{"session_id":"s","cwd":"/tmp"}"#.into(),
                 &mut stdout,
-                |path| {
+                |path, _token| {
                     assert_eq!(path, data_dir.as_path());
                     assert_eq!(hook_spool::spool_len(&spool), 1, "spawn runs after enqueue");
                     called.set(called.get() + 1);
@@ -1919,9 +1941,13 @@ mod tests {
             capture_mode: None,
         };
 
-        run_with_payload(Some(data_dir), args, "{}".into(), &mut stdout, |_path| {
-            Err(std::io::Error::other("spawn failed"))
-        })
+        run_with_payload(
+            Some(data_dir),
+            args,
+            "{}".into(),
+            &mut stdout,
+            |_path, _token| Err(std::io::Error::other("spawn failed")),
+        )
         .await
         .unwrap();
 
@@ -1954,7 +1980,7 @@ mod tests {
             args,
             r#"{"hook_event_name":"SessionEnd"}"#.into(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -1978,7 +2004,7 @@ mod tests {
     #[test]
     fn session_end_spawn_failure_is_returned_for_warning_only() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = after_background_drain_event_enqueue(tmp.path(), |_path| {
+        let err = after_background_drain_event_enqueue(tmp.path(), None, |_path, _token| {
             Err(std::io::Error::other("spawn failed"))
         })
         .unwrap_err();
@@ -1991,7 +2017,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let called = std::cell::Cell::new(false);
 
-        after_background_drain_event_enqueue(tmp.path(), |path| {
+        after_background_drain_event_enqueue(tmp.path(), None, |path, _token| {
             assert_eq!(path, tmp.path());
             called.set(true);
             Ok(())
@@ -2041,7 +2067,7 @@ mod tests {
         let called = std::cell::Cell::new(false);
         let mut args = devin_hook_args("post-tool-use");
         args.server_url = "http://127.0.0.1:1".into();
-        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_| { called.set(true); Ok(()) }).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_, _| { called.set(true); Ok(()) }).await.unwrap();
         assert_eq!(stdout, b"{}\n");
         assert!(!called.get());
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
@@ -2076,7 +2102,7 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -2117,7 +2143,7 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -2157,7 +2183,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| {
+            |_, _| {
                 called.set(true);
                 Ok(())
             },
@@ -2180,7 +2206,7 @@ mod tests {
         .unwrap();
         let data_dir = tmp.path().join("data");
         let mut stdout = Vec::new();
-        run_with_payload(Some(data_dir.clone()), devin_hook_args("post-tool-use"), serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL_PATH","args":"SENTINEL_ARGS"},"output":"SENTINEL_OUTPUT","error":"SENTINEL_ERROR","nested":{"raw":"SENTINEL_NESTED"}}).to_string(), &mut stdout, |_| Ok(())).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), devin_hook_args("post-tool-use"), serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL_PATH","args":"SENTINEL_ARGS"},"output":"SENTINEL_OUTPUT","error":"SENTINEL_ERROR","nested":{"raw":"SENTINEL_NESTED"}}).to_string(), &mut stdout, |_, _| Ok(())).await.unwrap();
         let entry = read_spooled_entries(&hook_spool::spool_dir(&data_dir))
             .pop()
             .unwrap();
@@ -2203,7 +2229,7 @@ mod tests {
         let mut args = devin_hook_args("post-tool-use");
         args.check_capture = true;
         let mut stdout = Vec::new();
-        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_| Err(std::io::Error::other("must not spawn"))).await.unwrap();
+        run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"SENTINEL"}}).to_string(), &mut stdout, |_, _| Err(std::io::Error::other("must not spawn"))).await.unwrap();
         let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
         // Pin the exact key set, not just its size: `--check-capture` is how an
         // operator verifies an opt-out, so a field silently appearing or
@@ -2246,7 +2272,7 @@ mod tests {
             devin_hook_args("post-tool-use"),
             inactive_payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2267,7 +2293,7 @@ mod tests {
             serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"public"}})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2298,7 +2324,7 @@ mod tests {
             args,
             raw.to_string(),
             &mut stdout,
-            |_| Err(std::io::Error::other("must not spawn")),
+            |_, _| Err(std::io::Error::other("must not spawn")),
         )
         .await
         .unwrap();
@@ -2331,7 +2357,7 @@ mod tests {
                 devin_hook_args("post-tool-use"),
                 raw.to_string(),
                 &mut stdout,
-                |_| Ok(()),
+                |_, _| Ok(()),
             )
             .await
             .unwrap();
@@ -2444,7 +2470,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2492,7 +2518,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Err(std::io::Error::other("must not spawn")),
+            |_, _| Err(std::io::Error::other("must not spawn")),
         )
         .await
         .unwrap();
@@ -2516,7 +2542,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2551,7 +2577,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2582,7 +2608,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2599,7 +2625,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2619,7 +2645,7 @@ mod tests {
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path(), "prompt": "hi"})
                 .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2645,7 +2671,7 @@ mod tests {
             kimi_hook_args("session-start", &base),
             serde_json::json!({"sessionId": "session_abc", "cwd": tmp.path()}).to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2670,7 +2696,7 @@ mod tests {
             args,
             serde_json::json!({"session_id": "claude-session", "cwd": tmp.path()}).to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2715,7 +2741,7 @@ mod tests {
             kimi_hook_args("user-prompt-submit", &base),
             payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2736,7 +2762,7 @@ mod tests {
             kimi_hook_args("user-prompt-submit", &base),
             payload,
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2768,7 +2794,7 @@ mod tests {
             kimi_hook_args("user-prompt", &base),
             payload.clone(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2787,7 +2813,7 @@ mod tests {
             kimi_hook_args("user-prompt", &base),
             payload,
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();
@@ -2816,7 +2842,7 @@ mod tests {
             })
             .to_string(),
             &mut stdout,
-            |_| Ok(()),
+            |_, _| Ok(()),
         )
         .await
         .unwrap();

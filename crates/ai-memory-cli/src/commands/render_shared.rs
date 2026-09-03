@@ -457,6 +457,111 @@ pub(crate) fn build_zero_hooks_config(
     serde_json::json!({ "enabled": true, "hooks": hooks })
 }
 
+/// ZCode (z.ai) lifecycle events ai-memory hooks (#512). Each pair is
+/// `(event-name-in-config.json, native `hook --event` value)`.
+///
+/// ZCode's hook vocabulary is exactly these six triggers (verified live
+/// against the embedded engine v0.16.5): no `SessionEnd` — `Stop` fires at
+/// the end of every turn, so `ai-memory finalize-session --agent zcode` is
+/// the close path. `PermissionRequest` is deliberately not installed: its
+/// hook chain races the interactive permission client and the loser is
+/// aborted (`racePermissionResponders`), so a fast client decision silently
+/// kills the hook — passive capture of that event is unreliable by design.
+/// `PostToolUseFailure` fires *instead of* `PostToolUse` when the tool
+/// throws; it forwards onto the same `post-tool-use` channel and the
+/// payload's `error` field marks the outcome.
+pub(crate) const ZCODE_EVENTS: [(&str, &str); 6] = [
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "user-prompt-submit"),
+    ("PreToolUse", "pre-tool-use"),
+    ("PostToolUse", "post-tool-use"),
+    ("PostToolUseFailure", "post-tool-use"),
+    ("Stop", "stop"),
+];
+
+/// ZCode hooks config (#512): the root `hooks` block of
+/// `~/.zcode/cli/config.json` —
+/// `{"enabled": true, "maxOutputBytes": …, "events": {Event: [{hooks: […]}]}}`.
+///
+/// Entries are exec-form `{"type":"process","command":…,"args":[…]}`: ZCode
+/// spawns them without a shell and pipes the event JSON to stdin, which the
+/// native `ai-memory hook` command reads directly — same wiring as Zero, so
+/// ZCode gets the local spool + OIDC fallback with zero glue scripts. Every
+/// key is from ZCode's documented hook schema (`type`, `command`, `args`,
+/// `enabled`, `timeoutMs`, `statusMessage`); ZCode drops entries with
+/// undocumented keys, so none are emitted. `statusMessage` doubles as the
+/// ownership marker apply/uninstall merge around. `timeoutMs` bounds each
+/// invocation (the capture POST is fire-and-forget; session-start also
+/// fetches a handoff), and `maxOutputBytes` is raised above the 32 KiB
+/// default so a fetched handoff is not truncated mid-JSON before ZCode
+/// injects it as session context.
+pub(crate) fn build_zcode_hooks_config(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "ai-memory".to_string());
+    let mut events = serde_json::Map::new();
+    for (zcode_event, our_event) in ZCODE_EVENTS {
+        let mut args: Vec<String> = Vec::new();
+        if let Some(dir) = data_dir {
+            args.push("--data-dir".into());
+            args.push(dir.to_string_lossy().into_owned());
+        }
+        args.extend(
+            [
+                "hook",
+                "--event",
+                our_event,
+                "--agent",
+                "zcode",
+                "--server-url",
+                server_url,
+            ]
+            .map(String::from),
+        );
+        if let Some(token) = auth_token {
+            args.push("--auth-token".into());
+            args.push(token.to_string());
+        }
+        if let Some(strategy) = project_strategy {
+            args.push("--project-strategy".into());
+            args.push(strategy.to_string());
+        }
+        let entry = serde_json::json!({
+            "type": "process",
+            "command": exe,
+            "args": args,
+            "enabled": true,
+            "timeoutMs": ZCODE_HOOK_TIMEOUT_MS,
+            "statusMessage": "ai-memory capture",
+        });
+        events.insert(
+            (*zcode_event).to_string(),
+            serde_json::json!([{ "hooks": [entry] }]),
+        );
+    }
+    serde_json::json!({
+        "enabled": true,
+        "maxOutputBytes": ZCODE_HOOK_MAX_OUTPUT_BYTES,
+        "events": events,
+    })
+}
+
+/// Per-hook wall-clock bound for ZCode invocations of the native command.
+/// Generous enough for the synchronous session-start handoff fetch on a
+/// slow machine; capture POSTs themselves are fire-and-forget.
+pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
+
+/// Session-start stdout ceiling for ZCode (`maxOutputBytes`). ZCode
+/// truncates hook stdout beyond this before injecting it; 64 KiB
+/// comfortably covers a handoff plus a `[briefing]`-budgeted brief
+/// (same reasoning as Kiro v2's `max_output_size`).
+pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
 /// Devin hook payload for docker/setup-agent script snippets.
 /// Devin uses HookShape::Nested (same as Claude Code/Grok) but with
 /// DEVIN_EVENTS (PostCompaction instead of PreCompact, no subagent events).
@@ -1652,6 +1757,114 @@ fn claude_code_windows_command_is_unchanged_by_the_codex_fix() {
         "cmd.exe treats `&` as a separator; claude-code must keep the bare quoted path: {cmd}"
     );
     assert!(cmd.starts_with('"'), "expected a quoted exe path: {cmd}");
+}
+
+/// TypeScript runtime shared by every generated integration that must
+/// survive an unreachable server (#580): a spool writer emitting the CLI
+/// `hook-spool` on-disk contract (same filenames, same `SpoolEntry` JSON,
+/// same permissions) plus a self-drain. Callers only need `TOKEN`,
+/// `timeoutSignal`, and the node `join`/`homedir`/fs imports in scope.
+pub(crate) fn ts_spool_runtime() -> &'static str {
+    r#"
+// ---- offline spool (#580): the same on-disk contract as `ai-memory hook` ----
+// <data_dir>/hook-spool, entries the CLI's hook-drain understands. Written on
+// delivery failure, drained here on first use and after each queue flush; the
+// ingest_key minted at spool time makes a double drain idempotent server-side.
+function hookSpoolDir(): string {
+  const env = process.env.AI_MEMORY_DATA_DIR;
+  if (env && env.trim()) return join(env, "hook-spool");
+  const home = homedir();
+  const base =
+    process.platform === "darwin"
+      ? join(home, "Library", "Application Support", "ai-memory")
+      : process.platform === "win32"
+        ? join(process.env.LOCALAPPDATA ?? join(home, "AppData", "Local"), "ai-memory")
+        : join(process.env.XDG_DATA_HOME?.trim() || join(home, ".local", "share"), "ai-memory");
+  return join(base, "hook-spool");
+}
+
+let spoolSeq = 0;
+
+function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): void {
+  try {
+    const dir = hookSpoolDir();
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const createdMs = Date.now();
+    // Idempotency key minted ONCE at spool time and baked into the URL,
+    // so this plugin's drain and the CLI's drain can both deliver the
+    // entry without double-ingesting.
+    const key = `ts${createdMs.toString(16)}${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
+    const u = new URL(String(url));
+    if (!u.searchParams.has("ingest_key")) u.searchParams.set("ingest_key", key);
+    const token = TOKEN;
+    const entry = {
+      url: u.toString(),
+      body: JSON.stringify(payload),
+      created_ms: createdMs,
+      auth_mode: token ? "static" : "none",
+      ...(token ? { token } : {}),
+      attempts: 0,
+    };
+    const seq = (spoolSeq++ & 0xffffffff).toString(16).padStart(16, "0");
+    const name = `${String(createdMs).padStart(13, "0")}-${process.pid}-${seq}.json`;
+    const tmp = join(dir, `${name}.tmp`);
+    writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
+    renameSync(tmp, join(dir, name));
+  } catch (_e) {
+    // Spooling is best-effort on top of best-effort capture.
+  }
+}
+
+let spoolDrainPromise: Promise<void> | undefined;
+
+function requestSpoolDrain(): void {
+  if (spoolDrainPromise) return;
+  spoolDrainPromise = drainHookSpool().finally(() => {
+    spoolDrainPromise = undefined;
+  });
+}
+
+async function drainHookSpool(): Promise<void> {
+  let names: string[];
+  try {
+    names = readdirSync(hookSpoolDir()).filter((n) => n.endsWith(".json"));
+  } catch (_e) {
+    return; // no spool dir = nothing queued
+  }
+  names.sort();
+  for (const name of names.slice(0, 500)) {
+    const file = join(hookSpoolDir(), name);
+    let entry: { url?: string; body?: string; token?: string };
+    try {
+      entry = JSON.parse(readMarkerText(file, "utf8"));
+    } catch (_e) {
+      continue; // torn or foreign file; leave it for the CLI drain
+    }
+    if (!entry.url || typeof entry.body !== "string") continue;
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
+      const resp = await fetch(entry.url, {
+        method: "POST",
+        headers,
+        body: entry.body,
+        signal: timeoutSignal(2000),
+      }).catch(() => undefined);
+      if (!resp) return; // still unreachable; stop, keep the backlog
+      if (resp.ok || (resp.status >= 400 && resp.status < 500)) {
+        // Delivered, or permanently rejected - either way, done with it.
+        try { unlinkSync(file); } catch (_e) {}
+      } else {
+        return; // 5xx: server unhappy; retry a later drain
+      }
+    } catch (_e) {
+      return;
+    }
+    await new Promise<void>((r) => setTimeout(r, 50));
+  }
+}
+
+"#
 }
 
 #[cfg(test)]

@@ -169,7 +169,7 @@ fn apply_runtime_auth(command: &mut Command, auth_token: Option<&str>) -> io::Re
     ] {
         command.env_remove(name);
     }
-    if let Some(token) = auth_token {
+    if let Some(token) = auth_token.filter(|token| !token.is_empty()) {
         let secret_file = crate::secret_input::anonymous_file(token, "hook drainer bearer token")
             .map_err(io::Error::other)?;
         command.arg("--auth-token-stdin");
@@ -319,6 +319,38 @@ mod tests {
 
         // Missing file: no-op, no panic.
         rotate_oversized_log(&log, 16);
+    }
+
+    /// The credential reaches the drain through anonymous stdin and nowhere
+    /// near argv or inherited environment.
+    #[test]
+    fn the_live_token_travels_through_stdin_not_the_command_line() {
+        let mut command = Command::new("ai-memory-test");
+        apply_runtime_auth(&mut command, Some("SECRET-BEARER")).unwrap();
+        let rendered: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !rendered.iter().any(|a| a.contains("SECRET-BEARER")),
+            "token leaked into argv: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|a| a == "--auth-token-stdin"),
+            "stdin credential transport was not selected: {rendered:?}"
+        );
+        assert!(command.get_envs().all(|(_, value)| value.is_none()));
+    }
+
+    /// An absent or empty token carries nothing, so a no-auth deployment does
+    /// not export an empty bearer into the child.
+    #[test]
+    fn an_absent_or_empty_token_is_not_carried() {
+        for token in [None, Some("")] {
+            let mut command = Command::new("ai-memory-test");
+            apply_runtime_auth(&mut command, token).unwrap();
+            assert!(!command.get_args().any(|arg| arg == "--auth-token-stdin"));
+        }
     }
 
     #[test]

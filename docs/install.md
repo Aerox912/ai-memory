@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Command Code, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, ZCode, Kimi Code, Kiro CLI, Pool, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -19,6 +19,7 @@ path (docker + Claude Code). This page covers everything else:
 - [LLM provider tiers + self-hosted Ollama](#llm-provider-tiers)
 - [Common subcommands](#common-subcommands)
 - [Managed routing snippets and Agent Skills](#managed-routing-snippets-and-agent-skills)
+- [Human password bootstrap and recovery](#human-password-bootstrap-and-recovery)
 - [Operating without auth](#operating-without-auth) (local-only)
 - [Keeping ai-memory up to date](#keeping-ai-memory-up-to-date)
 
@@ -1035,6 +1036,56 @@ handoff via the MCP `memory_handoff_accept` tool. No first-party
 claimed: Pool's native session-store contract is not demonstrated, per
 [managed-harness contributions](managed-harness-contributions.md).
 
+### ZCode (z.ai)
+
+ZCode wires lifecycle hooks in the root `hooks` block of
+`~/.zcode/cli/config.json` — the same file that holds its other CLI
+registration. `install-hooks --agent zcode` (alias `zai`) merges ai-memory's
+entries into that block around any third-party hooks you already have, and is
+idempotent: re-running strips only ai-memory's own entries (marked by
+`statusMessage: "ai-memory capture"`) and rewrites them in place.
+
+```bash
+ai-memory install-hooks --agent zcode --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+
+# Preview the exact hooks block without writing anything:
+ai-memory install-hooks --agent zcode \
+    --server-url "http://homelab:49374"
+```
+
+Entries are exec-form `{"type": "process", "command": <ai-memory>, "args":
+[…]}` — ZCode spawns them with the event JSON on stdin and no shell, which the
+native `ai-memory hook` command reads directly, so the local spool, bearer
+auth, and `[capture] ignore_paths` exclusions all apply. Every emitted key is
+from ZCode's documented hook schema (`type`, `command`, `args`, `enabled`,
+`timeoutMs`, `statusMessage`); ZCode drops entries carrying undocumented keys,
+so none are emitted. Six documented triggers are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and
+`Stop` (verified live against the embedded engine v0.16.5).
+`PostToolUseFailure` fires *instead of* `PostToolUse` when a tool throws and
+is forwarded onto the same capture channel with the error preserved as the
+observation outcome. `PermissionRequest` is deliberately not installed: its
+hook chain races the interactive permission client, and a fast client decision
+aborts the losing hook, so passive capture of that event is unreliable by
+design.
+
+ZCode injects `SessionStart` stdout as model context
+(`hookSpecificOutput.additionalContext`), so unlike Pool, Zero, and Grok the
+prior session's handoff is delivered automatically at session start. There is
+no true session-end event — `Stop` fires at the end of every turn — so close
+finished sessions explicitly; use the exact id when several ZCode sessions are
+open in the same project:
+
+```bash
+ai-memory finalize-session --agent zcode
+ai-memory finalize-session --agent zcode --session-id <uuid>
+```
+
+No first-party `install-mcp` client and no managed workstream
+(`ai-memory run zcode`) are claimed yet.
+
 ### OpenCode
 
 ```bash
@@ -1240,6 +1291,10 @@ docker run --rm akitaonrails/ai-memory:latest \
 docker run --rm akitaonrails/ai-memory:latest \
     install-mcp --client zed             --auth-token "$TOKEN" \
     --server-url "http://homelab:49374/mcp"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client zcode           --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
 ```
 
 Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and OpenClaw support both
@@ -1248,7 +1303,8 @@ Cursor, Gemini CLI, Antigravity CLI, Grok Build CLI, Kiro CLI, Command Code, and
 `$GROK_HOME/hooks` (default `~/.grok/hooks`). `install-hooks --agent grok`
 captures lifecycle events.
 Grok ignores `SessionStart` stdout, so handoffs must be accepted through MCP with
-`memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, and Zed
+`memory_handoff_accept` when resuming. Claude Desktop, VS Code Copilot, Zed,
+and ZCode
 are MCP-only here, so you'll need to nudge the model to call
 `memory_query` / `memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
@@ -1296,6 +1352,17 @@ and `--to <dir>`; `--help` prints the full flag list. OpenCode,
 OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
 `install-hooks` generates TypeScript plugin/extension files for them
 instead. For Pi, the generated extension also provides the MCP bridge.
+
+The generated TypeScript integrations survive an unreachable server the
+same way the native hooks do: a delivery that fails at the network level
+(or gets a 5xx) is written to `<data_dir>/hook-spool/` in the exact
+format `ai-memory hook-drain` reads, and the plugin drains that backlog
+itself once the server is reachable again — so a day of laptop work off
+the server's network is captured, not silently dropped. Each spooled
+entry carries an idempotency key, so the plugin's own drain and a
+manual `hook-drain` can race without double-ingesting. Note the spool
+lands in the *agent host's* data dir (`AI_MEMORY_DATA_DIR` or the
+platform default), which is where a native `ai-memory` install looks.
 
 This path is friction-free when:
 - You have curl + bash but not docker
@@ -1429,7 +1496,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=anthropic` | `claude-haiku-4-5` | **Recommended default.** Best balance of speed, restraint, and classification quality. Not a reasoning model. Consistently classifies durable project rules as `kind: rule`. |
 | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once; set `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
-| `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. |
+| `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API — OpenAI-compatible endpoint at `opencode.ai/zen/go/v1`. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
@@ -1571,8 +1638,10 @@ Use `ai-memory auth status` to check whether a token is present and
 > summarisation tasks, not hard reasoning — a mini-class model is plenty and
 > is much easier on subscription rate limits. Set e.g.
 > `AI_MEMORY_LLM_MODEL=gpt-5-mini` (the `gpt-5.5` default works but is
-> overkill for this workload). Reserve the high-effort reasoning models for
-> your coding agent.
+> overkill for this workload). If you stay on a reasoning model, set
+> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` so hidden thought tokens
+> do not eat the JSON budget. Reserve high-effort reasoning for your
+> coding agent.
 
 ### GitHub Copilot
 
@@ -1629,6 +1698,17 @@ required. For OpenRouter (Kimi, DeepSeek, etc.):
 -e AI_MEMORY_LLM_MODEL=moonshotai/kimi-k2.6
 -e LLM_API_KEY=sk-or-v1-...
 ```
+
+`AI_MEMORY_LLM_REASONING_EFFORT` is honoured on this path: OpenRouter hosts
+send `reasoning: { effort, exclude: true }`; `https://api.x.ai` (Grok)
+sends Chat Completions `reasoning_effort` (clamped to `low`/`medium`/`high`/
+`xhigh`, because Grok cannot disable reasoning); other compat endpoints send
+OpenAI-style `reasoning_effort`. Anthropic and Anthropic-OAuth map the same
+key to `output_config.effort` and adaptive/disabled thinking on models that
+accept those fields (Haiku 4.5 omits them so the default model does not 400;
+Fable 5 / Mythos 5 / Mythos Preview omit `thinking: disabled` because those
+models reject it). `ultra` and `persistent` clamp to `max` on OpenAI-style
+hosts. Gemini and Copilot ignore the key.
 
 [Atlas Cloud](https://www.atlascloud.ai/models/qwen/qwen3.5-flash) uses the
 same provider; no Atlas-specific ai-memory provider is needed. Pass its API key
@@ -1740,7 +1820,9 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
 | `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `continue [--workspace NAME]` | host wrapper or native binary | From any directory, revalidate and resume the newest client-local managed checkout; accepts `--yolo` and `--fresh` but no harness-native arguments |
+| `resume [--workspace NAME] [--limit N]` | host wrapper or native binary | Interactively choose a recent managed workstream from valid client-local checkouts; Up/Down selects the workstream and Left/Right cycles `auto` plus installed harnesses before launch; accepts `--yolo` and `--fresh` |
 | `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
+| `rename-workstream (--from NAME \| --workstream-id ID) --to NAME [--workspace NAME] [--project NAME] [--json]` | host wrapper or native binary | Retitle one workstream selectable from the current checkout; metadata only, so the stable id, the ledger, the listing order, and the current selection are unaffected |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
@@ -1752,6 +1834,9 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `commit -m "…"` | `docker exec` | Stage + commit the wiki tree |
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
+| `user add-human` / `list` / `reset-password` / `disable` / `enable` / `patch` | `docker exec` or native binary | Human identities and temporary passwords; never issues an API key |
+| `user add` / `expire` / `revive` / `rotate-token` | `docker exec` or native binary | Deprecated 1.x compatibility-token lifecycle backed by `legacy-user-token` |
+| `api-key add` / `list` / `rotate` / `revoke` | `docker exec` or native binary | Native `aim_` machine credentials |
 | `auth login openai-oauth` | same data volume as the server | Store a ChatGPT/Codex OAuth refresh token for the optional `openai-oauth` LLM provider |
 | `auth login copilot` | same data volume as the server | Store a GitHub token for the optional `copilot` LLM provider |
 | `auth login oidc-device` | same developer data dir as native hooks and thin-client CLI commands | Store a per-developer OIDC device token for native hook authentication and HTTP CLI fallback auth |
@@ -1958,6 +2043,67 @@ either way. To keep durable file logs (and durable hook spooling) inside a
 sandbox, map the data dir read-write, e.g. `ai-jail --rw-map
 ~/.local/share/ai-memory …`.
 
+## Human password bootstrap and recovery
+
+Human console login is username/password, not a Bearer pasted into the
+browser. Machine APIs keep using `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN`
+or a native `aim_` key). Before human auth activates, deprecated GET-only
+browser compatibility may exchange the root bearer through HTTP Basic for an
+HttpOnly `ai_memory_auth` cookie; activation disables that path immediately.
+The active classes stay isolated: a password only issues a session; a session
+never authenticates `/mcp`/hooks/workstreams; recovery never issues a session;
+an API key never logs into `/auth/login`.
+
+### First-time root (greenfield)
+
+Set a one-shot password, then start `serve`. The engine creates the configured
+`root_username` (default `root`) with `must_change_password=true` and marks
+bootstrap complete. Later restarts ignore the value even if it stays in the
+environment — unset it so the plaintext is not kept in process env.
+
+```bash
+# At least 12 characters. Must not equal the root bearer, actor-proxy bearer,
+# or recovery token, and must not use an `ams_`/`aim_`/`amk_` prefix.
+export AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD='choose-a-long-password'
+docker compose up -d   # or: ai-memory serve
+unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD
+```
+
+The first login must change that password (`POST /auth/password` with CSRF).
+If the password collides with an existing native API-credential hash, startup
+fails closed and bootstrap is not marked complete.
+
+### Break-glass recovery
+
+If the last human root is lost, set a high-entropy recovery secret (at least
+32 characters) and `POST /auth/recovery` with a new password. Success returns
+204, expires the legacy `ai_memory_auth` cookie, revokes that user's sessions,
+and does **not** set `ai_memory_session`. Sign in again with the new password.
+
+```bash
+export AI_MEMORY_AUTH__RECOVERY_TOKEN='at-least-32-characters-of-entropy-here'
+# restart serve so the process picks up the new value
+curl -sS -D - -o /dev/null -X POST http://127.0.0.1:49374/auth/recovery \
+  -H 'content-type: application/json' \
+  -d '{"recovery_token":"'"$AI_MEMORY_AUTH__RECOVERY_TOKEN"'","new_password":"brand-new-pass!!","new_password_confirmation":"brand-new-pass!!"}'
+```
+
+Rotate by changing the env var and restarting; the previous token stops
+working immediately. Public failures (wrong token, recovery unset, password
+policy) share one 401 body. The recovery token is not a Bearer, cookie, or
+login password.
+
+When human mode is on (bootstrap completed, any password hash, or
+initial/recovery secrets configured), `serve` refuses to start unless a
+recoverable root exists (`role=root` with a password and not disabled) or
+recovery is configured. Explicit machine-only remote deploys with
+`AI_MEMORY_AUTH_TOKEN` and no human secrets remain valid. Loopback with
+neither Bearer nor human auth stays anonymous.
+
+CIDRs in `AI_MEMORY_AUTH__TRUSTED_PROXY_CIDRS` may supply `X-Forwarded-For`
+for login rate limits; untrusted peers' XFF is ignored. Behind HTTPS, set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true` as noted above.
+
 ## Operating without auth
 
 For local-only / single-machine deploys you can skip the bearer
@@ -2033,14 +2179,14 @@ warns that relabeling system directories such as `/home` can make the host
 inoperable. Docker documents `label=disable` in the
 [`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
 
-`ai-memory run`, `ai-memory show`, `ai-memory continue`, and
-`ai-memory workstreams` are the exceptions: the current wrapper intercepts them
-and starts a cached checksum-verified native client on the host, where local
-checkouts, harness executables, and session stores exist. It preserves an
-explicit remote `AI_MEMORY_SERVER_URL`. If one of these commands logs
-`data_dir=/data`, cannot find a checkout, or cannot find `codex`, `claude`, or
-another host executable, refresh the stale wrapper with `ai-memory upgrade` on
-that client machine.
+`ai-memory run`, `ai-memory show`, `ai-memory continue`, `ai-memory resume`,
+`ai-memory workstreams`, and `ai-memory rename-workstream` are the exceptions:
+the current wrapper intercepts them and starts a cached checksum-verified native
+client on the host, where local checkouts, harness executables, and session
+stores exist. It preserves an explicit remote `AI_MEMORY_SERVER_URL`. If one of
+these commands logs `data_dir=/data`, cannot find a checkout, or cannot find
+`codex`, `claude`, or another host executable, refresh the stale wrapper with
+`ai-memory upgrade` on that client machine.
 
 ### Docker compose alternative
 
