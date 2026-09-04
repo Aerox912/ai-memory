@@ -7,6 +7,247 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.3-aerox.1] - 2026-09-04
+
+### Changed
+- Integrate canonical AI Memory through `a2fd58ccc5ff736274035e660846c831a0fd0e86`
+  (2.0.3), retaining the Aerox Windows/WSL launchers, local embedding defaults,
+  and checksummed Windows x86_64 and Linux x86_64 release packaging.
+
+## [2.0.3] - 2026-09-04
+
+### Changed
+- Release, Docker, and the `cargo install --git` snippet now build with
+  `--locked` (#628). Without it `cargo install` re-resolves dependencies and
+  ignores the committed `Cargo.lock`, so a source install could silently pull
+  a different `schemars` than the one tested — a plausible source of
+  build-to-build structured-output schema drift. A unit guard also asserts the
+  strict-schema normalizer keeps `required` equal to `properties` (and closes
+  open maps), catching that drift class at build time rather than in
+  production.
+- The `_pending/auto-improve/` sidecar no longer renders a `status:` line
+  (#624). It was written once at staging and could never change from
+  `pending` — no code path updates or garbage-collects the sidecar — so it
+  contradicted design principle 14 (SQLite owns approval status) and misled a
+  human (or a second agent) reading the file. Status lives in
+  `ai-memory pending-writes list` / SQLite; the sidecar is a staging-time
+  snapshot.
+
+### Added
+- `ai-memory status` and the pre-migration backup log now report the data
+  directory's **filesystem free space** (#629). The OKF-migration backup gate
+  proves the archive is writable but said nothing about disk headroom — an
+  operator whose 447 MB safety archive left 77 MB free had the store fail to
+  extend its WAL eight minutes later, unlogged, for hours. This is pure signal
+  (no threshold, no refusal): `status` shows `filesystem free:` beside the
+  storage figures, and the "pre-migration backup verified" line now carries
+  `dest_free_bytes`, so the same number is visible right before a migration.
+
+### Fixed
+- The pre-migration safety archive is now taken **before** the SQLite schema
+  is migrated, so it is a genuine pre-2.0 recovery point a 1.x binary can
+  reopen — restoring the documented "reversible upgrade" (#633). Previously the
+  archive was written inside the wiki migration, which runs *after*
+  `Store::open` has already advanced the DB schema, so the archived `db/` was
+  already at 2.x and a 1.x binary refused it — the documented rollback was
+  impossible. The snapshot now runs in the boot path before `Store::open`,
+  gated to the real 1.x→2.0 upgrade (a fresh install or already-migrated store
+  takes nothing, unchanged) and idempotent; the OKF migration reuses that
+  archive instead of taking a second one. An integration test asserts the
+  archived DB reflects the pre-migration state.
+- Typed edges (`relations`) now actually work on OpenAI-family providers
+  (#630). `ConsolidatedPage.relations` was an open map
+  (`BTreeMap<String, Vec<String>>`), which the strict structured-output
+  normalizer closes to `additionalProperties: false` — OpenAI strict mode
+  cannot express arbitrary-key maps — so the model was structurally unable to
+  emit any `causes`/`fixes`/`contradicts` edge on `openai`, `openai-oauth`,
+  `copilot`, `opencode`, or `openai-compat`; the 2.0 typed-edges feature was
+  silently dead there. `relations` is now a fixed three-field object
+  (`causes`/`fixes`/`contradicts`), which strict mode expresses and which
+  serializes to the identical `relations:` frontmatter — no migration, no
+  downstream change. A schema guard pins the fixed shape.
+- `finalize-session --agent hermes` (and `claude-desktop`, `crush`, `other`)
+  is accepted again (#623). These agents are captured and stored, but
+  `finalize-session` reused the install-oriented agent enum — which is
+  deliberately limited to agents with a first-party installer — so it rejected
+  them at parse time and their sessions could never be closed, summarised, or
+  consolidated. `finalize-session` is agent-agnostic, so `--agent` now accepts
+  any agent the store recognises (a genuine typo is still rejected);
+  `install-hooks`/`setup-agent` stay limited. A drift guard keeps the two sets
+  from diverging again.
+- generated TypeScript integrations (`--agent open-code`, `omp`, `pi`,
+  `openclaw`) authenticate again under `install-hooks --apply`. Since #552
+  the bearer is deliberately omitted from the rendered file and persisted to
+  the 0600 `<data_dir>/auth-token` file, but only the native hook runtimes
+  learned to read it back: the generated TS adapters kept rendering
+  `TOKEN = null` with no runtime resolution, so every request they make
+  (hook capture, spool drain, handoff fetch) goes out unauthenticated and is
+  rejected by a Bearer-enabled server. The templates now render a
+  `resolveToken()` helper (static embed, then `AI_MEMORY_AUTH_TOKEN`, then
+  the auth-token file) used by `authHeaders()` and the spool writer.
+  `fetchHandoff()` in the same adapters also ignored `response.ok`, so a
+  401 error body could be injected into model context as if it were a
+  handoff; non-OK responses now return `undefined` like other failures.
+- `bootstrap` now retries a chunk's LLM call on a transient error before
+  giving up, instead of letting one blip discard the whole multi-chunk run
+  (#617). A provider `5xx`/`429` or a transport timeout/connect failure on
+  chunk *n* previously aborted the run and threw away chunks *1..n-1* — the
+  reporter's own runs died repeatedly to provider `520`s and connection
+  resets. Each chunk now gets up to 3 short, fixed-delay attempts;
+  deterministic failures (auth, schema, a `4xx`, malformed JSON) are not
+  retried. The retry is deliberately short and bounded, not tenacity-style
+  escalating backoff (cognee #2840). A durable `--resume` for the rarer
+  crash/hard-failure case remains tracked separately in #617.
+- `bootstrap` no longer aborts the whole multi-chunk run when one chunk
+  returns no `pages` key (#614). Later chunks are told which paths
+  earlier ones wrote, so a model that judges the material already
+  covered legitimately answers with a rationale and no pages; because
+  Anthropic's `tool_use` schema does not enforce required fields the way
+  OpenAI's `strict: true` does, that answer reached serde and failed
+  deserialisation with `missing field 'pages'`. Since pages are only
+  written after every chunk completes, the error discarded the work of
+  all preceding chunks. `pages` now defaults to empty.
+- `install-hooks --agent antigravity-cli` on native Windows now emits
+  an unquoted hook `command` (#611). The native-binary rendering wrapped
+  the executable, `--data-dir`, and `--server-url` in double quotes, but
+  Antigravity runs the string through `cmd /c "<string>"` without
+  stripping inner quotes, so `"C:\…\ai-memory.exe"` was "not
+  recognized", every hook failed, and the cp850 (non-UTF-8) error text
+  aborted the whole `agy` session. Antigravity's command is now rendered
+  bare; other Windows agents keep their quotes.
+- The wiki watcher no longer logs a scope-resolution failure for every page
+  in a project directory the store has no row for, on every pass, forever
+  (#613). The OKF v0.2 migration seeded an `index.md` into orphan directories
+  (dirs with a valid-UUID name but no `projects` row — near-empty shells left
+  by older history), and the watcher then warned once per file per 30s
+  reconciliation pass indefinitely — hundreds of identical lines that buried
+  real warnings, including, on one host, a 22-hour `sqlite: disk I/O error`.
+  Reconcile now checks the project scope once per directory and skips an
+  unresolvable one wholesale at `debug`, rather than retrying its pages; if
+  the row later appears the directory indexes normally on the next pass. The
+  same orphan skip now also guards the real-time directory-event path
+  (`reindex_project_dir`), not just the periodic pass (#616).
+- The store error for an unknown project id now says "does not exist" instead
+  of "does not belong to workspace X" (#612). A dangling id names no
+  workspace mismatch to hunt for; the disambiguating lookup runs only on the
+  failure path, so the common case still pays a single query.
+
+## [2.0.2] - 2026-09-03
+
+### Fixed
+- Web UI: OKF bundle-index links (and any relative in-wiki link) no
+  longer 404 (#603). Relative markdown link targets are now rewritten to
+  project-scoped URLs — the same convention `[[wikilinks]]` use — instead
+  of resolving against the web mount's `<base href>`, and a namespace
+  (directory) path such as `.../p/_lint/` now lists the pages under it
+  rather than returning 404. External links, anchors, and dangerous
+  schemes are untouched by the rewrite.
+- Pages with an empty frontmatter `title` no longer read back titleless
+  or trip a bogus duplicate-title lint (#599). Auto-improve could store
+  `title: ""` while the page had a proper `# H1`; now `memory_read_page`
+  derives the title from the H1 (then the path stem) when the stored one
+  is blank, the duplicate-title lint ignores blank titles instead of
+  collapsing them into one `Multiple pages share title ""` finding, and
+  the consolidator derives a title from the body H1 at write time so new
+  pages never store an empty one. The DB `title` column (search) was
+  already correct; this aligns the frontmatter-title readers with it
+  without rewriting stored pages.
+- Local-embedding model download (`fetch_model`) now bounds a stalled
+  connection instead of hanging startup forever (#602): a 30s connect
+  timeout and a generous 600s overall ceiling (large model files, so
+  not the inference clients' flat 120s that would fail a slow download).
+- The OKF v0.2 migration no longer crash-loops on startup with a
+  libgit2 `invalid object specified … class=Tree` error that left the
+  server unable to boot (#594). The wiki commit re-hashed files through
+  libgit2's index, whose stat cache could trust a cached blob OID absent
+  from the object database (a store carried across libgit2/git versions,
+  or an interrupted earlier operation) — `write_tree` then aborted and,
+  because the migration commits through that path, every restart failed.
+  The commit now clears the index before staging so every file is
+  re-hashed from the working tree. (The Docker runtime ships no `git`,
+  so the fix is in-library, not a CLI fallback.)
+- HTTP headers that carry a credential in an opaque value are now redacted
+  before reaching durable storage. Previously such a header matched no
+  built-in pattern unless it used the `Bearer` keyword or an
+  `UPPER_SNAKE_TOKEN=` shape. The bearer rule requires the literal keyword,
+  and the generic env-var rule requires `[A-Z][A-Z0-9_]*_TOKEN`, which never
+  matches a kebab-case header name. `X-Amz-Security-Token` (AWS SigV4),
+  `X-Api-Key`, `Private-Token` (GitLab), and `Ocp-Apim-Subscription-Key`
+  (Azure) all fall in that gap, and tool output echoing a `curl` invocation
+  is a common way they reach capture. A `key` or `token` suffix on its own
+  does not imply a secret, so it must be qualified by an auth word:
+  `Idempotency-Key`, `Continuation-Token` and storage partition keys are
+  left intact and stay readable in captured output.
+- `install-hooks --agent zcode --apply` no longer reports a hooks block
+  ZCode has thrown away as `no-op … (already up to date)` (#600). ZCode
+  validates `hooks.events` strictly and rejects the whole block, including
+  ai-memory's own entries, over a single key it does not recognize, so
+  capture never ran (`hookCount: 0`). Apply only ever merged the six event
+  keys it writes, so a key it does not write was neither inspected nor
+  reported, the file kept matching byte for byte, and the report claimed
+  the install was current. Apply now also withdraws ai-memory's own
+  entries from event keys it no longer writes, wherever they sit, and
+  reports what it found: a warning naming any key it withdrew from, and a
+  note for a key left unable to run anything, both naming the config file.
+  **Changed output:** an unchanged ZCode config with such a key now reports
+  `no-op … (unchanged; see the notes below)` instead of `already up to
+  date`, so a redirected stdout no longer carries the reassurance without
+  the cause. Event keys are never deleted and hooks ai-memory did not write
+  are never removed, so a key holding someone else's hook is reported, not
+  touched.
+- OpenCode Go requests now send `User-Agent: ai-memory/<version>` and a
+  per-operation `x-opencode-session` header. Session consolidation and
+  auto-improvement reuse the captured ai-memory session ID, while retries and
+  structured-output fallback keep the same ID instead of appearing as unrelated
+  requests (#608).
+- `as_of` time-travel queries and the entity retrieval stream now work
+  on real stores. Both read the entity index, which was populated only
+  from an LLM consolidator's `entities:` frontmatter — absent on the
+  bulk of a mature store (bootstrapped pages predate it; stable pages
+  are never re-consolidated), so the index sat empty and `as_of`
+  returned nothing. Entities are now also derived from each page's
+  `tags:` (the nouns a page is already labelled with) at write time, and
+  a one-shot idempotent backfill runs on the first start after upgrading
+  to populate the index for existing pages from their frontmatter —
+  opening each entity-link window at the page version's own `created_at`
+  so historical `as_of` is correct. Broad tags don't distort ranking
+  (the entity stream is inverse-frequency weighted), and a store already
+  written through the current path is a no-op. See `docs/temporal.md`.
+- The OKF v0.2 pre-migration backup walk now skips the `.serve.lock`
+  single-instance lock and its `.serve.lock.holder` sidecar. On Windows
+  the exclusive `LockFileEx` is mandatory, so the same `serve` process
+  that runs the migration also holds `.serve.lock` and could not read it
+  back while creating the backup — the walk aborted with `os error 33`
+  and the server crash-looped on every `2.0.x` upgrade from a 1.x store
+  (#593). Linux/macOS were immune because POSIX locks are advisory.
+- The Windows PowerShell wrapper (`ai-memory.ps1`) no longer crashes with
+  `git.exe : fatal: not a git repository … NativeCommandError` when run
+  outside a git repository — which broke `ai-memory status` and every
+  non-repo invocation (#591). The wrapper's script-global
+  `$ErrorActionPreference = 'Stop'` turned the repo-root probe's
+  *redirected* native stderr into a terminating error under Windows
+  PowerShell 5.1; the probe now runs under a localized
+  `SilentlyContinue`, gates on `$LASTEXITCODE`, and restores the
+  preference, falling back to the working directory as before. The
+  unredirected Docker invocations were never affected.
+
+
+### Security
+- Handoff and workstream-event content is now size-bounded at the store
+  boundary as defense in depth (data-layer audit follow-up, #607). The
+  MCP/hook callers already scrub and cap this prose, but the store is the
+  last gate before durable persistence, so it now bounds each handoff
+  field (16 KiB, matching the observation body) and list length, and a
+  workstream event's free-text content — a caller that ever forgot its
+  own cap can no longer write unbounded content to the DB.
+- Untrusted `relations:` frontmatter values (relation keys and targets)
+  are now length-bounded before being echoed into warning logs. On a
+  shared server one caller's page is parsed by a process whose logs
+  others read; a crafted or oversized relation key/target could bloat or
+  pollute the log. Bounded to 200 bytes (UTF-8-safe), matching the
+  bounding every other untrusted-content sink already uses. Found by a
+  data-layer security audit of the store/wiki crates.
+
 ## [2.0.1] - 2026-09-02
 
 ### Fixed
@@ -4776,7 +5017,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/akitaonrails/ai-memory/compare/v2.0.2...v2.0.3
+[2.0.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.2
 [2.0.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.1
 [2.0.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.0.0
 [1.39.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.39.0

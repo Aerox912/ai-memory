@@ -31,6 +31,13 @@ pub struct BackupReceipt {
     pub created_at: String,
     /// What the backup was taken for (e.g. "okf-v0.2-migration").
     pub label: String,
+    /// Free space on the destination filesystem right after the archive was
+    /// written, in bytes. `None` when it could not be read (e.g. an
+    /// unsupported filesystem) — never fails the backup on its own. A
+    /// verified archive next to a nearly-full disk is the exact shape of
+    /// the outage that motivated this field: the WAL had nowhere left to
+    /// extend minutes after a backup that "succeeded".
+    pub dest_free_bytes: Option<u64>,
 }
 
 impl BackupReceipt {
@@ -166,10 +173,17 @@ fn create_pre_migration_backup_inner(
                     }
                     stack.push(path);
                 } else if ft.is_file() {
+                    let file_name = path.file_name().and_then(|n| n.to_str());
                     if path == archive_path
-                        || path
-                            .file_name()
-                            .is_some_and(|n| n == "pre-migration-backup.json.tmp")
+                        || file_name == Some("pre-migration-backup.json.tmp")
+                        // The single-instance serve lock and its holder-info
+                        // sidecar. On Windows the exclusive LockFileEx is
+                        // mandatory, so the same serve process that owns the
+                        // migration also holds `.serve.lock` and cannot read
+                        // it back from the walk (os error 33). Keep in sync
+                        // with crates/ai-memory-cli/src/commands/serve.rs
+                        // `SERVE_LOCK_FILE`.
+                        || file_name.is_some_and(|n| n.starts_with(".serve.lock"))
                     {
                         continue;
                     }
@@ -204,6 +218,21 @@ fn create_pre_migration_backup_inner(
         ))));
     }
 
+    // A signal only: the backup itself already succeeded and verified, so a
+    // free-space read that fails (unsupported filesystem, transient error)
+    // must not turn a good archive into a failed migration.
+    let dest_free_bytes = match fs2::available_space(&dest_dir) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::debug!(
+                dest = %dest_dir.display(),
+                error = %e,
+                "could not read destination free space"
+            );
+            None
+        }
+    };
+
     let receipt = BackupReceipt {
         archive_path,
         size_bytes,
@@ -212,6 +241,7 @@ fn create_pre_migration_backup_inner(
             .strftime("%Y-%m-%dT%H:%M:%SZ")
             .to_string(),
         label: label.to_string(),
+        dest_free_bytes,
     };
     let tmp = data_dir.join(format!("{BACKUP_RECEIPT_FILE}.tmp"));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&receipt)?)?;
@@ -249,6 +279,22 @@ mod tests {
         assert!(receipt.archive_present());
         let loaded = BackupReceipt::load(data.path()).unwrap();
         assert_eq!(loaded.archive_path, receipt.archive_path);
+    }
+
+    /// The signal this field exists for: a verified archive next to a
+    /// nearly-full disk. A temp dir always reports some free space, and the
+    /// receipt (round-tripped through the JSON file) must carry it.
+    #[test]
+    fn the_receipt_carries_destination_free_space() {
+        let data = data_dir_with_content();
+        let dest = TempDir::new().unwrap();
+        let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path())).unwrap();
+        let free = receipt
+            .dest_free_bytes
+            .expect("free space should be readable for a real temp dir");
+        assert!(free > 0);
+        let loaded = BackupReceipt::load(data.path()).unwrap();
+        assert_eq!(loaded.dest_free_bytes, receipt.dest_free_bytes);
     }
 
     #[test]
@@ -332,5 +378,41 @@ mod tests {
         let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path())).unwrap();
         std::fs::remove_file(&receipt.archive_path).unwrap();
         assert!(!receipt.archive_present());
+    }
+
+    /// The pre-migration backup runs in the same process as `serve`, which
+    /// holds `.serve.lock` under an exclusive LockFileEx. On Windows that
+    /// lock is mandatory, so the walk cannot read the file back. The walk
+    /// must skip `.serve.lock` and its `.serve.lock.holder` sidecar by name,
+    /// exactly as it already skips the archive and the receipt tmp. Simulated
+    /// here on all platforms because the skip is by name, independent of OS
+    /// lock semantics; a Windows CI running the real lock would hit the same
+    /// path after this guard.
+    #[test]
+    fn the_backup_skips_the_serve_lock_and_its_holder_sidecar() {
+        let data = data_dir_with_content();
+        std::fs::write(data.path().join(".serve.lock"), b"").unwrap();
+        std::fs::write(data.path().join(".serve.lock.holder"), b"pid=1").unwrap();
+        let dest = TempDir::new().unwrap();
+        let receipt = create_pre_migration_backup(data.path(), "test", Some(dest.path())).unwrap();
+        assert_eq!(
+            receipt.entries, 2,
+            "only the two data files; serve lock and holder never archived"
+        );
+        let file = std::fs::File::open(&receipt.archive_path).unwrap();
+        let dec = flate2::read::GzDecoder::new(file);
+        let mut ar = tar::Archive::new(dec);
+        for entry in ar.entries().unwrap() {
+            let name = entry
+                .unwrap()
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                !name.starts_with(".serve.lock"),
+                "archive must not contain serve lock entry: {name:?}"
+            );
+        }
     }
 }

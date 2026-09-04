@@ -78,7 +78,7 @@ jobs:
       - name: Build release binary
         env:
           TAILWIND_SKIP: "1"
-        run: cargo build --release -p ai-memory-cli
+        run: cargo build --locked --release -p ai-memory-cli
 
       - name: Create release tarball
         env:
@@ -146,7 +146,7 @@ jobs:
       - name: Build release binary
         env:
           TAILWIND_SKIP: "1"
-        run: cargo build --release -p ai-memory-cli
+        run: cargo build --locked --release -p ai-memory-cli
 
       # Mirrors the Linux tarball, minus the Linux-only service assets
       # (packaging/systemd|sysusers|tmpfiles|env). Ships the `.exe`, the full
@@ -289,7 +289,7 @@ jobs:
           echo "# Windows x86_64: download ai-memory-windows-x86_64.zip below" >> body.md
           echo "" >> body.md
           echo "# From source" >> body.md
-          echo "cargo install --git https://github.com/${GITHUB_REPOSITORY} --tag ${GITHUB_REF_NAME}" >> body.md
+          echo "cargo install --locked --git https://github.com/${GITHUB_REPOSITORY} --tag ${GITHUB_REF_NAME}" >> body.md
           echo '```' >> body.md
 
       - name: Create GitHub Release

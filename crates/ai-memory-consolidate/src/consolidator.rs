@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use ai_memory_core::{AgentKind, Observation, PagePath, ProjectId, SessionId, Tier, WorkspaceId};
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
+};
 use ai_memory_store::{ReaderPool, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use thiserror::Error;
@@ -187,7 +189,8 @@ impl Consolidator {
             model = self.llm.model(),
             "consolidating session"
         );
-        let page: ConsolidatedPage = complete_structured(&*self.llm, request).await?;
+        let page: ConsolidatedPage =
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
 
         let frontmatter = build_frontmatter(&page, session_id, agent_kind);
         let id = self
@@ -481,7 +484,7 @@ impl Consolidator {
             "consolidating session (multi-page)",
         );
         let batch: ConsolidatedBatch =
-            ai_memory_llm::complete_structured(&*self.llm, request).await?;
+            complete_structured_with_operation_id(&*self.llm, request, session_id.into()).await?;
 
         // `dry_run` is always false past the early return above, so every
         // update here is a real write.
@@ -602,8 +605,22 @@ fn build_update(
     actor: &ai_memory_core::ActorContext,
     author_id: Option<ai_memory_core::UserId>,
 ) -> ConsolidatorResult<(WritePageRequest, ConsolidationOutcome)> {
+    // Never store an empty title: when a proposal omits one, fall back to
+    // the body's H1 (then the path stem), the same derivation the wiki
+    // write path uses — otherwise the page lands with `title: ""` in
+    // frontmatter, reads back titleless, and trips the duplicate-title
+    // lint (#599). `derive_title` returns the frontmatter title when
+    // present, so passing a null frontmatter here means "derive from the
+    // body/path".
+    let effective_title = if upd.title.trim().is_empty() {
+        let probe_path = PagePath::new(upd.path.clone())
+            .unwrap_or_else(|_| PagePath::new("notes/untitled.md").expect("static path is valid"));
+        ai_memory_wiki::derive_title(&serde_json::Value::Null, &upd.body_markdown, &probe_path)
+    } else {
+        upd.title.clone()
+    };
     let final_path = if upd.kind == crate::types::PageKind::Rule {
-        let slug = slugify_for_rule(&upd.title);
+        let slug = slugify_for_rule(&effective_title);
         format!("_rules/{slug}.md")
     } else {
         upd.path.clone()
@@ -612,7 +629,10 @@ fn build_update(
     let tier = upd.tier;
 
     let mut fm = serde_json::Map::new();
-    fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
+    fm.insert(
+        "title".into(),
+        serde_json::Value::String(effective_title.clone()),
+    );
     fm.insert(
         "tier".into(),
         serde_json::Value::String(tier_as_str(tier).into()),
@@ -624,7 +644,7 @@ fn build_update(
         "kind".into(),
         serde_json::Value::String(upd.kind.as_str().into()),
     );
-    if let Some(summary) = usable_summary(upd.summary.as_deref(), &upd.title) {
+    if let Some(summary) = usable_summary(upd.summary.as_deref(), &effective_title) {
         fm.insert("summary".into(), serde_json::Value::String(summary));
     }
     if !upd.tags.is_empty() {
@@ -668,7 +688,7 @@ fn build_update(
         body: upd.body_markdown.clone(),
         tier,
         pinned: false,
-        title: Some(upd.title.clone()),
+        title: Some(effective_title.clone()),
         admission_ctx: Some(AdmissionContext {
             op: AdmissionOp::Consolidate,
             actor: actor.clone(),
@@ -680,7 +700,7 @@ fn build_update(
     let outcome = ConsolidationOutcome {
         path,
         dry_run,
-        new_title: upd.title.clone(),
+        new_title: effective_title.clone(),
         new_body_markdown: upd.body_markdown.clone(),
         page_id: None,
         tags: upd.tags.clone(),
@@ -1264,13 +1284,10 @@ fn build_frontmatter(
     // boundary parses this frontmatter into typed links.
     let relations: serde_json::Map<String, serde_json::Value> = page
         .relations
-        .iter()
-        .filter(|(key, targets)| {
-            ai_memory_core::Relation::parse(key).is_some() && !targets.is_empty()
-        })
-        .map(|(key, targets)| {
+        .non_empty()
+        .map(|(relation, targets)| {
             (
-                key.clone(),
+                relation.as_str().to_string(),
                 serde_json::Value::Array(
                     targets
                         .iter()
@@ -1385,6 +1402,7 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/single_consolidate_system.m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Relations;
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
 
@@ -1762,7 +1780,7 @@ mod tests {
             body_markdown: "Body prose.".into(),
             tags: Vec::new(),
             summary: Some("Bounded the queue so backpressure is testable.".into()),
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations::default(),
         };
         let session_id = SessionId::new();
         let frontmatter = build_frontmatter(&page, session_id, AgentKind::Codex);
@@ -1800,26 +1818,48 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("ONE line of plain prose"));
     }
 
-    /// Only the closed vocabulary survives into `relations:` frontmatter
-    /// — an LLM inventing `blames:` must not mint a new edge kind.
+    /// Only non-empty, closed-vocabulary edges reach `relations:` frontmatter.
+    /// The vocabulary is now enforced by the `Relations` type (#630) — there is
+    /// no field for an invented `blames:`, so a bogus edge kind is unrepresentable
+    /// rather than filtered — and an empty kind is omitted.
     #[test]
-    fn relations_frontmatter_keeps_only_the_vocabulary() {
-        let mut page = ConsolidatedPage {
+    fn relations_frontmatter_keeps_only_non_empty_vocabulary() {
+        let page = ConsolidatedPage {
             title: "T".into(),
             body_markdown: "b".into(),
             tags: vec![],
             summary: None,
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations {
+                fixes: vec!["gotchas/g.md".into()],
+                causes: vec![], // empty -> omitted
+                contradicts: vec![],
+            },
         };
-        page.relations
-            .insert("fixes".into(), vec!["gotchas/g.md".into()]);
-        page.relations
-            .insert("blames".into(), vec!["notes/x.md".into()]);
-        page.relations.insert("causes".into(), vec![]);
         let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
         let relations = fm["relations"].as_object().unwrap();
         assert_eq!(relations.len(), 1, "{relations:?}");
         assert_eq!(relations["fixes"][0], "gotchas/g.md");
+    }
+
+    /// #630: the `relations` schema must be a FIXED object with named fields,
+    /// not an open `additionalProperties` map — otherwise OpenAI strict mode
+    /// closes it and the model can never emit an edge on any OpenAI-family
+    /// provider. Pin the shape so a revert to `BTreeMap` fails here.
+    #[test]
+    fn relations_schema_is_a_fixed_object_not_an_open_map() {
+        let schema = serde_json::to_value(schemars::schema_for!(Relations)).unwrap();
+        let props = schema["properties"]
+            .as_object()
+            .expect("relations must be a fixed object with named properties, not an open map");
+        assert!(props.contains_key("causes"));
+        assert!(props.contains_key("fixes"));
+        assert!(props.contains_key("contradicts"));
+        // An open map renders `additionalProperties` as a *schema object*; a
+        // fixed struct renders it as absent or `false`. It must not be a schema.
+        assert!(
+            !schema["additionalProperties"].is_object(),
+            "relations must not carry a schema-valued additionalProperties (open map)"
+        );
     }
 
     #[test]
@@ -1829,7 +1869,7 @@ mod tests {
             body_markdown: "b".into(),
             tags: vec![],
             summary: None,
-            relations: std::collections::BTreeMap::new(),
+            relations: Relations::default(),
         };
         let fm = build_frontmatter(&page, SessionId::new(), AgentKind::ClaudeCode);
         assert!(fm.get("relations").is_none());
@@ -1896,6 +1936,38 @@ mod tests {
             req.admission_ctx.expect("ctx").actor.user.as_deref(),
             Some("djalmajr")
         );
+    }
+
+    #[test]
+    fn build_update_derives_title_from_h1_when_proposal_title_is_empty() {
+        // A proposal with no title must not store `title: ""` — it derives
+        // from the body's H1, matching the wiki write path (#599).
+        let update = crate::types::ConsolidatedPageUpdate {
+            path: "concepts/thing.md".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "   ".into(), // blank
+            body_markdown: "# The Real Title\n\nbody text".into(),
+            summary: None,
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            entities: Vec::new(),
+        };
+        let (req, outcome) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update,
+            false,
+            &ai_memory_core::ActorContext::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            req.frontmatter["title"], "The Real Title",
+            "empty proposal title must derive from the body H1, not persist as \"\""
+        );
+        assert_eq!(req.title.as_deref(), Some("The Real Title"));
+        assert_eq!(outcome.new_title, "The Real Title");
     }
 
     #[test]

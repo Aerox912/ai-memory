@@ -532,6 +532,15 @@ pub fn ensure_project_with_id(
 /// Wiki writes call this before touching the filesystem so a stale hook/cache
 /// carrying the old workspace for a moved project fails before it can create an
 /// orphan file. The pairing INSERT triggers are still the final SQL backstop.
+///
+/// The two ways this fails need different words, because they send a reader
+/// looking in different places. A project that moved workspaces is a stale
+/// pairing: the row exists, and the caller's copy of its scope is out of date.
+/// A project id with no row at all is a dangling reference — nothing moved,
+/// and there is no scoping question to answer. Reporting the second as "does
+/// not belong to workspace X" costs whoever reads that line a hunt for a
+/// workspace/project mismatch that does not exist. The disambiguating query
+/// runs only on the failure path, so the common case still pays one lookup.
 pub fn ensure_project_workspace(
     conn: &Connection,
     workspace_id: &WorkspaceId,
@@ -545,12 +554,23 @@ pub fn ensure_project_workspace(
         )
         .optional()?;
     if found.is_some() {
-        Ok(())
-    } else {
-        Err(StoreError::NotFound(format!(
-            "project {project_id} does not belong to workspace {workspace_id}"
-        )))
+        return Ok(());
     }
+    let owner: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT workspace_id FROM projects WHERE id = ?1",
+            params![project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Err(StoreError::NotFound(match owner {
+        Some(owner) => format!(
+            "project {project_id} does not belong to workspace {workspace_id}; \
+             it belongs to {}",
+            WorkspaceId::from_slice(&owner)?
+        ),
+        None => format!("project {project_id} does not exist"),
+    }))
 }
 
 /// Upsert a batch of pages inside one transaction. Either *all* pages
@@ -706,6 +726,98 @@ fn stamped_frontmatter(mut conformed: serde_json::Value, now_us: i64) -> StoreRe
         ai_memory_core::okf::stamp_generated_at(&mut conformed, &ts);
     }
     Ok(serde_json::to_string(&conformed)?)
+}
+
+/// What a [`backfill_entity_index`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EntityBackfillSummary {
+    /// Latest pages that gained at least one entity link.
+    pub pages_backfilled: u64,
+    /// Entity→page links inserted.
+    pub links_added: u64,
+}
+
+/// One-shot, idempotent backfill of the entity index from existing
+/// frontmatter (docs/temporal.md).
+///
+/// The entity retrieval stream and every `as_of` timeline read from
+/// `entities` / `entity_page_links`, which are populated only when a page
+/// is written with entities. Historically those came from an LLM
+/// consolidator's `entities:` field, absent on the bulk of a real store —
+/// bootstrapped pages predate it and stable pages are never
+/// re-consolidated — so both features sat empty on mature deployments.
+///
+/// This derives each latest page's entities from its `tags`/`entities`
+/// frontmatter (the exact rule the write path now uses,
+/// [`ai_memory_core::frontmatter_entity_names`]) and attaches the links
+/// the page version never got, with `valid_from` = the version's
+/// `created_at` — the same window semantics the V56 migration used, and
+/// honest because those tags have lived in the frontmatter since that
+/// version was written.
+///
+/// Only latest pages that currently have NO entity links are considered,
+/// so a store whose pages were written through the fixed path is a cheap
+/// no-op and a re-run inserts nothing (the link insert is also
+/// `ON CONFLICT DO NOTHING`). Superseded versions are left untouched.
+pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfillSummary> {
+    type CandidateRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, i64);
+    let tx = conn.transaction()?;
+    let mut summary = EntityBackfillSummary::default();
+    {
+        let rows: Vec<CandidateRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT p.id, p.workspace_id, p.project_id, p.frontmatter_json, p.created_at \
+                 FROM pages p \
+                 WHERE p.is_latest = 1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM entity_page_links l WHERE l.page_id = p.id \
+                   )",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        for (page_id, ws, proj, fm_str, created_at) in rows {
+            let fm: serde_json::Value = serde_json::from_str(&fm_str).unwrap_or_default();
+            let names = ai_memory_core::frontmatter_entity_names(&fm);
+            if names.is_empty() {
+                continue;
+            }
+            let mut page_gained_a_link = false;
+            for name in names {
+                let entity_id: Vec<u8> = tx.query_row(
+                    "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT (workspace_id, project_id, name) DO UPDATE SET name = excluded.name \
+                     RETURNING id",
+                    params![EntityId::new().as_bytes(), &ws, &proj, name, created_at],
+                    |row| row.get(0),
+                )?;
+                let inserted = tx.execute(
+                    "INSERT INTO entity_page_links (entity_id, page_id, valid_from) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT (entity_id, page_id) DO NOTHING",
+                    params![entity_id, &page_id, created_at],
+                )?;
+                if inserted > 0 {
+                    summary.links_added += 1;
+                    page_gained_a_link = true;
+                }
+            }
+            if page_gained_a_link {
+                summary.pages_backfilled += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(summary)
 }
 
 pub(crate) fn upsert_page_in_tx(
@@ -2379,13 +2491,38 @@ pub fn end_session_with_handoff(
     Ok(id)
 }
 
+/// Store-boundary bound for a single handoff prose field. Generous
+/// (16 KiB, matching the observation body) — a backstop against
+/// unbounded content, not a functional cap; callers cap tighter.
+const HANDOFF_FIELD_MAX_BYTES: usize = 16 * 1024;
+/// Store-boundary bound on the number of items in a handoff list field.
+const HANDOFF_LIST_MAX_ITEMS: usize = 256;
+
+fn bound_handoff_field(value: &str) -> String {
+    ai_memory_core::truncate_utf8_bytes(value, HANDOFF_FIELD_MAX_BYTES)
+}
+
+fn bound_handoff_list(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .take(HANDOFF_LIST_MAX_ITEMS)
+        .map(|s| bound_handoff_field(s))
+        .collect()
+}
+
 fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
     validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
     let id = HandoffId::new();
     let now = Timestamp::now().as_microsecond();
-    let open_q = serde_json::to_string(&h.open_questions)?;
-    let next_s = serde_json::to_string(&h.next_steps)?;
-    let files = serde_json::to_string(&h.files_touched)?;
+    // Store-boundary bound (defense in depth): the MCP/hook callers already
+    // scrub and cap handoff prose, but the store is the last gate before
+    // durable persistence — mirror the observation body's bound so a caller
+    // that ever forgets cannot write unbounded content to the DB. Generous
+    // enough never to fire under the callers' tighter caps.
+    let summary = bound_handoff_field(&h.summary);
+    let open_q = serde_json::to_string(&bound_handoff_list(&h.open_questions))?;
+    let next_s = serde_json::to_string(&bound_handoff_list(&h.next_steps))?;
+    let files = serde_json::to_string(&bound_handoff_list(&h.files_touched))?;
     let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
     // Normalize the stored cwd: strip trailing path separators (keep a bare root
     // as "/"). The hook extractor preserves whatever the agent payload sent,
@@ -2452,7 +2589,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
             from_agent,
             to_agent,
             cwd,
-            h.summary,
+            summary,
             open_q,
             next_s,
             files,
@@ -5847,6 +5984,82 @@ pub(crate) mod tests {
         }
     }
 
+    /// A page written before entity extraction — tags in frontmatter but
+    /// no entity links — is backfilled from those tags, with the link's
+    /// window opening at the page version's creation. A page written with
+    /// entities is left alone, and a re-run is a no-op.
+    #[test]
+    fn backfill_entity_index_populates_from_tags_idempotently() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // Pre-fix page: tags present, but the write set no entities, so it
+        // has no entity links — exactly what a mature store looks like.
+        let mut stale = page(ws, proj, "concepts/writer.md", "the writer actor");
+        stale.frontmatter_json = serde_json::json!({"tags": ["SQLite", "Concurrency"]});
+        stale.entities = Vec::new();
+        let stale_id = upsert_page(&mut conn, &stale).unwrap();
+        let stale_created: i64 = conn
+            .query_row(
+                "SELECT created_at FROM pages WHERE id = ?1",
+                params![stale_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Already-indexed page: written with entities through the normal
+        // path. The backfill must not touch it.
+        let mut indexed = page(ws, proj, "concepts/search.md", "fts and vectors");
+        indexed.entities = vec!["fts5".into()];
+        upsert_page(&mut conn, &indexed).unwrap();
+        let links_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_page_links", [], |r| r.get(0))
+            .unwrap();
+
+        let summary = backfill_entity_index(&mut conn).unwrap();
+        assert_eq!(summary.pages_backfilled, 1, "only the tag-only page");
+        assert_eq!(summary.links_added, 2, "sqlite + concurrency");
+
+        // Entities exist, normalized, and the links carry the page
+        // version's own creation instant as the window open (docs/temporal).
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT e.name FROM entities e \
+                     JOIN entity_page_links l ON l.entity_id = e.id \
+                     WHERE l.page_id = ?1 ORDER BY e.name",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(params![stale_id.as_bytes()], |r| r.get(0))
+                .unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(names, vec!["concurrency".to_string(), "sqlite".to_string()]);
+        let valid_from: i64 = conn
+            .query_row(
+                "SELECT DISTINCT valid_from FROM entity_page_links WHERE page_id = ?1",
+                params![stale_id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            valid_from, stale_created,
+            "window opens at the version's created_at"
+        );
+
+        // Idempotent: a second pass finds no candidates and inserts nothing.
+        let again = backfill_entity_index(&mut conn).unwrap();
+        assert_eq!(again, EntityBackfillSummary::default(), "re-run is a no-op");
+        let links_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entity_page_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            links_after,
+            links_before + 2,
+            "the pre-existing entity page kept its single link; only the stale page gained two"
+        );
+    }
+
     #[test]
     fn page_feedback_is_scoped_rebuildable_and_audited() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
@@ -6430,6 +6643,56 @@ pub(crate) mod tests {
             resolved.as_deref(),
             Some(&target_id.as_bytes()[..]),
             "link must resolve across projects once the target lands"
+        );
+    }
+
+    /// Store-boundary defense in depth: an unbounded handoff field or list
+    /// (a caller that skipped its own cap) is bounded before it reaches the
+    /// DB, so pathological content cannot grow the store without limit.
+    #[test]
+    fn insert_handoff_bounds_oversized_fields_at_the_store() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let huge = "x".repeat(HANDOFF_FIELD_MAX_BYTES * 3);
+        let many: Vec<String> = (0..HANDOFF_LIST_MAX_ITEMS * 2)
+            .map(|i| format!("step {i}"))
+            .collect();
+        let new = NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: huge.clone(),
+            open_questions: vec![huge.clone()],
+            next_steps: many,
+            files_touched: vec![],
+            owner_user: None,
+        };
+        let id = insert_handoff(&mut conn, &new).unwrap();
+
+        let (summary, open_q, next_s): (String, String, String) = conn
+            .query_row(
+                "SELECT summary, open_questions, next_steps FROM handoffs WHERE id = ?1",
+                params![&id.as_bytes()[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            summary.len() <= HANDOFF_FIELD_MAX_BYTES,
+            "summary must be bounded: {} bytes",
+            summary.len()
+        );
+        let open: Vec<String> = serde_json::from_str(&open_q).unwrap();
+        assert!(
+            open[0].len() <= HANDOFF_FIELD_MAX_BYTES,
+            "list item bounded"
+        );
+        let steps: Vec<String> = serde_json::from_str(&next_s).unwrap();
+        assert!(
+            steps.len() <= HANDOFF_LIST_MAX_ITEMS,
+            "list length bounded: {}",
+            steps.len()
         );
     }
 
@@ -8060,6 +8323,38 @@ pub(crate) mod tests {
                 Err(StoreError::NotFound(_))
             ),
             "a stale workspace/project pair must fail before wiki writes touch disk"
+        );
+    }
+
+    #[test]
+    fn ensure_project_workspace_separates_a_moved_project_from_a_missing_one() {
+        let (_tmp, conn, ws, proj) = fresh_db();
+        let other_ws = WorkspaceId::new();
+        let ghost = ProjectId::new();
+
+        // The project exists, but the caller carries a stale workspace: the
+        // message has to name where it actually lives, or the reader cannot
+        // tell a stale cache from a corrupt one.
+        let moved = ensure_project_workspace(&conn, &other_ws, &proj).unwrap_err();
+        let moved = moved.to_string();
+        assert!(
+            moved.contains(&ws.to_string()) && moved.contains(&other_ws.to_string()),
+            "a moved project must name both the real and the supplied workspace, got: {moved}"
+        );
+
+        // No row at all. Saying this "does not belong to workspace X" sends
+        // the reader hunting a scoping bug that is not there — the id is
+        // simply dangling.
+        let missing = ensure_project_workspace(&conn, &ws, &ghost)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("does not exist"),
+            "a dangling project id must be reported as missing, got: {missing}"
+        );
+        assert!(
+            !missing.contains("does not belong to workspace"),
+            "a dangling project id must not be described as a workspace mismatch, got: {missing}"
         );
     }
 
