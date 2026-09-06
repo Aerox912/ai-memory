@@ -8050,14 +8050,13 @@ model = "gpt-5"
     fn opencode2_plugin_rejects_v1_template_drift() {
         // The builder rewrites the v1 template, so a v1 edit that moves the
         // binding anchor must fail loudly instead of shipping a hybrid.
-        let plugin =
-            build_opencode2_plugin(
-                "http://127.0.0.1:49374/",
-                None,
-                Some("repo-root"),
-                "denylist",
-            )
-            .unwrap();
+        let plugin = build_opencode2_plugin(
+            "http://127.0.0.1:49374/",
+            None,
+            Some("repo-root"),
+            "denylist",
+        )
+        .unwrap();
         assert!(plugin.contains("const TOKEN: string | null = null;"));
         assert!(
             plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
@@ -8080,8 +8079,9 @@ model = "gpt-5"
         // opencode2 reuses v1's capture prelude verbatim (see
         // `build_opencode2_plugin`'s doc comment), so the gate must survive
         // the anchor rewrite into the beta's `{ id, setup }` host binding.
-        let plugin = build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist")
-            .unwrap();
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist")
+                .unwrap();
         assert!(
             plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
             "{plugin}"
@@ -8091,8 +8091,9 @@ model = "gpt-5"
 
     #[test]
     fn opencode2_plugin_denylist_bakes_inert_gate() {
-        let plugin = build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist")
-            .unwrap();
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist")
+                .unwrap();
         assert!(
             plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
             "{plugin}"
@@ -8119,13 +8120,12 @@ model = "gpt-5"
 
     #[test]
     fn opencode_plugin_bakes_repo_root_default() {
-        let plugin =
-            build_opencode_plugin(
-                "http://127.0.0.1:49374",
-                Some("tok"),
-                Some("repo-root"),
-                "denylist",
-            );
+        let plugin = build_opencode_plugin(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            Some("repo-root"),
+            "denylist",
+        );
         assert!(
             plugin.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
             "repo-root install default must bake the const: {plugin}"
@@ -8151,7 +8151,8 @@ model = "gpt-5"
 
     #[test]
     fn opencode_plugin_bakes_allowlist_admit_gate() {
-        let plugin = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
+        let plugin =
+            build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "allowlist");
         assert!(
             plugin.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"allowlist\";"),
             "{plugin}"
@@ -8195,7 +8196,8 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_prefers_statically_embedded_token() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(extension.contains("function resolveToken("));
         assert!(extension.contains("if (TOKEN) return TOKEN;"));
     }
@@ -8228,7 +8230,8 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_uses_native_lifecycle_events() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert!(extension.contains("export default function AiMemoryExtension"));
         assert!(extension.contains("const AGENT = \"omp\";"));
@@ -8276,13 +8279,12 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_bakes_repo_root_default() {
-        let extension =
-            build_omp_extension(
-                "http://127.0.0.1:49374",
-                Some("tok"),
-                Some("repo-root"),
-                "denylist",
-            );
+        let extension = build_omp_extension(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            Some("repo-root"),
+            "denylist",
+        );
         assert!(
             extension.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
             "repo-root install default must bake the const: {extension}"
@@ -8295,7 +8297,8 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_default_omits_baked_strategy() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(
             !extension.contains("DEFAULT_PROJECT_STRATEGY"),
             "{extension}"
@@ -8304,7 +8307,8 @@ model = "gpt-5"
 
     #[test]
     fn omp_extension_uses_bounded_hook_queue() {
-        let extension = build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
 
         assert_generated_ts_uses_bounded_hook_queue(&extension);
     }
@@ -8636,8 +8640,7 @@ model = "gpt-5"
 
     #[test]
     fn pi_extension_denylist_bakes_inert_gate() {
-        let extension =
-            build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let extension = build_pi_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
         assert!(
             extension.contains("const CAPTURE_MODE: \"allowlist\" | \"denylist\" = \"denylist\";"),
             "{extension}"
