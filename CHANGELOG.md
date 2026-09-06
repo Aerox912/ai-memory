@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-event disposition runs. The install-time "enforced"/"NOT in force"
   messaging is corrected to match: a script-fallback install is now the
   only path flagged as unenforced. (#661)
+- A UTF-8 BOM on a hand-edited wiki page that has no frontmatter no longer
+  rides into the page body. `markdown::parse` stripped the mark before looking
+  for the frontmatter fence, but the no-frontmatter path returned the untouched
+  input as the body, so the mark stayed in front of the first line. Two things
+  followed from that: `derive_title` no longer read the leading `# ` as a
+  heading, so the page was indexed under its filename instead of its title, and
+  the OKF v0.2 file pass (which conforms frontmatter and leaves the body alone)
+  re-emitted the mark after the closing `---` fence, where it is a stray
+  zero-width no-break space rather than a byte-order mark. Both paths now drop
+  the leading BOM, which is what the frontmatter path already did. (#663)
 
 ## [2.1.0] - 2026-09-06
 

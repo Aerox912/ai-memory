@@ -542,6 +542,34 @@ mod tests {
         assert!(crate::backup::BackupReceipt::load(tmp.path()).is_none());
     }
 
+    /// The file pass leaves the body untouched, and a UTF-8 BOM is not part
+    /// of the body: it means "this file is UTF-8" only at offset zero. A
+    /// hand-edited page a Windows editor saved with one and no frontmatter
+    /// used to come back through `parse` with the mark still on the front of
+    /// the body, so this pass wrote it out AFTER the frontmatter fence, where
+    /// it is a stray zero-width no-break space ahead of the H1.
+    #[test]
+    fn conforming_a_bom_prefixed_page_does_not_move_the_mark_into_the_body() {
+        let tmp = TempDir::new().unwrap();
+        let rel = Path::new("w/p/notes/hand-written.md");
+        let abs = tmp.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, "\u{FEFF}# Hand written\n\nBody.\n").unwrap();
+
+        conform_file(tmp.path(), rel, &std::collections::HashMap::new()).unwrap();
+
+        let conformed = std::fs::read_to_string(&abs).unwrap();
+        assert!(
+            !conformed.contains('\u{FEFF}'),
+            "the mark survived the file pass: {conformed:?}"
+        );
+        assert!(
+            conformed.ends_with("---\n# Hand written\n\nBody.\n"),
+            "the body must reach disk exactly as it was authored: {conformed:?}"
+        );
+        assert_eq!(parse(&conformed).unwrap().frontmatter["type"], "Note");
+    }
+
     // ---- #633: the safety archive must be taken BEFORE the DB migration ----
 
     /// The core assertion for #633: the pre-open snapshot captures the DB as it
