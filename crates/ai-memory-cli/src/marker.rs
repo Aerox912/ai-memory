@@ -14,7 +14,7 @@
 //! splitting one checkout across two scopes.
 //!
 //! Parsing is deliberately line-based (`parse_toml_key` / `parse_toml_flag`)
-//! and mirrors `hooks/lib/_lib.sh`, so the native binary and the POSIX shell
+//! and mirrors `hooks/_lib.sh`, so the native binary and the POSIX shell
 //! hooks agree on what a marker means. `[capture]` is the one section parsed
 //! strictly, with a real TOML parser, and stays in `hook_capture`.
 
@@ -72,7 +72,7 @@ pub(crate) fn read_scope(cwd: &str, env: &RuntimeEnv) -> Option<MarkerScope> {
     if env.ignore_marker() {
         return None;
     }
-    let path = find_marker_with_home(cwd, env.home_dir().map(Path::new))?;
+    let path = find_settings_marker_with_home(cwd, env.home_dir().map(Path::new))?;
     // One read, three keys: the marker is re-read per key nowhere else on a
     // hot path, but this one runs on every client command.
     let text = std::fs::read_to_string(&path).ok()?;
@@ -113,6 +113,37 @@ pub(crate) fn find_marker(cwd: &str) -> Option<PathBuf> {
 }
 
 fn find_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
+    find_marker_matching(cwd, home, |_| true)
+}
+
+/// Like [`find_marker`], but skips a marker that declares nothing beyond a
+/// `[capture]` section (scope/settings-*transparent*) and continues the walk
+/// to the next ancestor. Resolves `workspace`/`project`/`project_strategy`
+/// and the other root-level settings `hook_capture` forwards, so a nested
+/// capture-only marker no longer resets them to their fallback (#668).
+/// `[capture]`/`ignore_paths` itself keeps using [`find_marker`] — the
+/// nearest marker, unchanged.
+pub(crate) fn find_settings_marker(cwd: &str) -> Option<PathBuf> {
+    let home = home_dir();
+    find_settings_marker_with_home(cwd, home.as_deref())
+}
+
+fn find_settings_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
+    find_marker_matching(cwd, home, |path| {
+        std::fs::read_to_string(path).is_ok_and(|text| declares_more_than_capture(&text))
+    })
+}
+
+/// Shared walk-up-from-`cwd`-toward-`$HOME` used by [`find_marker_with_home`]
+/// and [`find_settings_marker_with_home`]; `matches` decides whether a marker
+/// file found along the way stops the walk (returned) or is skipped in favor
+/// of the next ancestor. The HOME/checkout-root boundary is identical either
+/// way — only which markers count as a stopping point differs.
+fn find_marker_matching(
+    cwd: &str,
+    home: Option<&Path>,
+    matches: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let start = absolute_normalized(Path::new(cwd));
     let home = home.map(absolute_normalized);
     let boundary = match home.as_deref() {
@@ -124,7 +155,7 @@ fn find_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
     let mut dir = start.as_path();
     loop {
         let candidate = dir.join(".ai-memory.toml");
-        if candidate.is_file() {
+        if candidate.is_file() && matches(&candidate) {
             return Some(candidate);
         }
         if boundary.as_deref() == Some(dir) {
@@ -135,6 +166,34 @@ fn find_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
             _ => return None,
         }
     }
+}
+
+/// Whether a marker's raw text declares anything beyond a `[capture]`
+/// section: any root-level scope key (`workspace`/`project`/
+/// `project_strategy`), or any of the other settings
+/// `hook_capture::marker_query_suffix_impl` forwards (`[recall]
+/// default_global`, `[briefing]` keys, top-level `drop_subagent_captures`).
+/// A marker with any of these is a resolution boundary; only a marker whose
+/// only content is `[capture]` (e.g. `ignore_paths`) is transparent (#668).
+///
+/// Line-based like [`parse_key_in`] / [`parse_toml_flag`] — section headers
+/// are not tracked, so a stray key is still detected wherever it appears in
+/// the file. That is conservative on purpose: it can only turn a marker INTO
+/// a boundary, never wrongly make one transparent.
+fn declares_more_than_capture(text: &str) -> bool {
+    const QUOTED_KEYS: [&str; 4] = [
+        "workspace",
+        "project",
+        "project_strategy",
+        "drop_subagent_captures",
+    ];
+    const FLAG_KEYS: [&str; 3] = ["default_global", "inject_on_session_start", "max_chars"];
+    QUOTED_KEYS
+        .iter()
+        .any(|key| parse_key_in(text, key).is_some())
+        || FLAG_KEYS
+            .iter()
+            .any(|key| parse_flag_in(text, key).is_some())
 }
 
 fn absolute_normalized(path: &Path) -> PathBuf {
@@ -196,7 +255,13 @@ fn parse_key_in(text: &str, key: &str) -> Option<String> {
 /// quotes the value. Line-based like [`parse_toml_key`], so section headers
 /// are ignored; strips an optional trailing `# comment`.
 pub(crate) fn parse_toml_flag(file: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
+    parse_flag_in(&std::fs::read_to_string(file).ok()?, key)
+}
+
+/// [`parse_toml_flag`] over already-read marker text — the counterpart to
+/// [`parse_key_in`], shared with [`declares_more_than_capture`] so it pays
+/// for one read per key instead of re-opening the file.
+fn parse_flag_in(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim_start();
         let Some(after_key) = trimmed.strip_prefix(key) else {
@@ -406,5 +471,85 @@ project = "infra" # this is fine
             !base.declares_scope(),
             "a marker with only [capture] rules must not change scope"
         );
+    }
+
+    // ── #668: a capture-only marker is scope/settings-transparent ────────
+
+    /// A nested marker whose only content is `[capture]` must not shadow an
+    /// outer ancestor's declared scope: `read_scope` walks past it and
+    /// returns the OUTER marker's workspace/project.
+    #[test]
+    fn read_scope_skips_a_nested_capture_only_marker() {
+        let tmp = TempDir::new().unwrap();
+        let outer_marker = write_marker(tmp.path(), "workspace = \"acme\"\nproject = \"infra\"\n");
+        let inner = tmp.path().join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(&inner, "[capture]\nignore_paths = [\"secret/**\"]\n");
+
+        let scope = read_scope(inner.to_str().unwrap(), &RuntimeEnv::default())
+            .expect("the outer marker still declares scope");
+        assert_eq!(scope.workspace.as_deref(), Some("acme"));
+        assert_eq!(scope.project.as_deref(), Some("infra"));
+        assert_eq!(scope.path, outer_marker.canonicalize().unwrap());
+    }
+
+    /// When every marker in the ancestor chain is capture-only (or none
+    /// exist), behavior is unchanged from before #668: `read_scope` returns
+    /// `None` so the caller falls back to `DEFAULT_WORKSPACE` + repo-root.
+    #[test]
+    fn read_scope_still_none_when_only_capture_only_markers_exist() {
+        let tmp = TempDir::new().unwrap();
+        write_marker(tmp.path(), "[capture]\nignore_paths = [\"secret/**\"]\n");
+        let inner = tmp.path().join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(&inner, "[capture]\nignore_paths = [\"other/**\"]\n");
+
+        assert_eq!(
+            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default()),
+            None
+        );
+    }
+
+    /// A marker that declares `[briefing]` but no `workspace`/`project` is
+    /// NOT capture-only — it declares a forwarded setting, so it is a
+    /// resolution boundary. `read_scope` must not walk past it to an outer
+    /// marker's scope, even though that marker declares one: behavior for
+    /// this shape is exactly what it was before #668.
+    #[test]
+    fn read_scope_treats_a_briefing_only_marker_as_a_settings_boundary() {
+        let tmp = TempDir::new().unwrap();
+        write_marker(tmp.path(), "workspace = \"acme\"\nproject = \"infra\"\n");
+        let inner = tmp.path().join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        write_marker(&inner, "[briefing]\ninject_on_session_start = true\n");
+
+        assert_eq!(
+            read_scope(inner.to_str().unwrap(), &RuntimeEnv::default()),
+            None,
+            "a briefing-only marker is a settings boundary: it stops the walk \
+             but declares no scope of its own"
+        );
+    }
+
+    #[test]
+    fn declares_more_than_capture_is_conservative() {
+        assert!(!declares_more_than_capture(
+            "[capture]\nignore_paths = [\"a/**\"]\n"
+        ));
+        assert!(!declares_more_than_capture(""));
+        for text in [
+            "workspace = \"acme\"\n",
+            "project = \"infra\"\n",
+            "project_strategy = \"repo-root\"\n",
+            "drop_subagent_captures = \"true\"\n",
+            "[recall]\ndefault_global = true\n",
+            "[briefing]\ninject_on_session_start = true\n",
+            "[briefing]\nmax_chars = 4000\n",
+        ] {
+            assert!(
+                declares_more_than_capture(text),
+                "{text} should be a settings boundary"
+            );
+        }
     }
 }

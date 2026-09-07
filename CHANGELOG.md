@@ -14,6 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   duplicated in a harness-local store that other agents cannot see (#671).
 
 ### Fixed
+- A nested `.ai-memory.toml` marker whose only content is a `[capture]`
+  section (e.g. one that just sets `ignore_paths`) no longer resets scope
+  resolution to `default` / basename. The native binary, the POSIX shell
+  hooks, and the generated TypeScript integrations all used to resolve
+  `workspace`/`project` and the other forwarded root-level settings
+  (`project_strategy`, `drop_subagent_captures`, `[recall] default_global`,
+  `[briefing]` keys) from the single nearest marker — the same one that
+  decided `[capture]`/`ignore_paths` — so a capture-only marker in a
+  subdirectory silently shadowed an ancestor marker's declared
+  workspace/project and captures landed in the wrong scope. Scope and the
+  other forwarded settings now resolve from the nearest marker that
+  declares more than `[capture]`, while `[capture]`/`ignore_paths` keeps
+  reading the nearest marker unchanged — a marker that declares nothing
+  else is scope/settings-transparent. Applies to the native `ai-memory`
+  binary, the POSIX shell hooks (`hooks/_lib.sh`), and the generated
+  TypeScript integrations for every adapter that resolves scope client-side
+  (OpenCode, OpenCode2, pi, OMP, OpenClaw); outputs remain byte-identical
+  otherwise. (#668)
 - Wiki auto-commits no longer re-hash the whole tree. Since the #594 guard,
   every commit cleared the git index and re-read every page, so a session
   end cost the size of the wiki and grew with it; the LongMemEval harness
