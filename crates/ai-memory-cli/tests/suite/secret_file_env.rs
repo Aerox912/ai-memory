@@ -135,3 +135,50 @@ fn hidden_drainer_accepts_its_bearer_over_stdin() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("runtime-secret"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("runtime-secret"));
 }
+
+#[test]
+fn hidden_drainer_rejects_empty_stdin_before_spool_processing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    command
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .args([
+            "hook-drain",
+            "--server-url",
+            "http://127.0.0.1:1",
+            "--auth-token-stdin",
+        ])
+        .env_remove("AI_MEMORY_AUTH_TOKEN")
+        .env_remove("AI_MEMORY_AUTH_TOKEN_FILE");
+    let output = run_with_stdin(&mut command, "\n");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("secret is empty"));
+}
+
+#[test]
+fn hook_shortcut_rejects_missing_secret_file_before_capture_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    command
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .args([
+            "hook",
+            "--event",
+            "user-prompt",
+            "--agent",
+            "claude-code",
+            "--server-url",
+            "http://127.0.0.1:1",
+            "--check-capture",
+        ])
+        .env_remove("AI_MEMORY_AUTH_TOKEN")
+        .env(
+            "AI_MEMORY_AUTH_TOKEN_FILE",
+            tmp.path().join("missing-secret"),
+        );
+    let output = run_with_stdin(&mut command, r#"{"prompt":"test"}"#);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("hook bearer token"));
+}

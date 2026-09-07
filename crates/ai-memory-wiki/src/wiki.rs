@@ -1,7 +1,8 @@
 //! [`Wiki`] — the only correct write path for the markdown source-of-truth.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ai_memory_core::{
     ActorContext, AutoImproveProposalId, NewPage, PageId, PagePath, ProjectId, Sanitizer,
@@ -31,6 +32,10 @@ pub struct ReindexSummary {
     pub projects: usize,
     /// Pages reindexed from the wiki tree.
     pub pages: usize,
+    /// Project directories skipped because their scope was purged and
+    /// tombstoned (#607) — a purge whose on-disk removal did not complete.
+    /// Their pages are deliberately not resurrected.
+    pub skipped_purged: usize,
 }
 
 enum PageStoreRemoval {
@@ -110,7 +115,24 @@ pub struct Wiki {
     /// the directory rename and SQLite re-stamp so stale writes cannot land
     /// files under the old workspace while the project is in flight.
     mutation_lock: Arc<RwLock<()>>,
+    /// Per-page write serialization (#607, item 3). Two concurrent writes to
+    /// the *same* `(ws, proj, path)` would otherwise interleave their
+    /// file-rename and DB-upsert under the shared `mutation_lock` read guard,
+    /// transiently leaving on-disk markdown disagreeing with the DB `latest`
+    /// row. Each path gets its own async mutex, so same-path writers serialize
+    /// while different paths still run concurrently. The map is GC'd
+    /// opportunistically — entries no writer currently holds are dropped on the
+    /// next acquisition — so it stays bounded to currently-contended paths.
+    page_locks: Arc<std::sync::Mutex<HashMap<PageKey, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Scopes this process has already materialized `_meta.md` manifests for.
+    /// Keeps [`Wiki::ensure_scope_manifests`] to one hash lookup per page
+    /// write after the scope's first — the store query and the two manifest
+    /// reads happen once per scope per process, never per page.
+    manifested_scopes: Arc<Mutex<HashSet<(WorkspaceId, ProjectId)>>>,
 }
+
+/// Key uniquely identifying a page for per-path write serialization.
+type PageKey = (WorkspaceId, ProjectId, PagePath);
 
 impl Wiki {
     /// Construct a wiki handle rooted at `<data_dir>/wiki/`. Creates the
@@ -132,6 +154,8 @@ impl Wiki {
             admission_chain: None,
             store_reader: None,
             mutation_lock: Arc::new(RwLock::new(())),
+            page_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            manifested_scopes: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -154,9 +178,12 @@ impl Wiki {
     /// external webhooks must fall back to header introspection or use
     /// `_unscoped` placeholders.
     ///
-    /// The reader is only invoked when the chain is configured AND would
-    /// actually fire; tests and CLI paths that don't wire a chain pay
-    /// nothing for setting (or omitting) this.
+    /// The reader is also what makes a scope self-describing: the names a
+    /// `_meta.md` manifest carries are resolved through it, so without one
+    /// neither [`Self::backfill_scope_manifests`] nor the manifest written
+    /// with a scope's first page can run, and both become no-ops. For the
+    /// admission chain specifically the reader is still only consulted when
+    /// a chain is configured and would actually fire.
     #[must_use]
     pub fn with_store_reader(mut self, reader: ReaderPool) -> Self {
         self.store_reader = Some(reader);
@@ -474,7 +501,30 @@ impl Wiki {
         }
     }
 
+    /// Ensure the store rows for a scope exist **and** that the scope is
+    /// self-describing on disk. Every wiki write path funnels through here,
+    /// which is what guarantees a project directory never outlives its
+    /// `_meta.md`: the directory comes into existence with the first page
+    /// written into it, and this runs first.
     pub(crate) async fn ensure_project_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<()> {
+        self.ensure_project_scope_rows(workspace_id, project_id)
+            .await?;
+        self.ensure_scope_manifests(workspace_id, project_id).await;
+        Ok(())
+    }
+
+    /// Ensure the store rows for a scope exist, without touching the wiki
+    /// tree. The watcher's two orphan guards want this — the reconcile pass
+    /// and the directory-event path. Both run before `reindex_page` takes
+    /// the mutation guard, so creating a file there could drop a manifest
+    /// into a directory a concurrent project move is renaming away, and both
+    /// only ever see directories that already exist, whose manifests were
+    /// written with their first page or by the startup backfill.
+    pub(crate) async fn ensure_project_scope_rows(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -483,6 +533,61 @@ impl Wiki {
             .ensure_project_workspace(workspace_id, project_id)
             .await?;
         Ok(())
+    }
+
+    /// Write the workspace and project `_meta.md` manifests the first time
+    /// this process writes into a scope, so a project that first materializes
+    /// *while the server is up* is rebuildable immediately instead of only
+    /// after the next startup backfill (#643). In that window `reindex` could
+    /// not rebuild the scope at all: it walks the directories that exist on
+    /// disk, and the directory exists from the first page write onward.
+    ///
+    /// Best-effort on purpose. A manifest that cannot be written must not
+    /// fail the page write that triggered it — the page is the operator's
+    /// data, the manifest is derived, and
+    /// [`Self::backfill_scope_manifests`] rewrites it on the next start.
+    async fn ensure_scope_manifests(&self, workspace_id: WorkspaceId, project_id: ProjectId) {
+        let Some(reader) = &self.store_reader else {
+            return;
+        };
+        let key = (workspace_id, project_id);
+        if self
+            .manifested_scopes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key)
+        {
+            return;
+        }
+        let scope = match reader.scope_row_by_ids(workspace_id, project_id).await {
+            Ok(Some(scope)) => scope,
+            // No row to describe: the scope was purged or moved between the
+            // ensure above and this lookup. The next write re-checks.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "scope-manifest lookup failed (non-fatal)");
+                return;
+            }
+        };
+        let ws_dir = self.root.join(workspace_id.to_string());
+        let mut project_fm = serde_json::json!({ "project": scope.project_name });
+        if let Some(repo_path) = scope.repo_path {
+            project_fm["repo_path"] = serde_json::Value::String(repo_path);
+        }
+        let written = Self::write_scope_manifest(
+            &ws_dir,
+            serde_json::json!({ "workspace": scope.workspace_name }),
+        )
+        .and_then(|_| Self::write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm));
+        match written {
+            Ok(_) => {
+                self.manifested_scopes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key);
+            }
+            Err(e) => tracing::warn!(error = %e, "scope-manifest write failed (non-fatal)"),
+        }
     }
 
     /// Absolute on-disk path for a page within a specific project.
@@ -873,7 +978,7 @@ impl Wiki {
             .admit_purge_project(workspace_id, project_id, admission_ctx)
             .await?;
         self.remove_project_dir(workspace_id, project_id).await?;
-        self.dispatch_purge_project(ctx.as_ref());
+        self.dispatch_purge(ctx.as_ref());
         Ok(())
     }
 
@@ -1083,17 +1188,36 @@ impl Wiki {
         }
     }
 
-    /// Dispatch non-blocking purge webhooks after the caller's purge has
-    /// completed its durable DB/filesystem work.
-    pub fn dispatch_purge_project(&self, admission_ctx: Option<&AdmissionContext>) {
-        if let (Some(chain), Some(ctx)) = (&self.admission_chain, admission_ctx) {
-            chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
+    /// Remove one on-disk page file without touching the store.
+    ///
+    /// Used after a scoped store purge has already deleted the authoritative
+    /// rows and returned the affected paths. A missing file is treated as
+    /// already removed; any other filesystem error is reported to the caller.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
+    pub async fn remove_page_file(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        let abs = self.abs_path(workspace_id, project_id, path);
+        match std::fs::remove_file(&abs) {
+            Ok(()) => {
+                sync_parent_best_effort(&abs);
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(crate::WikiError::Io(e)),
         }
     }
 
-    /// Dispatch non-blocking purge-workspace webhooks after the caller's purge
-    /// has completed its durable DB/filesystem work.
-    pub fn dispatch_purge_workspace(&self, admission_ctx: Option<&AdmissionContext>) {
+    /// Dispatch non-blocking purge webhooks after the caller's purge has
+    /// completed its durable DB/filesystem work. The purge kind (project,
+    /// session, workspace) travels in `ctx.op`, set by the matching `admit_*`.
+    pub fn dispatch_purge(&self, admission_ctx: Option<&AdmissionContext>) {
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, admission_ctx) {
             chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
         }
@@ -1351,14 +1475,29 @@ impl Wiki {
     /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
     fn read_scope_meta(dir: &Path) -> WikiResult<serde_json::Value> {
         let path = dir.join("_meta.md");
-        let meta = std::fs::symlink_metadata(&path)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::NotFound {
+                format!("scope manifest {} is missing", path.display())
+            } else {
+                format!(
+                    "could not inspect scope manifest {}: {error}",
+                    path.display()
+                )
+            };
+            WikiError::Io(std::io::Error::new(error.kind(), message))
+        })?;
         if meta.file_type().is_symlink() {
             return Err(WikiError::Io(std::io::Error::other(format!(
                 "refusing to read symlinked scope manifest {}",
                 path.display()
             ))));
         }
-        let raw = std::fs::read_to_string(path)?;
+        let raw = std::fs::read_to_string(&path).map_err(|error| {
+            WikiError::Io(std::io::Error::new(
+                error.kind(),
+                format!("could not read scope manifest {}: {error}", path.display()),
+            ))
+        })?;
         Ok(parse(&raw)?.frontmatter)
     }
 
@@ -1380,7 +1519,10 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for filesystem/parse/store errors, including a
     /// scope directory that lacks its `_meta.md` (the wiki is not
-    /// self-describing — newer engines write the manifest on scope creation).
+    /// self-describing). Scopes written by this engine always have one: it
+    /// is materialized with the scope's first page, and
+    /// [`Self::backfill_scope_manifests`] repairs trees written by older
+    /// ones on every start.
     pub async fn reindex_all(&self) -> WikiResult<ReindexSummary> {
         let root = self.root().to_path_buf();
         let project_dirs =
@@ -1392,6 +1534,21 @@ impl Wiki {
         let mut seen_ws = std::collections::HashSet::new();
 
         for (ws, proj, proj_root) in project_dirs {
+            // A purged scope must not be resurrected from an on-disk directory
+            // its purge failed to remove (#607). The tombstone is terminal:
+            // skip the whole directory rather than recreating the scope row and
+            // reindexing its pages. The files stay inert (the watcher skips
+            // them too, #613) until a later purge or manual cleanup removes
+            // them; reindex stays non-destructive.
+            if self.writer.scope_is_purged(ws, proj).await? {
+                tracing::debug!(
+                    workspace = %ws,
+                    project = %proj,
+                    "skipping reindex of a purged (tombstoned) scope",
+                );
+                summary.skipped_purged += 1;
+                continue;
+            }
             if seen_ws.insert(ws) {
                 let ws_dir = proj_root
                     .parent()
@@ -1598,6 +1755,14 @@ impl Wiki {
 
         let (ids, dispatches) = {
             let _guard = self.mutation_lock.read().await;
+            // Serialize every path in this batch against concurrent single-page
+            // or batch writers to the same path (#607). Sorted acquisition
+            // keeps a batch deadlock-free against any other writer.
+            let batch_keys: Vec<PageKey> = staged
+                .iter()
+                .map(|(req, _, _, _)| (req.workspace_id, req.project_id, req.path.clone()))
+                .collect();
+            let _page_guards = self.lock_pages(&batch_keys).await;
             let mut staged_files: Vec<(
                 WritePageRequest,
                 tempfile::NamedTempFile,
@@ -1683,6 +1848,53 @@ impl Wiki {
         }
 
         Ok(ids)
+    }
+
+    /// Acquire the per-path write lock for one page, serializing concurrent
+    /// writers to the same `(ws, proj, path)` while different paths run
+    /// concurrently. See [`Wiki::page_locks`].
+    async fn lock_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self.page_locks.lock().expect("page_locks mutex poisoned");
+            // Opportunistic GC under the same short critical section that hands
+            // out locks: an entry whose only remaining strong ref is the map's
+            // own (count == 1) has no live guard and no waiter, so drop it.
+            map.retain(|_, v| Arc::strong_count(v) > 1);
+            Arc::clone(
+                map.entry((workspace_id, project_id, path.clone()))
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
+
+    /// Acquire per-path write locks for a batch of pages in a deterministic
+    /// global order (sorted by id/path bytes, deduped) so a batch write and any
+    /// concurrent single-page or batch writer can never deadlock. See
+    /// [`Wiki::page_locks`].
+    async fn lock_pages(&self, keys: &[PageKey]) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut ordered: Vec<PageKey> = keys.to_vec();
+        // The id newtypes are not `Ord`, so order by their byte / string
+        // representation — any total order works, it only has to be consistent
+        // across all acquirers.
+        ordered.sort_by(|a, b| {
+            (a.0.as_bytes(), a.1.as_bytes(), a.2.as_str()).cmp(&(
+                b.0.as_bytes(),
+                b.1.as_bytes(),
+                b.2.as_str(),
+            ))
+        });
+        ordered.dedup();
+        let mut guards = Vec::with_capacity(ordered.len());
+        for (ws, proj, path) in ordered {
+            guards.push(self.lock_page(ws, proj, &path).await);
+        }
+        guards
     }
 
     /// Write `body` (with optional `frontmatter`) atomically to
@@ -1799,6 +2011,11 @@ impl Wiki {
 
         let page_id = {
             let _guard = self.mutation_lock.read().await;
+            // Serialize with any concurrent write to this same path, so the
+            // file-rename and DB-upsert below cannot interleave with another
+            // writer's and leave disk disagreeing with the DB `latest` row
+            // (#607). Different paths still proceed concurrently.
+            let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
             let abs = self.abs_path(workspace_id, project_id, &path);
@@ -4196,6 +4413,156 @@ mod tests {
         let _ = meta;
     }
 
+    /// #607 item 2: a purge commits the DB deletion but removes on-disk files
+    /// only afterward (best-effort). If that removal is interrupted, the
+    /// markdown directory — `_meta.md` included — survives with no `projects`
+    /// row. `reindex_all` must NOT resurrect it: the tombstone written in the
+    /// purge transaction makes the deletion terminal.
+    #[tokio::test]
+    async fn reindex_does_not_resurrect_a_purged_scope_whose_files_survived() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let path = PagePath::new("notes/keep.md").unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/keep.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Keep"}),
+            body: "survivor".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+        // Manifests reindex reads to recreate scopes from disk.
+        wiki.backfill_scope_manifests().await.unwrap();
+
+        // Purge the DB only (store side); the on-disk files intentionally
+        // survive — exactly the crash-before-file-removal window.
+        store
+            .writer
+            .purge_project(
+                ws,
+                proj,
+                "default/scratch",
+                None,
+                false,
+                ai_memory_store::Compaction::Skip,
+            )
+            .await
+            .unwrap();
+        let meta_on_disk = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string())
+            .join("_meta.md");
+        assert!(
+            meta_on_disk.exists(),
+            "the purge left the manifest on disk (the crash window this guards)"
+        );
+
+        let summary = wiki.reindex_all().await.unwrap();
+
+        assert_eq!(
+            summary.skipped_purged, 1,
+            "the purged scope must be skipped"
+        );
+        assert_eq!(
+            summary.projects, 0,
+            "the purged project must not be recreated"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "a purged page must not reappear in the index"
+        );
+    }
+
+    /// #607 item 3: two concurrent writes to the SAME page path must not
+    /// interleave their file-rename and DB-upsert. Per-path serialization
+    /// guarantees the winning writer's body lands in both the on-disk file and
+    /// the DB `is_latest` row — they never disagree about who won.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_path_writes_keep_file_and_db_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let path = PagePath::new("notes/hot.md").unwrap();
+        let mk = |tag: char| WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/hot.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Hot"}),
+            body: format!("body-{tag}"),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        };
+
+        // Many rounds so any interleave window is likely to be exercised.
+        for _ in 0..25 {
+            let (wa, wb) = (wiki.clone(), wiki.clone());
+            let (ra, rb) = (mk('a'), mk('b'));
+            let ha = tokio::spawn(async move { wa.write_page(ra).await });
+            let hb = tokio::spawn(async move { wb.write_page(rb).await });
+            ha.await.unwrap().unwrap();
+            hb.await.unwrap().unwrap();
+
+            let on_disk = wiki.read_page(ws, proj, &path).unwrap().body;
+            let in_db = store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .expect("a latest row exists")
+                .body;
+            // Compare who won, not exact bytes (emit/parse normalizes newlines):
+            // the file and the DB latest row must reflect the same writer.
+            assert_eq!(
+                on_disk.contains("body-a"),
+                in_db.contains("body-a"),
+                "file ({on_disk:?}) and DB latest ({in_db:?}) disagree on the winning writer"
+            );
+        }
+    }
+
     /// Backward-compat: anonymous writes do not add attribution frontmatter.
     #[tokio::test]
     async fn write_page_with_anonymous_actor_omits_attribution_frontmatter() {
@@ -4253,10 +4620,12 @@ mod tests {
     }
 
     /// End-to-end "DB is rebuildable from files": `backfill_scope_manifests`
-    /// makes the wiki self-describing, then `reindex_all` on a FRESH store
-    /// (no DB carried over) recreates the named scopes + all pages from the
-    /// wiki tree alone — including a page that lives at the reserved name
-    /// `log.md` (kept because it has frontmatter).
+    /// repairs a tree whose manifests are missing (one written by a release
+    /// before scopes described themselves from their first page), then
+    /// `reindex_all` on a FRESH store (no DB carried over) recreates the
+    /// named scopes + all pages from the wiki tree alone — including a page
+    /// that lives at the reserved name `log.md` (kept because it has
+    /// frontmatter).
     #[tokio::test]
     async fn backfill_then_reindex_rebuilds_from_wiki_alone() {
         // Source store: a named scope with two pages (one at `log.md`).
@@ -4290,10 +4659,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Make the wiki self-describing.
+        // Simulate a tree written by an engine that had no manifests at all
+        // (pre-#643 releases), so the backfill is exercised as the repair
+        // path it now is — the writes above already made this scope
+        // self-describing on their own.
+        let ws_dir = src.path().join("wiki").join(ws.to_string());
+        std::fs::remove_file(ws_dir.join("_meta.md")).unwrap();
+        std::fs::remove_file(ws_dir.join(proj.to_string()).join("_meta.md")).unwrap();
+
+        // Make the wiki self-describing again.
         let written = w1.backfill_scope_manifests().await.unwrap();
         assert!(written >= 2, "ws + proj manifests written, got {written}");
-        let ws_dir = src.path().join("wiki").join(ws.to_string());
         assert!(ws_dir.join("_meta.md").is_file());
         assert!(ws_dir.join(proj.to_string()).join("_meta.md").is_file());
         drop(s1);
@@ -4372,6 +4748,132 @@ mod tests {
         assert!(meta.contains("workspace: empty-ws"));
     }
 
+    /// #643: a scope that first materializes *while the server is up* is
+    /// self-describing from its first page, without waiting for the next
+    /// startup backfill. The manifests must be byte-identical to the ones
+    /// the backfill would have written, or every restart would rewrite them
+    /// and churn the wiki's git history.
+    #[tokio::test]
+    async fn first_write_into_a_new_scope_writes_its_manifests() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        // The scope appears after startup — no backfill has run for it.
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+        wiki.write_page(req(ws, proj, "notes/a.md", "alpha", serde_json::json!({})))
+            .await
+            .unwrap();
+
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let ws_meta = std::fs::read_to_string(ws_dir.join("_meta.md")).unwrap();
+        assert!(ws_meta.contains("workspace: acme"), "{ws_meta}");
+        let proj_meta =
+            std::fs::read_to_string(ws_dir.join(proj.to_string()).join("_meta.md")).unwrap();
+        assert!(proj_meta.contains("project: webapp"), "{proj_meta}");
+        assert!(
+            proj_meta.contains("repo_path: /repo/webapp"),
+            "repo_path is carried, as the backfill carries it: {proj_meta}"
+        );
+        assert!(proj_meta.contains("type: Scope Manifest"), "{proj_meta}");
+
+        assert_eq!(
+            wiki.backfill_scope_manifests().await.unwrap(),
+            0,
+            "a later backfill finds nothing to write; the two emitters agree byte for byte"
+        );
+    }
+
+    /// #643 end-to-end: stop the server inside the window the issue
+    /// describes — a project created after startup, so no backfill has ever
+    /// seen it — and `reindex` still rebuilds it from the wiki tree alone.
+    /// Before the manifest was written with the first page, this aborted with
+    /// a bare `No such file or directory (os error 2)`.
+    #[tokio::test]
+    async fn scope_created_after_startup_reindexes_without_a_restart() {
+        let src = TempDir::new().unwrap();
+        let s1 = Store::open(src.path()).unwrap();
+        let w1 = Wiki::new(src.path(), s1.writer.clone())
+            .unwrap()
+            .with_store_reader(s1.reader.clone());
+        // Startup backfill: the server has seen nothing yet, so it writes
+        // nothing. The scope below is created afterwards, mid-run.
+        assert_eq!(w1.backfill_scope_manifests().await.unwrap(), 0);
+
+        let ws = s1.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = s1
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+        w1.write_page(req(
+            ws,
+            proj,
+            "notes/a.md",
+            "alpha uniquetoken",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        drop(s1);
+
+        // Fresh store, wiki tree only — the recovery the operator runs.
+        let dst = TempDir::new().unwrap();
+        let s2 = Store::open(dst.path()).unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let w2 = Wiki::new(dst.path(), s2.writer.clone()).unwrap();
+        let summary = w2.reindex_all().await.unwrap();
+
+        assert_eq!(summary.projects, 1);
+        assert_eq!(summary.pages, 1);
+        assert_eq!(
+            s2.reader.workspace_name_by_id(ws).await.unwrap().as_deref(),
+            Some("acme"),
+            "workspace name recovered from the manifest written mid-run"
+        );
+        assert_eq!(
+            s2.reader
+                .project_name_by_id(ws, proj)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("webapp"),
+        );
+    }
+
+    /// The watcher's reconcile pre-check runs outside the mutation guard, so
+    /// it deliberately ensures store rows ONLY. Writing a manifest there
+    /// could drop a file into a directory a concurrent project move is
+    /// renaming away, and buys nothing: a directory it can see already got
+    /// its manifest with its first page, or from the backfill.
+    #[tokio::test]
+    async fn reconcile_scope_check_does_not_write_manifests() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+
+        wiki.ensure_project_scope_rows(ws, proj).await.unwrap();
+
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        assert!(!ws_dir.join("_meta.md").exists());
+        assert!(!ws_dir.join(proj.to_string()).join("_meta.md").exists());
+    }
+
     /// Post-audit regression: manifests are OKF-typed at the writer
     /// choke point, and a typeless manifest (the tug-of-war era, or a
     /// hand edit) is HEALED by the next backfill instead of reverting
@@ -4402,6 +4904,50 @@ mod tests {
         assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 1);
         let healed = std::fs::read_to_string(&meta_path).unwrap();
         assert!(healed.contains("type: Scope Manifest"), "{healed}");
+    }
+
+    #[tokio::test]
+    async fn reindex_names_a_missing_workspace_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let missing = ws_dir.join("_meta.md");
+        std::fs::create_dir_all(ws_dir.join(proj.to_string())).unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("scope manifest {} is missing", missing.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_names_a_missing_project_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let proj_dir = ws_dir.join(proj.to_string());
+        let missing = proj_dir.join("_meta.md");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            ws_dir.join("_meta.md"),
+            "---\nworkspace: acme\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("scope manifest {} is missing", missing.display())
+        );
     }
 
     #[cfg(any(unix, windows))]

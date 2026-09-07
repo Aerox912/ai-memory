@@ -259,7 +259,12 @@ async fn reindex_project_dir(
     // behaviour that pass was about — quieter here only because it needs an
     // event rather than firing every 30s. Checking once per directory also
     // saves walking a tree whose every page is going to fail scope resolution.
-    if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+    //
+    // Rows only, for the same reason `reconcile` uses this form: the guard
+    // runs before `reindex_page` takes the mutation lock, so writing a
+    // `_meta.md` here could land it in a directory a concurrent project move
+    // is renaming away.
+    if let Err(e) = wiki.ensure_project_scope_rows(ws, proj).await {
         debug!(
             workspace = %ws,
             project = %proj,
@@ -317,7 +322,11 @@ async fn reconcile(wiki: &Wiki) -> WikiResult<ReconcileStats> {
         // directory and skip the whole thing at debug, instead of warning per
         // page indefinitely. If the row later appears (project recreated), the
         // check passes and the directory indexes normally on the next pass.
-        if let Err(e) = wiki.ensure_project_workspace(ws, proj).await {
+        // Rows only: reconcile runs outside the mutation guard, so it must
+        // not write a `_meta.md` into a directory a concurrent project move
+        // may be renaming away. These directories already have their
+        // manifests — written with their first page, or by the backfill.
+        if let Err(e) = wiki.ensure_project_scope_rows(ws, proj).await {
             debug!(
                 workspace = %ws,
                 project = %proj,
@@ -531,30 +540,62 @@ fn is_rotated_log_filename(s: &str) -> bool {
         && bytes[5..].iter().all(|b| b.is_ascii_digit())
 }
 
-/// Cheap peek: does the file open with a `---` YAML frontmatter fence?
-/// Used to tell a real page apart from the raw event ledger.
-fn opens_with_frontmatter(abs: &Path) -> bool {
-    use std::io::{BufRead, BufReader};
-    let Ok(file) = std::fs::File::open(abs) else {
-        return false;
-    };
-    let mut line = String::new();
-    BufReader::new(file).read_line(&mut line).is_ok() && line.trim_end() == "---"
-}
-
-/// Cheap check for the raw hook event ledger shape. Real page markdown can be
-/// frontmatter-free; a reserved-looking filename is only a ledger when the
-/// content starts with the hook log prefix.
+/// Cheap check for the raw hook event ledger shape. A reserved-looking
+/// filename is only a ledger when its first body line is a hook log entry
+/// (`## [ts] ...`).
+///
+/// The body may sit under a YAML frontmatter block: the OKF v0.2 migration
+/// conforms every `.md` under `wiki/`, ledgers included, so a migrated store
+/// has `type: Note` stamped on top of each `log-YYYY-MM.md`. Stopping at the
+/// fence would classify those ledgers as ordinary pages, and each hook
+/// `append_event` would then supersede a multi-megabyte page row.
 fn opens_with_log_ledger(abs: &Path) -> bool {
     use std::io::{BufRead, BufReader};
     let Ok(file) = std::fs::File::open(abs) else {
         return false;
     };
+    let mut reader = BufReader::new(file);
     let mut line = String::new();
-    BufReader::new(file)
-        .read_line(&mut line)
-        .is_ok_and(|_| line.starts_with("## ["))
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    if line.trim_end() != "---" {
+        return line.starts_with("## [");
+    }
+    // Walk past the frontmatter block. The bound keeps a pathological file
+    // (a lone opening fence in a multi-gigabyte log) from a full scan.
+    let mut closed = false;
+    for _ in 0..MAX_FRONTMATTER_LINES {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        if line.trim_end() == "---" {
+            closed = true;
+            break;
+        }
+    }
+    if !closed {
+        return false;
+    }
+    // First non-blank line after the fence decides.
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        if !line.trim().is_empty() {
+            return line.starts_with("## [");
+        }
+    }
 }
+
+/// Upper bound on frontmatter lines scanned by [`opens_with_log_ledger`].
+/// Conformant OKF frontmatter is a handful of keys; this is slack, not a
+/// format limit.
+const MAX_FRONTMATTER_LINES: usize = 64;
 
 /// Returns `true` for markdown files that are NOT wiki pages and must be
 /// skipped by the indexer:
@@ -563,13 +604,13 @@ fn opens_with_log_ledger(abs: &Path) -> bool {
 /// - the raw event ledger (`log.md` / exact `log-YYYY-MM.md`) — skipping which
 ///   avoids supersession loops, since every `append_event` write triggers a
 ///   watcher event. A reserved-looking filename is skipped only when its
-///   content opens with the raw hook log prefix; ordinary markdown pages with
-///   those names are indexed.
+///   first body line is a raw hook log entry; ordinary markdown pages with
+///   those names are indexed, frontmatter or not.
 fn is_reserved_page_file(abs: &Path, page_path: &PagePath) -> bool {
     if is_manifest_filename(page_path) || page_path.as_str() == "bootstrap.md" {
         return true;
     }
-    is_log_ledger_filename(page_path) && !opens_with_frontmatter(abs) && opens_with_log_ledger(abs)
+    is_log_ledger_filename(page_path) && opens_with_log_ledger(abs)
 }
 
 fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
@@ -882,6 +923,45 @@ mod tests {
         );
     }
 
+    /// The directory-event orphan guard (#616 added it beside `reconcile`'s)
+    /// is the watcher's second caller that runs BEFORE `reindex_page` takes
+    /// the mutation lock, so it must stay rows-only for the same reason: a
+    /// `_meta.md` written from an unguarded path could land in a directory a
+    /// concurrent project move is renaming away. Pages found in the walk are
+    /// a different matter — `reindex_page` writes the manifest under the
+    /// guard, which is safe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_events_do_not_write_scope_manifests() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+        // The reader is what lets a manifest be written at all; without it
+        // attached this would pass for the wrong reason.
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let proj_dir = ws_dir.join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        assert!(
+            reindex_project_dir(&wiki, ws, proj, proj_dir.clone()).await,
+            "a scope the store knows is not an orphan"
+        );
+
+        assert!(
+            !ws_dir.join("_meta.md").exists(),
+            "the unguarded directory-event pre-check must not write files"
+        );
+        assert!(!proj_dir.join("_meta.md").exists());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ignores_own_atomic_tempfiles() {
         // Quick unit test: tempfile prefix detection.
@@ -1035,6 +1115,14 @@ mod tests {
             "## [t] evt | x\nrawledgertoken\n",
         )
         .unwrap();
+        // An OKF-conformed ledger: the migration stamps frontmatter on
+        // every .md, ledgers included. Still a ledger, still skipped.
+        std::fs::write(
+            proj_dir.join("log-2026-07.md"),
+            "---\ntype: Note\ngenerated:\n  by: process:ai-memory/2.0.0\n---\n\
+             ## [t] evt | x\nstampedledgertoken\n",
+        )
+        .unwrap();
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
         reconcile(&wiki).await.unwrap();
@@ -1069,6 +1157,21 @@ mod tests {
         assert!(
             ledger_hits.is_empty(),
             "raw ledger (no frontmatter) must not be indexed"
+        );
+
+        // Regression: before this check looked past the frontmatter fence,
+        // an OKF-migrated ledger was indexed as a page. Every hook
+        // `append_event` then superseded it, writing the whole (ever
+        // growing) ledger body as a new `pages` row — a store that grew
+        // into the gigabytes within days.
+        let stamped_hits = store
+            .reader
+            .search_pages("stampedledgertoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            stamped_hits.is_empty(),
+            "OKF-conformed ledger (frontmatter + log entries) must not be indexed"
         );
 
         handle.shutdown().await;

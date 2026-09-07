@@ -9,6 +9,7 @@
 //!
 //! `setup-agent` bundles the extract + render into one command:
 //!
+//! ```sh
 //!     docker run --rm \
 //!       -v "$HOME/.ai-memory:/host" \
 //!       akitaonrails/ai-memory:latest \
@@ -17,6 +18,7 @@
 //!         --to /host/hooks \
 //!         --host-prefix "$HOME/.ai-memory/hooks" \
 //!         --auth-token "$TOKEN"
+//! ```
 //!
 //! 1. Copies `/usr/local/share/ai-memory/hooks/claude-code/*.{sh,ps1}` into
 //!    `/host/hooks/claude-code/` (which on the host is
@@ -63,7 +65,11 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
     };
     if matches!(
         args.agent,
-        AgentChoice::OpenCode | AgentChoice::Pi | AgentChoice::Omp | AgentChoice::Openclaw
+        AgentChoice::OpenCode
+            | AgentChoice::OpenCode2
+            | AgentChoice::Pi
+            | AgentChoice::Omp
+            | AgentChoice::Openclaw
     ) {
         emit_extension_setup_hint(&args)?;
         return Ok(());
@@ -165,6 +171,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         }
         AgentChoice::Pool => emit_pool(&emit_root, &args),
         AgentChoice::OpenCode
+        | AgentChoice::OpenCode2
         | AgentChoice::Pi
         | AgentChoice::Omp
         | AgentChoice::Openclaw
@@ -249,6 +256,12 @@ fn emit_extension_setup_hint(args: &SetupAgentArgs) -> Result<()> {
             "opencode",
             "Then restart OpenCode so it loads ~/.config/opencode/plugins/ai-memory.ts.",
             "opencode",
+        ),
+        AgentChoice::OpenCode2 => (
+            "OpenCode 2",
+            "opencode2",
+            "Then restart OpenCode 2 so it loads ~/.config/opencode/plugins/ai-memory-opencode2.ts.",
+            "opencode2",
         ),
         AgentChoice::Omp => (
             "OMP",

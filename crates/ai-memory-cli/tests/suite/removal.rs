@@ -93,6 +93,8 @@ fn install_then_uninstall_round_trip_claude_hooks() {
     // Install ai-memory hooks for Claude Code.
     let status = command_with_home(home.path())
         .args(["install-hooks", "--agent", "claude-code", "--apply"])
+        .arg("--hooks-dir")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks"))
         .status()
         .unwrap();
     assert!(status.success(), "install-hooks failed");
@@ -140,6 +142,16 @@ fn relocated_claude_uninstall_sweeps_active_and_legacy_installs() {
         }
         command
             .args(args)
+            .args(if args.first() == Some(&"install-hooks") {
+                vec![
+                    std::ffi::OsString::from("--hooks-dir"),
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../hooks")
+                        .into_os_string(),
+                ]
+            } else {
+                vec![]
+            })
             .current_dir(project.path())
             .output()
             .unwrap()

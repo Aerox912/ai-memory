@@ -1080,11 +1080,19 @@ mod tests {
         assert_eq!(persisted_capture_mode(tmp.path()), CaptureMode::Denylist);
     }
 
+    /// "The server is down": a loopback endpoint that accepts and immediately
+    /// closes every connection. A closed port would do, but Windows takes ~2s
+    /// to report a refused loopback connect, which made every test that posts
+    /// to a dead server cost 2s per request.
+    fn dead_server_url() -> String {
+        ai_memory_test_support::dead_http_endpoint()
+    }
+
     fn devin_hook_args(event: &str) -> HookArgs {
         HookArgs {
             event: event.into(),
             agent: "devin".into(),
-            server_url: "http://127.0.0.1:1".into(),
+            server_url: dead_server_url(),
             auth_token: None,
             auth_token_file: None,
             pool_id: None,
@@ -1361,7 +1369,7 @@ mod tests {
         let mut stdout = Vec::new();
         run_with_payload(
             Some(data_dir.clone()),
-            antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
+            antigravity_hook_args("pre-tool-use", &dead_server_url()),
             serde_json::json!({
                 "conversationId": "agy-session",
                 "workspacePaths": [tmp.path()],
@@ -1385,7 +1393,7 @@ mod tests {
         let mut stdout = Vec::new();
         run_with_payload(
             Some(data_dir.clone()),
-            antigravity_hook_args("pre-tool-use", "http://127.0.0.1:1"),
+            antigravity_hook_args("pre-tool-use", &dead_server_url()),
             "not-json".into(),
             &mut stdout,
             |_, _| Ok(()),
@@ -1842,7 +1850,7 @@ mod tests {
         let args = HookArgs {
             event: "session-end".into(),
             agent: "claude-code".into(),
-            server_url: "http://127.0.0.1:1".into(),
+            server_url: dead_server_url(),
             auth_token: None,
             auth_token_file: None,
             pool_id: None,
@@ -1887,7 +1895,7 @@ mod tests {
             let args = HookArgs {
                 event: event.into(),
                 agent: "claude-code".into(),
-                server_url: "http://127.0.0.1:1".into(),
+                server_url: dead_server_url(),
                 auth_token: None,
                 auth_token_file: None,
                 pool_id: None,
@@ -1931,7 +1939,7 @@ mod tests {
         let args = HookArgs {
             event: "session-end".into(),
             agent: "claude-code".into(),
-            server_url: "http://127.0.0.1:1".into(),
+            server_url: dead_server_url(),
             auth_token: None,
             auth_token_file: None,
             pool_id: None,
@@ -1965,7 +1973,7 @@ mod tests {
         let args = HookArgs {
             event: "session-end".into(),
             agent: "devin".into(),
-            server_url: "http://127.0.0.1:1".into(),
+            server_url: dead_server_url(),
             auth_token: None,
             auth_token_file: None,
             pool_id: None,
@@ -2066,7 +2074,7 @@ mod tests {
         let mut stdout = Vec::new();
         let called = std::cell::Cell::new(false);
         let mut args = devin_hook_args("post-tool-use");
-        args.server_url = "http://127.0.0.1:1".into();
+        args.server_url = dead_server_url();
         run_with_payload(Some(data_dir.clone()), args, serde_json::json!({"cwd":tmp.path(),"tool_name":"Edit","tool_input":{"path":"secret/SENTINEL"}}).to_string(), &mut stdout, |_, _| { called.set(true); Ok(()) }).await.unwrap();
         assert_eq!(stdout, b"{}\n");
         assert!(!called.get());

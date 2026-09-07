@@ -13,21 +13,20 @@
 //! both versions survive), then purge the source — there the episodic rows
 //! (sessions/observations/handoffs) are dropped by the purge.
 
+use super::common::{post, spawn_capture_hook};
 use ai_memory_core::{AgentKind, PagePath, Sanitized, Sanitizer, Tier};
-use ai_memory_mcp::{AdminState, admin_router};
+use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
     AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
 };
-use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post as axum_post;
 use axum::{Json, Router};
 use serde_json::json;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use tower::ServiceExt;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -99,17 +98,6 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-}
-
-async fn post(state: AdminState, uri: &str, body: serde_json::Value) -> axum::response::Response {
-    let router = admin_router(state);
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    router.oneshot(req).await.unwrap()
 }
 
 /// Seed `<ws>/<project>/<path>` with one page carrying `body`.
@@ -2197,24 +2185,7 @@ async fn delete_workspace_reject_policy_aborts_before_db_or_disk_destruction() {
 
 #[tokio::test]
 async fn delete_workspace_reports_partial_disk_failure_and_dispatches_notification() {
-    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
-    let tx = Arc::new(Mutex::new(Some(tx)));
-    let tx_for_route = tx.clone();
-    let app = Router::new().route(
-        "/hook",
-        axum_post(move |Json(payload): Json<serde_json::Value>| {
-            let tx_for_route = tx_for_route.clone();
-            async move {
-                if let Some(tx) = tx_for_route.lock().unwrap().take() {
-                    let _ = tx.send(payload);
-                }
-                StatusCode::NO_CONTENT
-            }
-        }),
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/hook", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (url, rx) = spawn_capture_hook().await;
 
     let tmp = TempDir::new().unwrap();
     let chain = AdmissionChain::new(vec![WebhookConfig {

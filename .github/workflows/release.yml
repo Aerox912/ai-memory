@@ -76,8 +76,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build release binary
-        env:
-          TAILWIND_SKIP: "1"
         run: cargo build --locked --release -p ai-memory-cli
 
       - name: Create release tarball
@@ -101,6 +99,7 @@ jobs:
           cp docs/install.md "dist/$artifact/docs/install.md"
           tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           sha256sum "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
+
 
       - name: Smoke test release tarball
         env:
@@ -144,8 +143,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build release binary
-        env:
-          TAILWIND_SKIP: "1"
         run: cargo build --locked --release -p ai-memory-cli
 
       # Mirrors the Linux tarball, minus the Linux-only service assets

@@ -49,11 +49,11 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, CompactSummary, Compaction, DeleteWorkspaceSummary, EmbedOutcome,
-    EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IngestObservationOutcome,
-    LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
-    OkfMigratedPage, PagesMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
-    backfill_entity_index, purge_session, record_embed_failure,
+    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DeleteWorkspaceSummary,
+    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MoveSessionSummary, MoveSummary,
+    ObservationPruneOutcome, OkfMigratedPage, PagesMode, PurgeSessionSummary, PurgeSummary,
+    ReorgSummary, backfill_entity_index, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
@@ -7000,3 +7000,13 @@ mod tests {
         );
     }
 }
+
+// Integration tests compile into this crate's test harness instead of a
+// separate binary: every test binary is another link and, on macOS and
+// Windows, another first-run malware scan. They still exercise only the
+// public API; `extern crate self` lets them keep addressing it by crate name.
+#[cfg(test)]
+extern crate self as ai_memory_store;
+#[cfg(test)]
+#[path = "../tests/suite/mod.rs"]
+mod integration;

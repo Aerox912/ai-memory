@@ -192,6 +192,16 @@ below the selected skill root. Skill files are ai-memory-managed only when they
 contain the managed marker, so unmanaged same-name skills should not be
 overwritten unless the human explicitly forces replacement.
 
+The installed snippet and all project-scoped managed skills use the same
+client-aware scope rule. A session-aware bridge that forwards the real hook
+session id may omit scope for the current repository. A static MCP client must
+send exact `workspace` and `project` values on every project-scoped call, even
+when lifecycle hooks are installed, because hooks alone do not identify the MCP
+request. Declare both names in the nearest [`.ai-memory.toml`](marker-file.md),
+or obtain them from the operator/server configuration; never infer them from a
+directory name or rely on the server's last active project. Global query and
+global preference modes still omit project scope arguments.
+
 From a terminal:
 
 ```bash
@@ -318,6 +328,8 @@ Client cleanup hints:
   under `$KIRO_HOME` when set) for stale ai-memory entries.
 - OpenCode, OpenClaw, and OMP: check MCP config and plugin/extension directories;
   move old memory plugins to a disabled/quarantine directory before deleting.
+  For the OpenCode 2 beta the plugin file is `ai-memory-opencode2.ts` and the
+  MCP entry lives under `mcp.servers` in the same `opencode.json(c)`.
 - VS Code Copilot, Claude Desktop, and Zed: these are MCP-only, so confirm
   whether the old tool was providing capture hooks elsewhere. Zed's MCP
   entries live under `context_servers` in its user `settings.json`.
@@ -451,7 +463,7 @@ page and no argument, ai-memory appends no preference block.
 
 Durable project rules belong in the agent's rules file, not only in the
 wiki. For Claude Code that is `CLAUDE.md`; for Codex, Devin CLI, OpenCode,
-Cursor, Gemini CLI, Grok Build CLI, Kimi Code, Kiro CLI, and Command Code it is usually
+OpenCode 2 beta, Cursor, Gemini CLI, Grok Build CLI, Kimi Code, Kiro CLI, and Command Code it is usually
 `AGENTS.md`.
 
 The consolidator classifies compiled observations as `decision`,
