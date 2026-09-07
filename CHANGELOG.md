@@ -77,6 +77,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line is a hook log entry), moved into a shared `ledger` module so both
   call sites stay in sync; a page literally named `log-2026-09.md` whose
   body is prose is still migrated. (#669)
+- SessionEnd no longer writes an ephemeral `sessions/<id>.md` page for a
+  session that logged no real work. `is_lifecycle_only_session` treated a
+  session as skippable only when every observation was `SessionStart` or
+  `SessionEnd`, so a single `Stop` observation — which OpenCode fires for
+  purely internal work like branch-naming, alongside `session.created` +
+  `session.idle` with no user prompt and no tool use — was enough to make
+  the session look substantive and get a wiki page synthesized for it,
+  flooding the wiki with no-op session pages. "Substantive" is now defined
+  positively instead of negatively: a session counts as real work only if
+  it contains a `UserPrompt`, `PreToolUse`, or `PostToolUse` observation
+  (`is_ephemeral_session` in `ai-memory-hooks`). The atomic store-side
+  check (`end_lifecycle_only_session_in_tx` in `ai-memory-store`) moved to
+  the same positive `kind IN ('user-prompt', 'pre-tool-use',
+  'post-tool-use')` test so the two stay in agreement, and the
+  PreCompact/PostCompaction checkpoint path gates on the same test rather
+  than only `observations.is_empty()`. Provider-agnostic: this fixes the
+  class for any harness that fires lifecycle-only `Stop`/`Notification`
+  events, not just OpenCode. (#662)
 
 ## [2.1.0] - 2026-09-06
 
