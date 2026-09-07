@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The managed routing snippet now states that ai-memory is the cross-harness
+  memory of record: when the surrounding harness has its own local memory
+  feature, durable project facts should be captured in ai-memory rather than
+  duplicated in a harness-local store that other agents cannot see (#671).
+
 ### Fixed
 - Wiki auto-commits no longer re-hash the whole tree. Since the #594 guard,
   every commit cleared the git index and re-read every page, so a session
