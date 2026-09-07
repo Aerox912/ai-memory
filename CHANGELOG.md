@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Preserved typed relation edges in multi-page consolidation. Batch updates
+  now include the same closed `causes` / `fixes` / `contradicts` schema as
+  single-page consolidation and carry non-empty relations into wiki
+  frontmatter and the link index, instead of silently discarding them. (#630)
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated
   store stops growing without bound. The reserved-file check treated any
   `log.md` / `log-YYYY-MM.md` carrying YAML frontmatter as an ordinary page,
