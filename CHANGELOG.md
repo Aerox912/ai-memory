@@ -65,6 +65,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-emitted the mark after the closing `---` fence, where it is a stray
   zero-width no-break space rather than a byte-order mark. Both paths now drop
   the leading BOM, which is what the frontmatter path already did. (#663)
+- `serve` no longer re-archives the whole data dir on every start once a
+  monthly log ledger exists. The OKF conformance migration's
+  `nonconformant_files` scan flagged every frontmatter-less `log-YYYY-MM.md`
+  / `log.md` event ledger as a pre-OKF page (`okf::is_conformant` requires a
+  `type` key and a ledger has none), so the pre-migration backup gate saw a
+  non-empty pending list and took a full `tar.gz` snapshot on every boot —
+  the flip side of #660, which taught only the watcher's indexer to skip
+  ledgers by content. The migration scan now shares that same content-gated
+  check (a reserved-looking filename is excluded only when its first body
+  line is a hook log entry), moved into a shared `ledger` module so both
+  call sites stay in sync; a page literally named `log-2026-09.md` whose
+  body is prose is still migrated. (#669)
 
 ## [2.1.0] - 2026-09-06
 
