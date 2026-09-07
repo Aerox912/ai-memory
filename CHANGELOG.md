@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by a test that removes a blob from the object store. Commits on one wiki
   are also serialized: two session ends at once used to collide on the index
   lock, and the losing snapshot was dropped with a warning. (#665)
+- Preserved typed relation edges in multi-page consolidation. Batch updates
+  now include the same closed `causes` / `fixes` / `contradicts` schema as
+  single-page consolidation and carry non-empty relations into wiki
+  frontmatter and the link index, instead of silently discarding them. (#667)
 - OKF-conformed event ledgers are skipped by the indexer again, so a migrated
   store stops growing without bound. The reserved-file check treated any
   `log.md` / `log-YYYY-MM.md` carrying YAML frontmatter as an ordinary page,
