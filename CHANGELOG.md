@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time. A session end now costs what it wrote, not the size of the wiki,
   and the git history no longer silently misses snapshots under
   concurrent sessions (#674).
+- The generated pi/omp and OpenClaw TypeScript integrations registered their
+  session-end lifecycle event (`session_shutdown` for pi/omp, `session_end`
+  for OpenClaw) with a synchronous, fire-and-forget handler. The host tears
+  down the runtime as soon as a synchronous handler returns, killing the
+  in-flight `session-end` POST before it completes, so the server never
+  learned the session had ended: `sessions.ended_at` stayed `NULL`, and no
+  summary or handoff was produced. The handlers are now `async` and await a
+  bounded (2s) drain of the pending request(s) before returning, mirroring
+  the joinable dispose-drain already used by the OpenCode integration (#676).
 
 ## [2.1.1] - 2026-09-07
 
