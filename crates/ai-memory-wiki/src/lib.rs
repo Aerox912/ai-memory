@@ -35,5 +35,6 @@ pub use wiki::{MoveSessionOutcome, SessionPageFile, Wiki, WritePageRequest};
 #[cfg(test)]
 extern crate self as ai_memory_wiki;
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 #[path = "../tests/suite/mod.rs"]
 mod integration;
