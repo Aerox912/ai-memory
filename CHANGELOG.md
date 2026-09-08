@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   summary or handoff was produced. The handlers are now `async` and await a
   bounded (2s) drain of the pending request(s) before returning, mirroring
   the joinable dispose-drain already used by the OpenCode integration (#676).
+- The `bin/ai-memory` container wrapper now matches multi-architecture image
+  manifests against the host's platform architecture, eliminating a
+  false-positive "a newer image is available on Docker Hub" warning on x86_64
+  and Podman. Additionally, `emit_docker_run_script` now preserves volume mount
+  modes (such as `:Z` on SELinux/Podman environments) and filters transient
+  runtime environment variables (`HOSTNAME`, `container=podman`).
 
 ## [2.1.1] - 2026-09-07
 

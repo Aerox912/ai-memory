@@ -46,10 +46,14 @@ case "${1:-}" in
       '{{.Id}}') printf 'running-container-id\n' ;;
       '{{.Config.Image}}') printf 'akitaonrails/ai-memory:latest\n' ;;
       *PortBindings*) printf '%s\n' '-p 127.0.0.1:49374:49374/tcp ' ;;
-      *Mounts*) printf '%s\n' '-v ai-memory-data:/data ' ;;
+      *Mounts*) printf '%s\n' '-v ai-memory-data:/data:Z ' ;;
       *RestartPolicy*) printf '%s\n' '--restart unless-stopped' ;;
       '{{json .Config.Cmd}}') printf '[]\n' ;;
-      *'.Config.Env'*) : ;;
+      *'.Config.Env'*)
+        if [ "${2:-}" = "ai-memory" ]; then
+          printf 'CUSTOM_VAR=custom_val\nHOSTNAME=container-id-123\ncontainer=podman\n'
+        fi
+        ;;
       *) printf 'unexpected inspect format: %s\n' "${4:-<missing>}" >&2; exit 2 ;;
     esac
     ;;
@@ -84,7 +88,10 @@ run_upgrade_case() {
 run_upgrade_case standalone 0
 assert_contains "${TMP_ROOT}/standalone/output.log" "does not manage the running ai-memory container"
 assert_not_contains "${TMP_ROOT}/standalone/docker.log" "compose up -d"
-assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "-v ai-memory-data:/data"
+assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "-v ai-memory-data:/data:Z"
+assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "-e CUSTOM_VAR=custom_val"
+assert_not_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "HOSTNAME="
+assert_not_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "container=podman"
 assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "${FAKE_DOCKER} stop ai-memory"
 assert_not_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "docker stop ai-memory"
 
@@ -93,6 +100,96 @@ assert_contains "${TMP_ROOT}/compose/output.log" "restarting local ai-memory con
 assert_contains "${TMP_ROOT}/compose/docker.log" "compose up -d"
 if [ -e "${TMP_ROOT}/compose/cache/ai-memory/recreate-ai-memory.sh" ]; then
   fail "Compose-owned container unexpectedly produced a standalone recreation script"
+fi
+
+# ---- multi-arch manifest version-check tests -----------------------------
+
+if command -v python3 >/dev/null 2>&1; then
+  H_ARM="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  H_AMD="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  H_OLD="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+  MULTI_ARCH_JSON="{\"manifests\":[{\"digest\":\"${H_ARM}\",\"platform\":{\"architecture\":\"arm64\"}},{\"digest\":\"${H_AMD}\",\"platform\":{\"architecture\":\"amd64\"}}]}"
+
+  run_version_check_case() {
+    local name="$1" uname_m="$2" local_inspect="$3" remote_manifest="$4" expect_warn="$5"
+    local case_dir="${TMP_ROOT}/ver_${name}"
+    mkdir -p "${case_dir}/cache"
+    local fake_engine="${case_dir}/engine"
+    cat >"${fake_engine}" <<ENGINE
+#!/usr/bin/env bash
+case "\${1:-}" in
+  image)
+    printf '%b\n' '${local_inspect}'
+    ;;
+  manifest)
+    printf '%b\n' '${remote_manifest}'
+    ;;
+  info)
+    printf 'name=seccomp\n'
+    ;;
+  run)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+ENGINE
+    chmod 0755 "${fake_engine}"
+
+    local fake_uname="${case_dir}/uname"
+    cat >"${fake_uname}" <<UNAME
+#!/usr/bin/env bash
+printf '%s\n' "${uname_m}"
+UNAME
+    chmod 0755 "${fake_uname}"
+
+    local out="${case_dir}/out.log"
+    python3 -c '
+import os, pty, sys
+master, slave = pty.openpty()
+pid = os.fork()
+if pid == 0:
+    os.close(master)
+    os.dup2(slave, 0)
+    os.dup2(slave, 1)
+    os.dup2(slave, 2)
+    os.close(slave)
+    env = dict(os.environ)
+    env["PATH"] = sys.argv[1] + ":" + env["PATH"]
+    env["AI_MEMORY_DOCKER"] = sys.argv[2]
+    env["AI_MEMORY_NO_TTY"] = "1"
+    env["XDG_CACHE_HOME"] = sys.argv[3]
+    env.pop("AI_MEMORY_NO_VERSION_CHECK", None)
+    os.execvpe(sys.argv[4], [sys.argv[4], "status"], env)
+else:
+    os.close(slave)
+    output = b""
+    while True:
+        try:
+            chunk = os.read(master, 1024)
+            if not chunk: break
+            output += chunk
+        except OSError:
+            break
+    os.close(master)
+    os.waitpid(pid, 0)
+    with open(sys.argv[5], "wb") as f:
+        f.write(output)
+' "${case_dir}" "${fake_engine}" "${case_dir}/cache" "${ROOT}/bin/ai-memory" "${out}"
+
+    if [ "${expect_warn}" -eq 1 ]; then
+      assert_contains "${out}" "a newer image is available on Docker Hub"
+    else
+      assert_not_contains "${out}" "a newer image is available on Docker Hub"
+    fi
+  }
+
+  run_version_check_case amd64_matching "x86_64" "sha256:index\n${H_AMD}" "${MULTI_ARCH_JSON}" 0
+  run_version_check_case amd64_outdated "x86_64" "sha256:index\n${H_OLD}" "${MULTI_ARCH_JSON}" 1
+  run_version_check_case arm64_matching "aarch64" "${H_ARM}" "${MULTI_ARCH_JSON}" 0
+  run_version_check_case arm64_outdated "aarch64" "${H_OLD}" "${MULTI_ARCH_JSON}" 1
 fi
 
 printf 'wrapper upgrade ownership checks passed\n'
