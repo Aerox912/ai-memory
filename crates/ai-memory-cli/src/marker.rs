@@ -196,16 +196,60 @@ fn declares_more_than_capture(text: &str) -> bool {
             .any(|key| parse_flag_in(text, key).is_some())
 }
 
-fn absolute_normalized(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(path))
-                .unwrap_or_else(|_| path.to_path_buf())
+/// Make `path` absolute and resolve its `.`/`..` components, WITHOUT
+/// touching the filesystem: no symlink resolution, no `\\?\` verbatim
+/// prefix. `find_marker`'s callers (`hook_capture::capture_policy` ->
+/// `CapturePolicy::compile`) compare the returned marker directory, as a
+/// plain string prefix, against runtime candidate paths straight from the
+/// hook payload (`cwd`/`tool_input.file_path`) — paths the hook host never
+/// canonicalizes. A `fs::canonicalize`-based normalization here used to
+/// resolve macOS's `/var` -> `/private/var` symlink and prepend Windows'
+/// `\\?\` prefix, moving the marker path into a different namespace than
+/// the candidate and making `[capture] ignore_paths` glob matching
+/// silently miss on both platforms (#671). Lexical normalization keeps
+/// `start`, `home`, the marker path and `checkout_root` in the caller's own
+/// namespace on every platform, and still resolves `..` traversal purely
+/// syntactically, preserving the boundary hardening from f69e896e.
+///
+/// `pub(crate)`: `commands::hook` normalizes the same raw hook `cwd` with
+/// this exact function (see `commands::hook::lexical_capture_cwd`) before
+/// joining a tool event's relative candidate path onto it, so the join lands
+/// in the identical namespace as the marker directory found here — a
+/// symlinked cwd (e.g. #671's `capture_drop_handles_symlinked_cwd`) then
+/// matches `ignore_paths` without either side resolving the symlink.
+pub(crate) fn absolute_normalized(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    lexically_normalize(&absolute)
+}
+
+/// Resolve `.`/`..` path components purely syntactically (no filesystem
+/// access) — the well-known `path-clean` algorithm. A leading `..` that has
+/// nothing left to pop (already at a root, or a still-relative path with no
+/// preceding `Normal` component) is kept rather than dropped or erroring,
+/// matching `canonicalize`'s inability to go above `/`.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut stack: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match stack.last() {
+                Some(Component::Normal(_)) => {
+                    stack.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => stack.push(component),
+            },
+            other => stack.push(other),
         }
-    })
+    }
+    stack.into_iter().collect()
 }
 
 fn checkout_root(start: &Path) -> Option<PathBuf> {
@@ -339,7 +383,7 @@ mod tests {
 
         assert_eq!(
             find_marker_with_home(nested.to_str().unwrap(), Some(&home)),
-            Some(repo_marker.canonicalize().unwrap())
+            Some(repo_marker.clone())
         );
         fs::remove_file(repo.join(".ai-memory.toml")).unwrap();
         assert_eq!(
@@ -367,7 +411,7 @@ mod tests {
         let local = write_marker(&cwd, "workspace = \"right\"\n");
         assert_eq!(
             find_marker_with_home(cwd.to_str().unwrap(), Some(&home)),
-            Some(local.canonicalize().unwrap())
+            Some(local)
         );
     }
 
@@ -490,7 +534,11 @@ project = "infra" # this is fine
             .expect("the outer marker still declares scope");
         assert_eq!(scope.workspace.as_deref(), Some("acme"));
         assert_eq!(scope.project.as_deref(), Some("infra"));
-        assert_eq!(scope.path, outer_marker.canonicalize().unwrap());
+        // `scope.path` is the marker found by the lexical (non-canonicalizing)
+        // walk, so it stays in the input's namespace — compare against the raw
+        // marker path, not `canonicalize()` (which would diverge on macOS's
+        // /var -> /private/var symlink and Windows's \\?\ prefix).
+        assert_eq!(scope.path, outer_marker);
     }
 
     /// When every marker in the ancestor chain is capture-only (or none
@@ -551,5 +599,61 @@ project = "infra" # this is fine
                 "{text} should be a settings boundary"
             );
         }
+    }
+
+    // ── #671: `absolute_normalized` must be lexical, not filesystem-real ──
+
+    /// A `..` component is resolved purely syntactically: it must not
+    /// require the path to exist, which `fs::canonicalize` would (this path
+    /// is guaranteed absent). Pins the regression that made macOS's
+    /// `/private/var` symlink resolution and Windows' `\\?\` prefix diverge
+    /// from the raw hook-reported candidate paths.
+    #[test]
+    fn absolute_normalized_resolves_dotdot_without_requiring_the_path_to_exist() {
+        let missing = Path::new("/definitely/does/not/exist-671/nested/../sibling");
+        assert_eq!(
+            absolute_normalized(missing),
+            PathBuf::from("/definitely/does/not/exist-671/sibling"),
+            "`..` must resolve lexically even though the path is absent \
+             (fs::canonicalize would have returned Err for this)"
+        );
+    }
+
+    /// A leading `..` with nothing left to pop stays literal — lexical
+    /// normalization can't escape above a root, matching what
+    /// `fs::canonicalize` does for `/`.
+    #[test]
+    fn absolute_normalized_keeps_dotdot_that_cannot_go_above_root() {
+        assert_eq!(
+            absolute_normalized(Path::new("/../above-root")),
+            PathBuf::from("/above-root")
+        );
+    }
+
+    /// The regression itself: a REAL symlinked directory must be returned
+    /// as-is, with the symlink component intact, rather than resolved to
+    /// its target — the behavior `fs::canonicalize` had and that diverged
+    /// `marker_dir` from the runtime hook's un-canonicalized candidate
+    /// paths on macOS/Windows (`ignore_paths` silently stopped matching).
+    #[test]
+    fn absolute_normalized_does_not_resolve_a_real_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let real_target = tmp.path().join("real-target");
+        fs::create_dir_all(&real_target).unwrap();
+        let link = tmp.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+        #[cfg(not(unix))]
+        return; // symlink creation needs elevated privilege on Windows CI
+
+        let via_symlink = link.join("nested").join("..").join("file.txt");
+        let normalized = absolute_normalized(&via_symlink);
+
+        assert!(
+            normalized.starts_with(&link),
+            "normalized path {normalized:?} must keep the `link` component \
+             rather than resolving it to {real_target:?}"
+        );
+        assert_eq!(normalized, link.join("file.txt"));
     }
 }
