@@ -608,6 +608,10 @@ project = "infra" # this is fine
     /// is guaranteed absent). Pins the regression that made macOS's
     /// `/private/var` symlink resolution and Windows' `\\?\` prefix diverge
     /// from the raw hook-reported candidate paths.
+    // Unix-only fixtures (hardcoded `/`-rooted absolute paths); the lexical
+    // fold itself is platform-agnostic and exercised on Windows by the capture
+    // tests once they compile.
+    #[cfg(unix)]
     #[test]
     fn absolute_normalized_resolves_dotdot_without_requiring_the_path_to_exist() {
         let missing = Path::new("/definitely/does/not/exist-671/nested/../sibling");
@@ -622,6 +626,7 @@ project = "infra" # this is fine
     /// A leading `..` with nothing left to pop stays literal — lexical
     /// normalization can't escape above a root, matching what
     /// `fs::canonicalize` does for `/`.
+    #[cfg(unix)]
     #[test]
     fn absolute_normalized_keeps_dotdot_that_cannot_go_above_root() {
         assert_eq!(
@@ -635,16 +640,17 @@ project = "infra" # this is fine
     /// its target — the behavior `fs::canonicalize` had and that diverged
     /// `marker_dir` from the runtime hook's un-canonicalized candidate
     /// paths on macOS/Windows (`ignore_paths` silently stopped matching).
+    // Unix-only: creating a symlink on Windows CI needs elevated privilege.
+    // The regression this guards (canonicalize resolving the symlink and
+    // diverging `marker_dir` from raw runtime paths) is exercised on Linux/macOS.
+    #[cfg(unix)]
     #[test]
     fn absolute_normalized_does_not_resolve_a_real_symlink() {
         let tmp = TempDir::new().unwrap();
         let real_target = tmp.path().join("real-target");
         fs::create_dir_all(&real_target).unwrap();
         let link = tmp.path().join("link");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&real_target, &link).unwrap();
-        #[cfg(not(unix))]
-        return; // symlink creation needs elevated privilege on Windows CI
 
         let via_symlink = link.join("nested").join("..").join("file.txt");
         let normalized = absolute_normalized(&via_symlink);
