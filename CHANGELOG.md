@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- CLI server errors now name the request. A non-2xx response from the
+  configured server printed only `server returned 404 Not Found: <body>`,
+  so a failure gave no clue which endpoint answered. The message now leads
+  with the request method and path: `GET /admin/open-sessions: server
+  returned 404 Not Found: <body>`. The error keeps the path only, so a
+  token in the URL userinfo or query string never reaches a log line.
 - Wiki auto-commits stage what the wiki wrote instead of walking the
   whole tree, keep the repository open between commits, and no longer
   drop the commit when another session is writing a file at the same
