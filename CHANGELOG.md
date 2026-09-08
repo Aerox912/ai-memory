@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Wiki auto-commits stage what the wiki wrote instead of walking the
+  whole tree, keep the repository open between commits, and no longer
+  drop the commit when another session is writing a file at the same
+  time. A session end now costs what it wrote, not the size of the wiki,
+  and the git history no longer silently misses snapshots under
+  concurrent sessions (#674).
+
 ## [2.1.1] - 2026-09-07
 
 ### Changed

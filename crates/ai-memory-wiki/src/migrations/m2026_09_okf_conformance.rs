@@ -17,7 +17,6 @@
 //!
 //! Idempotent: on a conformant store both passes find nothing and the
 //! backup gate never engages (fresh installs never create archives).
-
 use std::path::{Path, PathBuf};
 
 use ai_memory_store::WriterHandle;
@@ -173,9 +172,9 @@ impl WikiMigration for OkfConformance {
 
         // 4. File pass.
         for file in file_pending {
-            conform_file(wiki_root, &file, &at_by_page)?;
+            conform_file(&git, &file, &at_by_page)?;
         }
-        ensure_bundle_indexes(wiki_root)?;
+        ensure_bundle_indexes(&git)?;
 
         // 5. One commit for the whole rewrite.
         git.commit_all("okf-migration: conform wiki to OKF v0.2")?;
@@ -260,11 +259,11 @@ fn is_ledger_file(path: &Path) -> bool {
 /// (`_meta.md`) get their `type` only — they are identity records, not
 /// concept pages with provenance.
 fn conform_file(
-    wiki_root: &Path,
+    git: &crate::git::GitAdapter,
     rel: &Path,
     at_by_page: &std::collections::HashMap<(String, String, String), String>,
 ) -> WikiResult<()> {
-    let abs = wiki_root.join(rel);
+    let abs = git.root().join(rel);
     let raw = std::fs::read_to_string(&abs)?;
     let mut md = parse(&raw).unwrap_or_else(|_| Markdown {
         frontmatter: serde_json::Value::Object(serde_json::Map::new()),
@@ -306,9 +305,7 @@ fn conform_file(
 
     let emitted = emit(&md)?;
     if emitted != raw {
-        let tmp = tempfile::NamedTempFile::new_in(abs.parent().unwrap_or(wiki_root))?;
-        std::fs::write(tmp.path(), emitted.as_bytes())?;
-        crate::atomic::persist_with_retry(tmp, &abs)?;
+        git.write_atomic(&abs, emitted.as_bytes())?;
     }
     Ok(())
 }
@@ -327,8 +324,8 @@ fn mtime_iso(path: &Path) -> String {
 /// Each project directory is one OKF bundle: give it an `index.md`
 /// declaring `okf_version` when absent (the only place index.md may
 /// carry frontmatter, per spec).
-fn ensure_bundle_indexes(wiki_root: &Path) -> WikiResult<()> {
-    let Ok(workspaces) = std::fs::read_dir(wiki_root) else {
+fn ensure_bundle_indexes(git: &crate::git::GitAdapter) -> WikiResult<()> {
+    let Ok(workspaces) = std::fs::read_dir(git.root()) else {
         return Ok(());
     };
     for ws in workspaces.flatten() {
@@ -362,13 +359,14 @@ fn ensure_bundle_indexes(wiki_root: &Path) -> WikiResult<()> {
             let body =
                 format!("# Bundle index\n\nConcept files live in these directories:\n\n{listing}");
             let content = format!("---\nokf_version: \"0.2\"\n---\n\n{body}");
-            std::fs::write(&index, content)?;
+            git.write_atomic(&index, content.as_bytes())?;
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use ai_memory_core::{PagePath, Tier};
     use ai_memory_store::Store;
@@ -577,7 +575,8 @@ mod tests {
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, "\u{FEFF}# Hand written\n\nBody.\n").unwrap();
 
-        conform_file(tmp.path(), rel, &std::collections::HashMap::new()).unwrap();
+        let git = crate::git::GitAdapter::open_or_init(tmp.path()).unwrap();
+        conform_file(&git, rel, &std::collections::HashMap::new()).unwrap();
 
         let conformed = std::fs::read_to_string(&abs).unwrap();
         assert!(

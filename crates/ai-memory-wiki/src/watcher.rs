@@ -196,7 +196,22 @@ async fn run_loop(
     }
 }
 
+/// Inside the wiki's own git directory: neither indexed nor reported.
+fn is_git_internal(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|rel| rel.starts_with(".git"))
+}
+
 async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent) {
+    // Nothing to index, but the next auto-commit must stage it.
+    if matches!(event.kind, EventKind::Remove(_)) {
+        for raw_path in &event.paths {
+            if !is_tempfile(raw_path) && !is_git_internal(wiki.root(), raw_path) {
+                wiki.git().mark_written(raw_path);
+            }
+        }
+        return;
+    }
     if !matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Other
@@ -204,6 +219,9 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         return;
     }
     for raw_path in &event.paths {
+        if is_git_internal(wiki.root(), raw_path) {
+            continue;
+        }
         let Ok(metadata) = std::fs::symlink_metadata(raw_path) else {
             // Likely a transient state (mv, atomic rename in flight).
             continue;
@@ -219,13 +237,13 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
             reindex_project_dir(wiki, ws, proj, proj_root).await;
             continue;
         }
-        if !ft.is_file() {
+        if !ft.is_file() || is_tempfile(raw_path) {
             continue;
         }
+        // Reported before the indexer's filters, which skip ledgers,
+        // pending and non-markdown files.
+        wiki.git().mark_written(raw_path);
         if !is_markdown(raw_path) {
-            continue;
-        }
-        if is_tempfile(raw_path) {
             continue;
         }
         let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
@@ -425,7 +443,7 @@ pub(crate) fn extract_project_ids(
 
     // Rejoin remaining segments as the page path.
     let page_rel: std::path::PathBuf = components.collect();
-    let page_str = page_rel.to_string_lossy().replace('\\', "/");
+    let page_str = crate::git::slash_path(&page_rel);
     if page_str.is_empty() {
         return None;
     }
@@ -539,11 +557,11 @@ fn is_reserved_page_file(abs: &Path, page_path: &PagePath) -> bool {
 
 fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
     let rel: &Path = abs.strip_prefix(root).ok()?;
-    let s = rel.to_string_lossy().replace('\\', "/");
-    PagePath::new(s).ok()
+    PagePath::new(crate::git::slash_path(rel)).ok()
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use ai_memory_store::Store;
@@ -729,6 +747,43 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "external.md");
+    }
+
+    /// The watcher reports what the next auto-commit must stage: removals,
+    /// and files the indexer skips; never the wiki's own git directory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_report_their_paths_for_the_next_commit() {
+        let (_tmp, _store, wiki, ws, proj) = setup().await;
+        let proj_dir = wiki.root().join(ws.to_string()).join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let ledger = proj_dir.join("events.jsonl");
+        std::fs::write(&ledger, "{}\n").unwrap();
+        let git_log = wiki.root().join(".git/logs/HEAD");
+        std::fs::create_dir_all(git_log.parent().unwrap()).unwrap();
+        std::fs::write(&git_log, "ref\n").unwrap();
+        let gone = proj_dir.join("gone.md");
+
+        for (kind, path) in [
+            (EventKind::Create(notify::event::CreateKind::File), &ledger),
+            (EventKind::Modify(notify::event::ModifyKind::Any), &git_log),
+            (EventKind::Remove(notify::event::RemoveKind::File), &gone),
+            (EventKind::Remove(notify::event::RemoveKind::File), &git_log),
+        ] {
+            let event = notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(kind).add_path(path.clone()),
+                std::time::Instant::now(),
+            );
+            handle_event(&wiki, event).await;
+        }
+
+        let reported = wiki.git().written_paths();
+        let rel = |p: &Path| p.strip_prefix(wiki.root()).unwrap().to_path_buf();
+        assert!(reported.contains(&rel(&ledger)), "{reported:?}");
+        assert!(reported.contains(&rel(&gone)), "{reported:?}");
+        assert!(
+            !reported.iter().any(|p| p.starts_with(".git")),
+            "{reported:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
