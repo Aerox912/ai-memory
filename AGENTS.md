@@ -462,7 +462,7 @@ Additional boundary rules:
 - **Auth ladder:** static root bearer token → DB-user tokens
   (attribution only, no admin) → OIDC device tokens at the hook edge.
   `/admin/*` becomes root-only the moment the first DB user exists.
-- **Dependency policy:** `cargo deny check --all-features` and
+- **Dependency policy:** `cargo deny --all-features check` and
   `cargo audit` run in CI; do not add dependencies without checking the
   project doesn't already have the capability, and match existing
   versions/idioms.
