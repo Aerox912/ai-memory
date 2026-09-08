@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
+  does not read `AGENTS.md`: a project whose canonical instruction file is
+  `AGENTS.md` needs a bare `@AGENTS.md` import line in `CLAUDE.md`, or the rules
+  written there are absent from context at session start and reach the agent only
+  if it opens the file. `docs/install.md` and `docs/usage.md` carry the same note
+  beside the `--target AGENTS.md` guidance, and this repository's own `CLAUDE.md`
+  now uses the import instead of a prose pointer (#680).
+
 ### Fixed
 - Wiki auto-commits stage what the wiki wrote instead of walking the
   whole tree, keep the repository open between commits, and no longer
