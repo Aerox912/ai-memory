@@ -46,7 +46,13 @@ case "${1:-}" in
       '{{.Id}}') printf 'running-container-id\n' ;;
       '{{.Config.Image}}') printf 'akitaonrails/ai-memory:latest\n' ;;
       *PortBindings*) printf '%s\n' '-p 127.0.0.1:49374:49374/tcp ' ;;
-      *Mounts*) printf '%s\n' '-v ai-memory-data:/data:Z ' ;;
+      *Mounts*)
+        if printf '%s\n' "${4:-}" | grep -q 'if \.Mode'; then
+          printf '%s\n' '-v ai-memory-data:/data:Z '
+        else
+          printf '%s\n' '-v ai-memory-data:/data '
+        fi
+        ;;
       *RestartPolicy*) printf '%s\n' '--restart unless-stopped' ;;
       '{{json .Config.Cmd}}') printf '[]\n' ;;
       *'.Config.Env'*)
@@ -105,6 +111,7 @@ fi
 # ---- multi-arch manifest version-check tests -----------------------------
 
 if command -v python3 >/dev/null 2>&1; then
+  H_INDEX="sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   H_ARM="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   H_AMD="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   H_OLD="sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -112,15 +119,44 @@ if command -v python3 >/dev/null 2>&1; then
   MULTI_ARCH_JSON="{\"manifests\":[{\"digest\":\"${H_ARM}\",\"platform\":{\"architecture\":\"arm64\"}},{\"digest\":\"${H_AMD}\",\"platform\":{\"architecture\":\"amd64\"}}]}"
 
   run_version_check_case() {
-    local name="$1" uname_m="$2" local_inspect="$3" remote_manifest="$4" expect_warn="$5"
+    local name="$1" engine_flavor="$2" uname_m="$3" repo_digests="$4" digest_field="$5" buildx_digest="$6" remote_manifest="$7" expect_warn="$8"
     local case_dir="${TMP_ROOT}/ver_${name}"
     mkdir -p "${case_dir}/cache"
     local fake_engine="${case_dir}/engine"
     cat >"${fake_engine}" <<ENGINE
 #!/usr/bin/env bash
 case "\${1:-}" in
+  buildx)
+    if [ -n "${buildx_digest}" ]; then
+      printf 'Name: %s\nDigest: %s\n' "\${4:-}" "${buildx_digest}"
+    else
+      printf 'Error: unrecognized command\n' >&2
+      exit 1
+    fi
+    ;;
   image)
-    printf '%b\n' '${local_inspect}'
+    fmt=""
+    for arg in "\$@"; do
+      case "\${arg}" in
+        --format=*) fmt="\${arg#--format=}" ;;
+      esac
+    done
+    case "\${fmt}" in
+      *'.Digest'*)
+        if [ "${engine_flavor}" = "docker" ]; then
+          printf 'template parsing error: map has no entry for key "Digest"\n' >&2
+          exit 1
+        else
+          printf '%b\n' "${digest_field}"
+        fi
+        ;;
+      *'.RepoDigests'*)
+        printf '%b\n' "${repo_digests}"
+        ;;
+      *)
+        printf '%b\n' "${repo_digests}"
+        ;;
+    esac
     ;;
   manifest)
     printf '%b\n' '${remote_manifest}'
@@ -186,10 +222,20 @@ else:
     fi
   }
 
-  run_version_check_case amd64_matching "x86_64" "sha256:index\n${H_AMD}" "${MULTI_ARCH_JSON}" 0
-  run_version_check_case amd64_outdated "x86_64" "sha256:index\n${H_OLD}" "${MULTI_ARCH_JSON}" 1
-  run_version_check_case arm64_matching "aarch64" "${H_ARM}" "${MULTI_ARCH_JSON}" 0
-  run_version_check_case arm64_outdated "aarch64" "${H_OLD}" "${MULTI_ARCH_JSON}" 1
+  # Podman cases: exposes .Digest and per-arch child digest in .RepoDigests
+  run_version_check_case podman_amd64_matching "podman" "x86_64" "${H_INDEX}\n${H_AMD}" "${H_AMD}" "" "${MULTI_ARCH_JSON}" 0
+  run_version_check_case podman_amd64_outdated "podman" "x86_64" "${H_INDEX}\n${H_OLD}" "${H_OLD}" "" "${MULTI_ARCH_JSON}" 1
+  run_version_check_case podman_arm64_matching "podman" "aarch64" "${H_INDEX}\n${H_ARM}" "${H_ARM}" "" "${MULTI_ARCH_JSON}" 0
+  run_version_check_case podman_arm64_outdated "podman" "aarch64" "${H_INDEX}\n${H_OLD}" "${H_OLD}" "" "${MULTI_ARCH_JSON}" 1
+
+  # Docker cases: .Digest fails; .RepoDigests has manifest-list digest; buildx gets remote list digest
+  run_version_check_case docker_amd64_matching "docker" "x86_64" "${H_INDEX}" "" "${H_INDEX}" "${MULTI_ARCH_JSON}" 0
+  run_version_check_case docker_amd64_outdated "docker" "x86_64" "${H_OLD}" "" "${H_INDEX}" "${MULTI_ARCH_JSON}" 1
+  run_version_check_case docker_arm64_matching "docker" "aarch64" "${H_INDEX}" "" "${H_INDEX}" "${MULTI_ARCH_JSON}" 0
+  run_version_check_case docker_arm64_outdated "docker" "aarch64" "${H_OLD}" "" "${H_INDEX}" "${MULTI_ARCH_JSON}" 1
+
+  # Classic Docker fallback: no buildx, only manifest-list locally; gated to avoid false positive
+  run_version_check_case docker_classic_gated  "docker" "x86_64" "${H_INDEX}" "" "" "${MULTI_ARCH_JSON}" 0
 fi
 
 printf 'wrapper upgrade ownership checks passed\n'
