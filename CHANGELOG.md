@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now uses the import instead of a prose pointer (#680).
 
 ### Fixed
+- The from-source AUR `PKGBUILD` now builds and tests on constrained AUR
+  builders. Release LTO was disabled (`options=('!debug' '!lto')`) so the
+  final link no longer gets OOM-killed on low-memory build hosts, and the
+  `check()` step pins `CARGO_HOME` to the registry `build()` already
+  populated before it repoints `HOME` at an empty test home, so the
+  `--frozen` test run can resolve the packages it fetched instead of
+  failing offline (#677).
 - CLI server errors now name the request. A non-2xx response from the
   configured server printed only `server returned 404 Not Found: <body>`,
   so a failure gave no clue which endpoint answered. The message now leads
