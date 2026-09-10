@@ -175,7 +175,17 @@ impl GitAdapter {
     /// Make the next path-scoped commit walk, as if the sweep were due.
     #[cfg(test)]
     pub(crate) fn age_last_walk(&self) {
-        self.written().last_walk = Instant::now().checked_sub(SWEEP_INTERVAL);
+        let now = Instant::now();
+        let mut written = self.written();
+        // A fresh Windows runner may have less than one interval of uptime.
+        // Keep a previous walk recorded even when its timestamp cannot be aged.
+        match now.checked_sub(SWEEP_INTERVAL) {
+            Some(aged) => written.last_walk = Some(aged),
+            None => {
+                written.last_walk = Some(now);
+                written.walk_needed = true;
+            }
+        }
     }
 
     /// What the sweeps found; see [`SweepSnapshot`].
