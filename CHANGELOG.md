@@ -12,8 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Integrated canonical snapshot `55fcce35d2bf3e52d933f83cb651b380fd67e81b`,
   preserving Aerox file-backed authentication and checksummed native releases.
-
-### Changed
 - The managed routing snippet now states that Claude Code loads `CLAUDE.md` and
   does not read `AGENTS.md`: a project whose canonical instruction file is
   `AGENTS.md` needs a bare `@AGENTS.md` import line in `CLAUDE.md`, or the rules
@@ -172,6 +170,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Integrate canonical AI Memory through `a5c3861412b20d7f15fb6b62987903ec5ffbedb9`
   (2.1.0 plus follow-ups), retaining Aerox file-backed secrets, launchers,
   and checksummed Windows x86_64 and Linux x86_64 release packaging.
+### Fixed
+- OKF-conformed event ledgers are skipped by the indexer again, so a migrated
+  store stops growing without bound. The reserved-file check treated any
+  `log.md` / `log-YYYY-MM.md` carrying YAML frontmatter as an ordinary page,
+  but the OKF v0.2 migration stamps frontmatter on every `.md` under `wiki/`,
+  ledgers included. A migrated store therefore indexed its ledgers, and each
+  hook `append_event` superseded them: one `pages` row per appended line,
+  holding the whole multi-megabyte ledger body. One affected store reached
+  6,539 page versions and 14 GB from 101 live pages within four days of
+  migrating. The check now reads past the frontmatter fence and classifies on
+  the first body line, so a real page that happens to be named `log.md` is
+  still indexed. (#660)
+- `install-hooks --apply --capture-mode allowlist` no longer captures
+  repositories with no `.ai-memory.toml` marker on the five generated
+  TypeScript integrations (`pi`, `omp`, `opencode`, `opencode2`,
+  `openclaw`). The native `ai-memory hook` path already gated every
+  lifecycle event on marker presence before spooling or sending anything
+  (`repository_admits_capture` in `ai-memory-hooks::capture_policy`), but
+  the generated adapters POST to `<server>/hook` directly and had only
+  ported the `ignore_paths` denylist logic into their shared
+  `capturePolicy` — never the allowlist admit gate — so an unmarked
+  repository was still fully captured while the CLI printed that the
+  protection was active. The shared template now bakes the selected
+  `--capture-mode` into a `CAPTURE_MODE` constant and gates on
+  marker *presence* (not on marker configuration state, so a marker with
+  an empty `[capture]` section still opts a repository in) before any
+  per-event disposition runs. The install-time "enforced"/"NOT in force"
+  messaging is corrected to match: a script-fallback install is now the
+  only path flagged as unenforced. (#661)
 
 ## [2.1.0] - 2026-09-06
 

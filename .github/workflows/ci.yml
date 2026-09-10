@@ -173,6 +173,7 @@ jobs:
           # needs history rather than a shallow clone.
           fetch-depth: 0
       - run: scripts/check-changelog-sections.sh
+      - run: python3 scripts/test_changelog_frozen.py
       - name: released sections stay frozen
         run: scripts/check-changelog-frozen.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
 

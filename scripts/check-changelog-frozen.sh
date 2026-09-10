@@ -45,7 +45,8 @@ git rev-parse --verify "$BASE_REF" >/dev/null 2>&1 || {
 # a rewrite), so only sections present in both are compared.
 
 released_half() {
-    git show "$1:CHANGELOG.md" 2>/dev/null | awk '/^## \[[0-9]/{f=1} f'
+    # Release-link definitions are mutable navigation, not frozen release notes.
+    git show "$1:CHANGELOG.md" 2>/dev/null | awk '/^## \[[0-9]/{f=1} f && !/^\[[^]]+\]:/'
 }
 
 BASE_RELEASED="$(released_half "$BASE_REF")"
