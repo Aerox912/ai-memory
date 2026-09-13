@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `install-hooks --agent cursor --apply` now warns about existing
+  `~/.cursor/hooks.json` entries that mention ai-memory but are not ai-memory
+  hook entries, such as a pre-2.1.0 shim that injected `cwd`. Those entries
+  are kept beside the native ones, so every event would otherwise be captured
+  twice without any sign (#721).
+
 ## [2.2.1] - 2026-09-12
 
 ### Fixed
