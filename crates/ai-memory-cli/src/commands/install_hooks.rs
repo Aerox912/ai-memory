@@ -105,6 +105,70 @@ pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// True when `~/.cursor/hooks.json` already registers a native ai-memory hook
+/// declared `--agent cursor`.
+///
+/// The Cursor CLI also runs the commands in Claude Code's settings, so on a
+/// host with both installs every Cursor event reaches `ai-memory hook` twice:
+/// once as `--agent cursor` and once as `--agent claude-code` carrying
+/// `cursor_version`. The hook uses this to drop the second copy (#721).
+/// Unreadable or malformed files count as "not installed" so the Claude Code
+/// path keeps capturing Cursor sessions on hosts without Cursor's own hooks.
+pub(crate) fn cursor_native_hooks_installed() -> bool {
+    cursor_hooks_path().is_ok_and(|path| cursor_native_hooks_installed_in(&path))
+}
+
+const MAX_CURSOR_HOOKS_BYTES: u64 = 1024 * 1024;
+
+pub(crate) fn cursor_native_hooks_installed_in(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut raw = String::new();
+    if file
+        .take(MAX_CURSOR_HOOKS_BYTES)
+        .read_to_string(&mut raw)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .any(|entry| is_ai_memory_hook_entry(entry) && declares_cursor_agent(entry))
+        })
+}
+
+fn declares_cursor_agent(entry: &serde_json::Value) -> bool {
+    if let Some(args) = entry.get("args").and_then(serde_json::Value::as_array) {
+        return args
+            .windows(2)
+            .any(|pair| pair[0] == "--agent" && pair[1] == "cursor");
+    }
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| {
+            let tokens: Vec<&str> = command
+                .split_whitespace()
+                .map(|t| t.trim_matches(['"', '\'']))
+                .collect();
+            tokens
+                .windows(2)
+                .any(|pair| pair[0] == "--agent" && pair[1] == "cursor")
+                || tokens.contains(&"--agent=cursor")
+                || command.contains("agent=cursor")
+        })
+}
+
 /// `~/.gemini/settings.json`.
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -8963,6 +9027,50 @@ model = "gpt-5"
         assert_eq!(
             parsed["version"], 1,
             "version: 1 must be set at the top level"
+        );
+    }
+
+    #[test]
+    fn cursor_native_hooks_detection_requires_an_ai_memory_cursor_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.json");
+        assert!(!cursor_native_hooks_installed_in(&path), "missing file");
+
+        fs::write(&path, "not json").unwrap();
+        assert!(!cursor_native_hooks_installed_in(&path), "malformed file");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"sessionStart":[
+                {"command":"/opt/third-party","args":["--agent","cursor"]},
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            !cursor_native_hooks_installed_in(&path),
+            "third-party or non-cursor entries do not count"
+        );
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","stop","--agent","cursor","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(cursor_native_hooks_installed_in(&path), "exec form");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory hook --event stop --agent cursor --server-url http://h"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            cursor_native_hooks_installed_in(&path),
+            "command-string form"
         );
     }
 
