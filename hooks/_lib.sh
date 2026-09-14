@@ -516,12 +516,32 @@ ai_memory_get_handoff() {
 # handoff in hookSpecificOutput.additionalContext).
 ai_memory_json_string() {
     awk '
-        BEGIN { printf "\"" }
+        # BusyBox awk applies backslash processing to a gsub REPLACEMENT
+        # string; gawk, mawk and one-true-awk pass it through literally. Every
+        # replacement below carries a backslash, so on BusyBox all four escapes
+        # were silently no-ops (#733): a backslash stayed bare, a quote stayed
+        # bare, and -- not in the report, but the same root cause -- \t and \r
+        # collapsed to the letters "t" and "r", corrupting content rather than
+        # only breaking the framing.
+        #
+        # Detect the behaviour once instead of guessing at it, and pre-double
+        # the replacements where they will be halved. Done with gsub rather
+        # than a split/concat loop on purpose: concatenating per occurrence is
+        # quadratic in the value length, which is the cost #727 was about.
+        BEGIN {
+            probe = "X"; gsub(/X/, "\\\\", probe)
+            if (length(probe) == 1) {
+                BS = "\\\\\\\\"; QT = "\\\\\""; TB = "\\\\t"; CR = "\\\\r"
+            } else {
+                BS = "\\\\"; QT = "\\\""; TB = "\\t"; CR = "\\r"
+            }
+            printf "\""
+        }
         {
-            gsub(/\\/, "\\\\")
-            gsub(/"/, "\\\"")
-            gsub(/\t/, "\\t")
-            gsub(/\r/, "\\r")
+            gsub(/\\/, BS)
+            gsub(/"/, QT)
+            gsub(/\t/, TB)
+            gsub(/\r/, CR)
             printf "%s%s", sep, $0
             sep = "\\n"
         }
