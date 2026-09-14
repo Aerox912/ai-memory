@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Updated `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),
+  in which a TLS 1.3 handshake message that follows a key-changing message in
+  the same record can be accepted at the wrong encryption level. `rustls` is a
+  direct dependency — it installs the process-wide crypto provider the MCP
+  bridge needs for HTTPS — and is also the TLS implementation every outbound
+  HTTPS call resolves to through reqwest, so the advisory failed `cargo audit`
+  and `cargo deny check` on every open pull request that inherited `main`'s
+  lockfile, including ones that change no Rust at all. `Cargo.toml` already
+  allows compatible 0.23 patch releases, so this is a lockfile-only change
+  needing no manifest or public-surface edit; the same resolution moves
+  `rustls-webpki` 0.103.13 → 0.103.15 and nothing else (#731).
+
 ## [2.2.1] - 2026-09-12
 
 ### Fixed
