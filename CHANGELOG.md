@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The POSIX shell hook bundle's spool reader no longer costs time quadratic in
+  the entry size. `ai_memory_json_field` rebuilt the decoded value one character
+  at a time, so reading a multi-megabyte entry — one large tool result is enough
+  — took minutes of CPU, and a drain pass reads every entry three times (`url`,
+  `body`, `token`) while one detached pass starts behind every delivery that
+  succeeds. Once an outage had filled the spool, the passes accumulated faster
+  than they retired and saturated the machine. The value is now bounded by a
+  single regex pass over the JSON string grammar and unescaped with `gsub` over
+  whole segments, for identical output and exit codes: a 2.2 MB entry goes from
+  529 s to 0.29 s, and a 400 KB entry from 15.0 s to 0.07 s (#727).
+
 ## [2.2.1] - 2026-09-12
 
 ### Fixed
