@@ -153,7 +153,7 @@ fn store_session_id(data_dir: &Path, agent: AgentKind, session_id: &str) {
     let _ = fs::write(path, session_id);
 }
 
-fn clear_session_id(data_dir: &Path, agent: AgentKind) {
+pub(crate) fn clear_session_id(data_dir: &Path, agent: AgentKind) {
     let _ = fs::remove_file(session_id_state_path(data_dir, agent));
 }
 
@@ -250,6 +250,17 @@ fn payload_has_session_id(raw: &serde_json::Value) -> bool {
     })
 }
 
+/// Agents whose hook payloads do not reliably carry a session id. Devin's
+/// payloads may omit it; ZCode's do too (and ZCode fires `Stop` per turn with
+/// no SessionEnd, so without a persisted id each turn would fragment into a
+/// fresh server-side session). For these agents the hook maintains a
+/// `<data_dir>/hook-state/<agent>-session-id` file so a whole agent session
+/// shares one stable id. Agents whose payloads always carry an id never touch
+/// this path.
+fn agent_needs_session_id_state(agent_kind: AgentKind) -> bool {
+    matches!(agent_kind, AgentKind::Devin | AgentKind::Zcode)
+}
+
 fn session_id_query_suffix(
     data_dir: &Path,
     agent: &str,
@@ -257,7 +268,7 @@ fn session_id_query_suffix(
     raw: &serde_json::Value,
 ) -> String {
     let agent_kind = AgentKind::from_wire(agent);
-    if agent_kind != AgentKind::Devin || payload_has_session_id(raw) {
+    if !agent_needs_session_id_state(agent_kind) || payload_has_session_id(raw) {
         return String::new();
     }
 
@@ -651,6 +662,9 @@ where
             "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
         );
     }
+    // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
+    // per turn, so its stored id is cleared by `finalize-session` (or
+    // overwritten by the next session-start), never by a hook event.
     if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
         clear_session_id(&dd, AgentKind::Devin);
     }
@@ -1548,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn session_id_query_suffix_is_devin_only() {
+    fn session_id_query_suffix_is_opt_in_per_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
@@ -1556,6 +1570,60 @@ mod tests {
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::ClaudeCode).is_none());
+    }
+
+    #[test]
+    fn zcode_query_session_id_is_stable_across_turns_without_native_id() {
+        // ZCode fires Stop at the end of every turn and has no SessionEnd; the
+        // stored id must survive Stop so one agent session maps to one
+        // server-side session.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let bare = serde_json::json!({"hook_event_name": "SessionStart"});
+
+        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare);
+        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
+        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare);
+
+        assert!(first.starts_with("&session_id="), "{first}");
+        assert_eq!(after_stop, first);
+        assert_eq!(next_turn, first);
+        assert_eq!(
+            stored_session_id(data_dir, AgentKind::Zcode).as_deref(),
+            first.strip_prefix("&session_id=")
+        );
+    }
+
+    #[test]
+    fn zcode_query_session_id_does_not_override_native_payload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_session = serde_json::json!({
+            "session_id": "zcode-native-session",
+            "hook_event_name": "PostToolUse"
+        });
+
+        let suffix = session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session);
+
+        assert!(suffix.is_empty());
+        assert!(stored_session_id(tmp.path(), AgentKind::Zcode).is_none());
+    }
+
+    #[test]
+    fn zcode_stop_event_does_not_clear_stored_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        store_session_id(data_dir, AgentKind::Zcode, "stable-zcode-session");
+
+        // The only hook-side clearing is Devin's session-end; ZCode's stored
+        // id is cleared by `finalize-session` (or overwritten by the next
+        // session-start), never by Stop.
+        let bare = serde_json::json!({"hook_event_name": "Stop"});
+        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
+
+        assert_eq!(
+            stored_session_id(data_dir, AgentKind::Zcode).as_deref(),
+            Some("stable-zcode-session")
+        );
     }
 
     #[test]
