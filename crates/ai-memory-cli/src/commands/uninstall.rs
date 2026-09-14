@@ -1159,16 +1159,14 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
 /// for clients whose installer appends a schema flavor, the form
 /// `install-mcp` actually writes (`--mcp-url` keeps the unflavored default).
 /// Every other client keeps exact-match semantics.
-fn mcp_url_candidates(client: McpClient, url: &str) -> Vec<String> {
+fn mcp_url_candidates(_client: McpClient, url: &str) -> Vec<String> {
     let mut candidates = vec![url.to_string()];
-    if matches!(client, McpClient::KimiCode) {
-        let flavored = install_mcp::moonshot_flavored_mcp_url(url);
-        if !candidates.contains(&flavored) {
-            candidates.push(flavored);
-        }
-    }
-    if matches!(client, McpClient::KiroCli) {
-        let flavored = install_mcp::bedrock_flavored_mcp_url(url);
+    // Every marker, for every client: `install-mcp --flavor` can write any of
+    // them into any client's config, so keying this off the client's built-in
+    // default would strand the entries an operator pinned by hand. Candidates
+    // that do not appear in the file simply match nothing.
+    for marker in install_mcp::FLAVOR_MARKERS {
+        let flavored = install_mcp::flavored_mcp_url_for_marker(url, marker);
         if !candidates.contains(&flavored) {
             candidates.push(flavored);
         }
@@ -2204,31 +2202,48 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
     }
 
     #[test]
-    fn mcp_url_candidates_adds_client_schema_flavors() {
+    fn mcp_url_candidates_covers_every_installable_flavor() {
+        // Was keyed off the client's built-in default. `install-mcp --flavor`
+        // can now write any marker into any client's config, so candidates are
+        // keyed off what the installer can write instead — otherwise an entry
+        // an operator pinned by hand survives `uninstall`.
         assert_eq!(
             mcp_url_candidates(McpClient::KimiCode, "http://127.0.0.1:49374/mcp"),
             vec![
                 "http://127.0.0.1:49374/mcp".to_string(),
-                "http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()
+                "http://127.0.0.1:49374/mcp?flavor=moonshot".to_string(),
+                "http://127.0.0.1:49374/mcp?flavor=bedrock".to_string(),
+                "http://127.0.0.1:49374/mcp?flavor=gemini".to_string(),
             ]
+        );
+        // An already-flavored URL is not duplicated into the list.
+        assert_eq!(
+            mcp_url_candidates(
+                McpClient::KimiCode,
+                "http://127.0.0.1:49374/mcp?flavor=moonshot"
+            )[0],
+            "http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()
         );
         assert_eq!(
             mcp_url_candidates(
                 McpClient::KimiCode,
                 "http://127.0.0.1:49374/mcp?flavor=moonshot"
-            ),
-            vec!["http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()]
+            )
+            .iter()
+            .filter(|c| c.ends_with("flavor=moonshot"))
+            .count(),
+            1
         );
-        assert_eq!(
-            mcp_url_candidates(McpClient::KiroCli, "https://memory.example/mcp"),
-            vec![
-                "https://memory.example/mcp".to_string(),
-                "https://memory.example/mcp?flavor=bedrock".to_string()
-            ]
+        // The case the broadening exists for: Command Code has no default
+        // flavor, but an operator on a Vertex-backed model pins one.
+        assert!(
+            mcp_url_candidates(McpClient::CommandCode, "https://memory.example/mcp")
+                .contains(&"https://memory.example/mcp?flavor=gemini".to_string())
         );
-        assert_eq!(
-            mcp_url_candidates(McpClient::Cursor, "http://127.0.0.1:49374/mcp"),
-            vec!["http://127.0.0.1:49374/mcp".to_string()]
+        // Kiro's own default is still matched.
+        assert!(
+            mcp_url_candidates(McpClient::KiroCli, "https://memory.example/mcp")
+                .contains(&"https://memory.example/mcp?flavor=bedrock".to_string())
         );
     }
 
