@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `DATA_HANDLING.md`, `docs/sso.md`, and `docs/airgapped-install.md`,
+  consolidating existing data-flow, OIDC, and offline-install facts from
+  `SECURITY.md`/`docs/install.md`/`docs/local-embeddings.md` into the shape
+  enterprise security/legal review typically asks for before approving a dev
+  tool. No behavior change; a small addendum to `SECURITY.md`'s reporting
+  section adds a fallback contact path for reporters who can't use GitHub's
+  private-advisory flow.
+
 ### Fixed
 - `install-hooks --apply` no longer aborts the entire install when the hook
   bearer token cannot be persisted under the data dir. This bit the docker
