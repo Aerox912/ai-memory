@@ -727,10 +727,10 @@ Copilot chat endpoint.
 
 **Embedder env** (opt-in):
 ```
-AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini | openai-compat
+AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini | openai-compat | copilot
 AI_MEMORY_EMBEDDING_MODEL      e.g. text-embedding-3-small, gemini-embedding-001
 AI_MEMORY_EMBEDDING_BASE_URL   optional override; required for openai-compat
-AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google);
+AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI, Copilot), 1024 (Voyage), 768 (Google);
                                required explicitly for openai-compat
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 LLM_API_KEY                    accepted for openai with a custom base URL and as
@@ -752,6 +752,16 @@ when a custom embedding base URL is set, exactly as before. `voyage` and
 no safe shared model or dimensionality default. It sends no authorization header
 when both `EMBEDDING_API_KEY` and `LLM_API_KEY` are absent and stores vectors
 under the distinct `provider="openai-compat"` identity.
+
+`copilot` takes no API key at all: it resolves the same `CopilotAuth` as the
+`copilot` LLM provider (`auth login copilot`, `COPILOT_GITHUB_TOKEN`, or
+`GITHUB_COPILOT_API_TOKEN`) and shares its GitHub-token -> short-lived
+Copilot-API-token exchange (`CopilotAuthState` in `ai-memory-llm::copilot`) —
+no separate exchange path. It defaults to `text-embedding-3-small` / dim 1536
+and calls Copilot's `/embeddings` endpoint with the same `vscode-chat`
+integration headers as chat. That endpoint's wire shape follows the
+OpenAI-compatible contract Copilot documents for chat, not a published
+embeddings spec, and is not covered by a live test against Copilot here.
 
 ## Future work
 

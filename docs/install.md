@@ -1599,6 +1599,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=copilot` | `text-embedding-3-small` (1536-dim) | Reuses the `copilot` LLM provider's OAuth login (`ai-memory auth login copilot`, `COPILOT_GITHUB_TOKEN`, or `GITHUB_COPILOT_API_TOKEN`) — no separate API key. Calls Copilot's `/embeddings` endpoint following the OpenAI-compatible contract Copilot documents for chat; that endpoint's exact shape is not covered by a live test against Copilot here, so treat it as needing a real-Copilot smoke test. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on

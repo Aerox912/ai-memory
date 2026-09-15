@@ -16,10 +16,14 @@ use tracing::{debug, info};
 
 use crate::auth::CopilotAuth;
 use crate::auth_file::{load_entry, now_ms, save_entry};
+use crate::embedding::{
+    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values,
+};
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
+use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::text::truncate_for_embedding;
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Usage};
 
 /// GitHub Copilot's public OAuth client id used by Copilot clients.
@@ -179,23 +183,20 @@ impl CopilotToken {
     }
 }
 
-/// Copilot provider backed by Copilot chat completions.
-pub struct CopilotProvider {
+/// Shared Copilot token-resolution state: the GitHub->Copilot token exchange,
+/// cache, and persistence used by every Copilot-backed client (chat
+/// completions, embeddings). Factored out so both clients call the exact
+/// same `exchange_copilot_token` / `resolve_copilot_api_base_url` path
+/// instead of duplicating the auth chain.
+struct CopilotAuthState {
     client: reqwest::Client,
-    model: String,
     auth: CopilotAuth,
     stored: Mutex<CopilotToken>,
     timeout: Duration,
-    extra_headers: ExtraHeaders,
 }
 
-impl CopilotProvider {
-    /// Build a provider from resolved Copilot auth inputs.
-    ///
-    /// # Errors
-    /// Returns [`LlmError::NotConfigured`] when no GitHub/direct token is
-    /// available.
-    pub fn new(auth: CopilotAuth, model: impl Into<String>) -> LlmResult<Self> {
+impl CopilotAuthState {
+    fn new(auth: CopilotAuth) -> LlmResult<Self> {
         let stored = CopilotToken::load(&auth.token_file)?.unwrap_or_default();
         if auth.direct_api_token.is_none()
             && auth.github_token.is_none()
@@ -213,30 +214,10 @@ impl CopilotProvider {
             .map_err(LlmError::from)?;
         Ok(Self {
             client,
-            model: model.into(),
             auth,
             stored: Mutex::new(stored),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
-            extra_headers: ExtraHeaders::default(),
         })
-    }
-
-    /// Override the per-request timeout (default
-    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]). Also bounds the
-    /// GitHub token-exchange request.
-    #[must_use]
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout = Duration::from_secs(secs);
-        self
-    }
-
-    /// Attach operator-configured headers to every chat request. The factory
-    /// calls this with `ProviderConfig::extra_headers`. Replaces the client's
-    /// default `user-agent` when the operator configures one.
-    #[must_use]
-    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
-        self.extra_headers = headers;
-        self
     }
 
     async fn current_token(&self) -> LlmResult<CopilotApiToken> {
@@ -290,15 +271,56 @@ impl CopilotProvider {
                 .unwrap_or_else(|| DEFAULT_COPILOT_API_BASE_URL.into()),
         })
     }
+}
+
+/// Copilot provider backed by Copilot chat completions.
+pub struct CopilotProvider {
+    model: String,
+    state: CopilotAuthState,
+    extra_headers: ExtraHeaders,
+}
+
+impl CopilotProvider {
+    /// Build a provider from resolved Copilot auth inputs.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] when no GitHub/direct token is
+    /// available.
+    pub fn new(auth: CopilotAuth, model: impl Into<String>) -> LlmResult<Self> {
+        Ok(Self {
+            model: model.into(),
+            state: CopilotAuthState::new(auth)?,
+            extra_headers: ExtraHeaders::default(),
+        })
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]). Also bounds the
+    /// GitHub token-exchange request.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.state.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`. Replaces the client's
+    /// default `user-agent` when the operator configures one.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
+        self
+    }
 
     async fn post(&self, body: &CopilotChatRequest<'_>) -> LlmResult<CopilotChatResponse> {
-        let token = self.current_token().await?;
+        let token = self.state.current_token().await?;
         let url = format!("{}/chat/completions", token.base_url.trim_end_matches('/'));
         debug!(url = %url, "POST copilot chat completions");
         let request = self.extra_headers.apply(
-            self.client
+            self.state
+                .client
                 .post(&url)
-                .timeout(self.timeout)
+                .timeout(self.state.timeout)
                 .bearer_auth(token.access.expose_secret())
                 .headers(copilot_runtime_headers()),
         );
@@ -366,6 +388,131 @@ struct CopilotApiToken {
     access: SecretString,
     expires_at_ms: u64,
     base_url: String,
+}
+
+/// Default embedding model requested from Copilot's `/embeddings` endpoint.
+pub const COPILOT_DEFAULT_EMBED_MODEL: &str = "text-embedding-3-small";
+
+/// Default vector dimensionality for [`COPILOT_DEFAULT_EMBED_MODEL`].
+pub const COPILOT_DEFAULT_EMBED_DIM: u32 = 1536;
+
+#[derive(Debug, Serialize)]
+struct CopilotEmbeddingRequest<'a> {
+    input: &'a str,
+    model: &'a str,
+}
+
+/// GitHub Copilot embedder.
+///
+/// **Caveat:** the Copilot `/embeddings` endpoint path and wire shape are
+/// taken from the OpenAI-compatible contract Copilot documents for chat and
+/// from prior art in other Copilot clients (openclaw#61717), not from a live
+/// test against Copilot here — GitHub does not publish a dedicated
+/// embeddings spec. Default model [`COPILOT_DEFAULT_EMBED_MODEL`]
+/// (`text-embedding-3-small`) and dim [`COPILOT_DEFAULT_EMBED_DIM`] (1536)
+/// follow the same prior art. Reuses the identical GitHub-token ->
+/// short-lived Copilot API token exchange as [`CopilotProvider`] via
+/// [`CopilotAuthState`] — no separate exchange path.
+pub struct CopilotEmbedder {
+    state: CopilotAuthState,
+    model: String,
+    dim: u32,
+}
+
+impl CopilotEmbedder {
+    /// Build an embedder from resolved Copilot auth inputs.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] when no GitHub/direct token is
+    /// available.
+    pub fn new(auth: CopilotAuth, model: impl Into<String>, dim: u32) -> LlmResult<Self> {
+        Ok(Self {
+            state: CopilotAuthState::new(auth)?,
+            model: model.into(),
+            dim,
+        })
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]).
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.state.timeout = Duration::from_secs(secs);
+        self
+    }
+}
+
+#[async_trait]
+impl Embedder for CopilotEmbedder {
+    fn provider(&self) -> &'static str {
+        "copilot"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
+        let token = self.state.current_token().await?;
+        let input = truncate_for_embedding(text, OPENAI_EMBED_MAX_TOKENS);
+        let url = format!("{}/embeddings", token.base_url.trim_end_matches('/'));
+        debug!(url = %url, model = %self.model, "POST copilot embeddings");
+        let req = CopilotEmbeddingRequest {
+            input: &input,
+            model: &self.model,
+        };
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .state
+                .client
+                .post(&url)
+                .timeout(self.state.timeout)
+                .bearer_auth(token.access.expose_secret())
+                .headers(copilot_runtime_headers())
+                .json(&req)
+                .send()
+                .await
+                .map_err(LlmError::from)?;
+            let status = resp.status();
+            if status.as_u16() == 429 && attempt < 5 {
+                attempt += 1;
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+                debug!(attempt, ?delay, "copilot embeddings rate-limited; retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            // Client errors (e.g. input too long) are not retried.
+            if status.as_u16() == 400 {
+                let body = provider_error_body(resp).await;
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            if !status.is_success() {
+                let body = provider_error_body(resp).await;
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            let body = response_text_limited(resp).await?;
+            let values = parse_openai_embedding_values(&body, status.as_u16())?;
+            if values.len() as u32 != self.dim {
+                return Err(LlmError::UnexpectedShape(format!(
+                    "expected dim {}, got {}",
+                    self.dim,
+                    values.len()
+                )));
+            }
+            return Ok(normalise(values));
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -1471,10 +1471,11 @@ impl Config {
             "google" | "gemini" => EmbedderChoice::Google,
             "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
             "local" => EmbedderChoice::Local,
+            "copilot" => EmbedderChoice::Copilot,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
-                     openai|voyage|google|gemini|openai-compat|local|none"
+                     openai|voyage|google|gemini|openai-compat|local|copilot|none"
                 )));
             }
         };
@@ -1492,6 +1493,7 @@ impl Config {
                     ));
                 }
                 EmbedderChoice::Local => ai_memory_llm::LOCAL_MODEL.to_string(),
+                EmbedderChoice::Copilot => ai_memory_llm::COPILOT_DEFAULT_EMBED_MODEL.to_string(),
             },
         };
         let dim = match self.embedding_dim {
@@ -1532,6 +1534,8 @@ impl Config {
                 .unwrap_or_else(|| SecretString::from(String::new())),
             // In-process: no key, ever.
             EmbedderChoice::Local => SecretString::from(String::new()),
+            // OAuth-backed: no API key, ever; see `copilot_auth` below.
+            EmbedderChoice::Copilot => SecretString::from(String::new()),
         };
         let base_url = self.embedding_base_url.clone();
         if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
@@ -1539,6 +1543,17 @@ impl Config {
                 "AI_MEMORY_EMBEDDING_BASE_URL required for openai-compat embeddings".into(),
             ));
         }
+        // Resolve Copilot auth only when the embedding provider is actually
+        // copilot (invariant 14: auth resolves before construction). Mirrors
+        // exactly how the chat-provider path builds `ProviderAuth::copilot`.
+        let copilot_auth = if provider == EmbedderChoice::Copilot {
+            Some(
+                self.provider_auth(ProviderChoice::Copilot, None)
+                    .require_copilot_auth()?,
+            )
+        } else {
+            None
+        };
         Ok(Some(EmbedderConfig {
             provider,
             model,
@@ -1546,6 +1561,7 @@ impl Config {
             api_key,
             base_url,
             models_dir: Some(self.data_dir.join("models")),
+            copilot_auth,
             defaulted,
         }))
     }
@@ -2716,6 +2732,68 @@ mod tests {
             missing_base.embedder_config().unwrap_err(),
             LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_BASE_URL")
         ));
+    }
+
+    #[test]
+    fn copilot_embedding_defaults_model_dim_and_reuses_copilot_auth() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            embedding_provider: Some("copilot".into()),
+            runtime_env: RuntimeEnv {
+                copilot_github_token: Some(SecretString::from("ghu-test")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.provider, EmbedderChoice::Copilot);
+        assert_eq!(embedder.model, "text-embedding-3-small");
+        assert_eq!(embedder.dim, 1536);
+        assert!(embedder.api_key.expose_secret().is_empty());
+        let auth = embedder
+            .copilot_auth
+            .expect("copilot embedder config carries resolved Copilot auth");
+        assert_eq!(auth.token_file, tmp.path().join("auth.json"));
+        assert_eq!(auth.github_token.unwrap().expose_secret(), "ghu-test");
+    }
+
+    #[test]
+    fn copilot_embedding_without_credentials_still_resolves_auth_material() {
+        // `embedder_config` only resolves auth *inputs*, mirroring the chat
+        // provider path (`copilot_provider_uses_data_dir_token_file_and_env_token`);
+        // whether a usable credential exists is checked at construction time
+        // by `CopilotEmbedder::new` (`ai-memory-llm`), not here.
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            embedding_provider: Some("copilot".into()),
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        let auth = embedder.copilot_auth.expect("copilot auth is resolved");
+        assert!(auth.github_token.is_none());
+        assert!(auth.direct_api_token.is_none());
+    }
+
+    #[test]
+    fn non_copilot_embedding_leaves_copilot_auth_unresolved() {
+        // Auth resolution must be gated on the embedding provider actually
+        // being copilot — resolving it unconditionally would fail closed for
+        // every operator who has not logged into Copilot at all.
+        let cfg = Config {
+            embedding_provider: Some("openai".into()),
+            runtime_env: RuntimeEnv {
+                openai_api_key: Some(SecretString::from("sk-embed-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert!(embedder.copilot_auth.is_none());
     }
 
     #[test]

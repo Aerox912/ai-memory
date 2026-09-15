@@ -38,6 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-client default. `vertex` is accepted as an alias. `uninstall` now matches
   every marker on every client, so an entry pinned this way is still removed
   (#735).
+- `AI_MEMORY_EMBEDDING_PROVIDER=copilot` adds GitHub Copilot as an embedding
+  provider, reusing the `copilot` LLM provider's OAuth login and GitHub-token
+  exchange (no separate API key). Defaults to `text-embedding-3-small`,
+  1536-dim; calls Copilot's `/embeddings` endpoint following the
+  OpenAI-compatible contract Copilot documents for chat (#739).
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),

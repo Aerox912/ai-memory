@@ -160,10 +160,10 @@ hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 
 Embeddings are optional and separate from the LLM provider. Set
-`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
-`openai-compat` when you want vector retrieval in addition to FTS5 + entity +
-graph-neighbor retrieval. `openai-compat` targets self-hosted engines
-(Ollama, LM Studio, vLLM): it needs no API key and requires explicit
+`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`,
+`openai-compat`, or `copilot` when you want vector retrieval in addition to
+FTS5 + entity + graph-neighbor retrieval. `openai-compat` targets self-hosted
+engines (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
 `AI_MEMORY_EMBEDDING_DIM`. The optional `EMBEDDING_API_KEY` credentials the
 embedder alone and is checked before `OPENAI_API_KEY` and `LLM_API_KEY`, so
@@ -171,6 +171,15 @@ embeddings can run on a different provider than the LLM. Both the FTS-only and
 hybrid paths apply the same bounded page-authority adjustment after candidate
 generation; embeddings improve relevance recall but do not decide which source
 is canonical.
+
+`AI_MEMORY_EMBEDDING_PROVIDER=copilot` reuses the same Copilot OAuth login as
+the `copilot` LLM provider (`ai-memory auth login copilot` or
+`COPILOT_GITHUB_TOKEN`/`GITHUB_COPILOT_API_TOKEN`) — no separate API key.
+It defaults to model `text-embedding-3-small`, dim 1536, and calls Copilot's
+`/embeddings` endpoint following the same OpenAI-compatible contract Copilot
+documents for chat. That endpoint's exact shape is not covered by a live
+test against Copilot here; treat it as needing a real-Copilot smoke test
+before relying on it in production.
 
 `AI_MEMORY_EMBEDDING_PROVIDER=local` needs no key and no server at all:
 sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
