@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1536-dim; calls Copilot's `/embeddings` endpoint following the
   OpenAI-compatible contract Copilot documents for chat (#739).
 
+## [2.2.2] - 2026-09-15
+
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),
   in which a TLS 1.3 handshake message that follows a key-changing message in
@@ -130,7 +132,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resuming session started with no context. The escaping is linear and reuses
   the same BusyBox replacement-doubling probe as the four existing escapes
   (#732).
-||||||| 74d2d31e
 
 ## [2.2.1] - 2026-09-12
 
@@ -5738,7 +5739,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.2...HEAD
+[2.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.2
 [2.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.1
 [2.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.0
 [2.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.1.2
