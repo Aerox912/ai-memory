@@ -6220,6 +6220,10 @@ mod tests {
             .as_str()
             .and_then(|reference| reference.strip_prefix("#/$defs/"))
             .map_or(signal, |name| &schema["$defs"][name]);
+        assert_eq!(
+            signal_schema["type"], "string",
+            "signal schema must have top-level type: string to satisfy moonshot flavored json schema"
+        );
         for expected in ["helpful", "not_helpful", "stale", "wrong"] {
             let in_enum = signal_schema["enum"]
                 .as_array()
