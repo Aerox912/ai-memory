@@ -427,6 +427,21 @@ fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_jso
     true
 }
 
+/// A `--agent claude-code` hook invoked by Cursor (it runs Claude Code's
+/// settings too) is a duplicate when Cursor's own ai-memory hooks are also
+/// installed: the native `--agent cursor` hook already delivers the same
+/// event. Dropping it keeps one observation per Cursor event (#721). The
+/// installed check runs last so ordinary Claude Code events never touch disk.
+fn is_redundant_cursor_copy(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    cursor_hooks_installed: impl FnOnce() -> bool,
+) -> bool {
+    agent == AgentKind::ClaudeCode
+        && ai_memory_hooks::agent_from_payload(raw) == Some(AgentKind::Cursor)
+        && cursor_hooks_installed()
+}
+
 fn write_success_response<W: std::io::Write>(
     stdout: &mut W,
     agent: AgentKind,
@@ -507,7 +522,13 @@ where
     // fires before every model call; invocation zero is the only startup
     // boundary. Fail closed when the documented counter is absent so a later
     // invocation can never consume a handoff intended for the next session.
-    if !should_process_hook_event(agent_kind, hook_event, &json) {
+    if !should_process_hook_event(agent_kind, hook_event, &json)
+        || is_redundant_cursor_copy(
+            agent_kind,
+            &json,
+            super::install_hooks::cursor_native_hooks_installed,
+        )
+    {
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
     }
@@ -1225,6 +1246,38 @@ mod tests {
             events[2]["payload"]["tool_input"]["path"],
             "/workspace/project/sample.txt"
         );
+    }
+
+    #[test]
+    fn cursor_copy_via_claude_code_hooks_is_dropped_only_when_cursor_hooks_exist() {
+        let cursor = serde_json::json!({
+            "cursor_version": "2026.09.02-c22c1a3",
+            "conversation_id": "c1",
+        });
+        let claude = serde_json::json!({"session_id": "s1"});
+        assert!(is_redundant_cursor_copy(
+            AgentKind::ClaudeCode,
+            &cursor,
+            || true
+        ));
+        // Without Cursor's own hooks the Claude Code path is the only capture.
+        assert!(!is_redundant_cursor_copy(
+            AgentKind::ClaudeCode,
+            &cursor,
+            || false
+        ));
+        // The native Cursor hook itself is never dropped.
+        assert!(!is_redundant_cursor_copy(
+            AgentKind::Cursor,
+            &cursor,
+            || true
+        ));
+        // A real Claude Code payload never consults the filesystem.
+        assert!(!is_redundant_cursor_copy(
+            AgentKind::ClaudeCode,
+            &claude,
+            || { panic!("must not check Cursor hooks for a Claude Code payload") }
+        ));
     }
 
     #[tokio::test]

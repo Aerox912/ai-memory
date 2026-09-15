@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),
   in which a TLS 1.3 handshake message that follows a key-changing message in
@@ -38,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   top-level `type: "string"`, so strict function-calling gateways (Moonshot/Kimi
   and other schema validators) accept the `tools/list` surface instead of
   rejecting the enum for a missing type (#735, #741).
+- Cursor lifecycle events are no longer stored twice on a host where both
+  `install-hooks --agent cursor` and `install-hooks --agent claude-code` are
+  applied. Cursor also runs the commands in Claude Code's settings, and since
+  2.1.0 that copy is re-attributed to `cursor` by its `cursor_version`, so it
+  landed in the same session as the native event. The `--agent claude-code`
+  hook now drops a Cursor-marked payload when `~/.cursor/hooks.json` already
+  registers an ai-memory `--agent cursor` hook; without Cursor's own hooks the
+  Claude Code path keeps capturing Cursor sessions as before (#721).
 
 ## [2.2.1] - 2026-09-12
 
