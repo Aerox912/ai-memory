@@ -345,7 +345,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md) | Proposed opt-in fallback-chain design for transient LLM-provider failures; not yet a supported configuration surface. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
-| Research docs under `docs/` | Karpathy LLM Wiki notes, Hermes Agent, agentmemory / basic-memory / cognee deep-dives, lessons-learned from upstream issues. |
+| Research docs under `docs/` | Karpathy LLM Wiki notes, Hermes Agent, agentmemory / basic-memory / cognee / hindsight deep-dives, the 2026 landscape survey (Zep/Graphiti, Letta, Mem0, mcp-memory-service, OpenViking, …), and lessons-learned from upstream issues. |
 - [`docs/support-matrix.md`](docs/support-matrix.md) - the full agent/platform matrix with notes.
 - [`docs/use-cases.md`](docs/use-cases.md) - scenario walkthroughs.
 - [`docs/llm-providers.md`](docs/llm-providers.md) - provider configuration.
