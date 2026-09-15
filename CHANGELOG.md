@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook entries, such as a pre-2.1.0 shim that injected `cwd`. Those entries
   are kept beside the native ones, so every event would otherwise be captured
   twice without any sign (#721).
+- The POSIX shell hook bundle's spool reader no longer builds the decoded value
+  in memory. `ai_memory_json_field` appended to a string that grows to the whole
+  value, so reading a multi-megabyte entry — one large tool result is enough —
+  took minutes of CPU, and a drain pass reads every entry three times (`url`,
+  `body`, `token`) while one detached pass starts behind every delivery that
+  succeeds. Once an outage had filled the spool, the passes accumulated faster
+  than they retired and saturated the machine. The value is now bounded by a
+  single regex pass over the JSON string grammar, unescaped with `gsub` over
+  whole segments and written straight to stdout, for identical output and exit
+  codes. A 2.2 MB entry of `grep` output — the shape that caused the incident,
+  where every literal backslash is an escaped pair — goes from 732 s to 5.5 s
+  under the awk macOS ships and from 9-10 s to about 1 s under mawk and gawk
+  (#727).
 
 ## [2.2.1] - 2026-09-12
 

@@ -641,10 +641,31 @@ ai_memory_spool_event() {
 }
 
 # Read one top-level string field out of a spool entry, undoing the escapes
-# `ai_memory_json_string` produces. Scans left to right, which is the only
-# correct way to find the closing quote. An entry carrying a `\uXXXX` escape
-# was written by a richer serializer (the native binary); this prints nothing
-# for it so the caller leaves it to `ai-memory hook-drain`.
+# `ai_memory_json_string` produces. The regex is the JSON string grammar, so
+# the match ends at the first quote that is not escaped, which is the only
+# correct way to find the end. `match` itself cannot fail — the pattern accepts
+# the empty string — so the terminator check on the line after it is what
+# rejects an unterminated value, and dropping that line drops the check. An
+# entry carrying a `\uXXXX` escape was written by a richer serializer (the
+# native binary); this prints nothing for it so the caller leaves it to
+# `ai-memory hook-drain`.
+#
+# Nothing accumulates: each segment goes straight to stdout. Appending into a
+# string that grows to the whole value costs time quadratic in the number of
+# appends, and that holds whether the step is one character or one
+# escaped-backslash pair — a 2.2 MB entry of `grep` output over source, where
+# every literal backslash is a pair, cost 36 s a pass that way under
+# one-true-awk. A drain pass reads every entry three times and one detached
+# pass starts behind every delivery that succeeds, so the cost is paid over
+# and over.
+#
+# Splitting on the escaped-backslash pairs first is what makes the unescaping
+# safe: no segment can contain one, so inside a segment every backslash starts
+# a real escape and no placeholder byte is needed, which keeps a raw control
+# byte in the value (`ai_memory_json_string` does not escape those)
+# round-tripping untouched. Validation is a pass of its own so that a declined
+# value prints nothing at all — a partial read must never look like a whole
+# one to `ai_memory_drain_spool`, which reads the field through `|| continue`.
 ai_memory_json_field() {
     awk -v key="$1" '
         { text = text (NR > 1 ? "\n" : "") $0 }
@@ -652,27 +673,21 @@ ai_memory_json_field() {
             needle = "\"" key "\":\""
             start = index(text, needle)
             if (start == 0) exit 1
-            i = start + length(needle)
-            out = ""
-            while (i <= length(text)) {
-                c = substr(text, i, 1)
-                if (c == "\\") {
-                    e = substr(text, i + 1, 1)
-                    if (e == "n") out = out "\n"
-                    else if (e == "t") out = out "\t"
-                    else if (e == "r") out = out "\r"
-                    else if (e == "\"") out = out "\""
-                    else if (e == "\\") out = out "\\"
-                    else if (e == "/") out = out "/"
-                    else exit 1
-                    i += 2
-                    continue
-                }
-                if (c == "\"") { printf "%s", out; exit 0 }
-                out = out c
-                i += 1
+            rest = substr(text, start + length(needle))
+            match(rest, /^(\\.|[^"\\])*/)
+            if (substr(rest, RSTART + RLENGTH, 1) != "\"") exit 1
+            parts = split(substr(rest, RSTART, RLENGTH), seg, /\\\\/)
+            for (i = 1; i <= parts; i++)
+                if (seg[i] ~ /\\[^ntr"\/]/) exit 1
+            for (i = 1; i <= parts; i++) {
+                gsub(/\\n/, "\n", seg[i])
+                gsub(/\\t/, "\t", seg[i])
+                gsub(/\\r/, "\r", seg[i])
+                gsub(/\\"/, "\"", seg[i])
+                gsub(/\\\//, "/", seg[i])
+                printf "%s%s", (i == 1 ? "" : "\\"), seg[i]
             }
-            exit 1
+            exit 0
         }
     ' "$2"
 }
