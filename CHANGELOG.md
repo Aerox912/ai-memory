@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Codex assistant-final-turn capture: `install-hooks --agent codex --capture-assistant`
+  now captures the assistant's final message on `Stop`, the same double opt-in
+  (client flag + server `capture_assistant = true`) and sanitize/bound pipeline
+  as Claude Code. Codex's `Stop` payload carries `last_assistant_message`
+  (verified on codex-cli 0.154.0); the installer previously refused the flag for
+  Codex and now bakes it on a native hook platform. Only `(Codex, Stop)` is added
+  — Codex has no `SubagentStop` (#743).
 - Cross-project agent messaging: a directed, claim-once inbox/queue so an agent
   in one project can hand a self-contained request to an agent in another
   project without pulling that project's context into its own session. Four new

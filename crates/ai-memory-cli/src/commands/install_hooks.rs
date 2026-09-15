@@ -1537,11 +1537,14 @@ fn overlay_kiro_cli_event_hooks(
 /// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
 /// user has wired up to other tools.
 /// Whether `--capture-assistant` may take effect for this agent + platform
-/// (#196): Claude Code on a native hook platform only. Any other agent or a
-/// script-fallback platform cannot honor the opt-in, so the installer bails
-/// instead of enabling it silently.
+/// (#196, #743): Claude Code and Codex on a native hook platform. Both carry
+/// `last_assistant_message` on their `Stop` payload (see
+/// `ai_memory_hooks::assistant_capture`). Any other agent or a script-fallback
+/// platform cannot honor the opt-in, so the installer bails instead of enabling
+/// it silently.
 fn capture_assistant_allowed(agent: AgentChoice) -> bool {
-    matches!(agent, AgentChoice::ClaudeCode) && local_hook_policy_v1_supported()
+    matches!(agent, AgentChoice::ClaudeCode | AgentChoice::Codex)
+        && local_hook_policy_v1_supported()
 }
 
 fn prompt_capture_options_allowed(agent: AgentChoice) -> bool {
@@ -1873,6 +1876,8 @@ fn apply_to_command_code_settings_with_staged(
         "command-code",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Command Code is refused by `capture_assistant_allowed`; never bake it.
+        false,
     );
     apply_to_command_code_settings_with_payload(payload, args)
 }
@@ -1989,6 +1994,10 @@ fn apply_to_codex_settings_with_staged(
         "codex",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Codex Stop carries last_assistant_message (#743); bake the opt-in when
+        // asked. `capture_assistant_allowed` already gated it, so this only bakes
+        // on a native path.
+        args.capture_assistant,
     );
     apply_to_codex_settings_with_payload(payload, args)
 }
@@ -2034,6 +2043,7 @@ fn merge_codex_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    capture_assistant: bool,
 ) -> Result<ApplyOutcome> {
     // Build the Codex-flavoured payload. The JSON shape is identical
     // to Claude Code's matcher + nested hooks form — the event list
@@ -2046,6 +2056,7 @@ fn merge_codex_hooks(
         "codex",
         Some(data_dir),
         project_strategy,
+        capture_assistant,
     );
     merge_codex_payload(payload, config_path)
 }
@@ -2192,6 +2203,7 @@ fn merge_cursor_hooks(
         "cursor",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2284,6 +2296,7 @@ fn merge_gemini_hooks(
         "gemini-cli",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -5877,12 +5890,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn capture_assistant_allowed_only_for_claude_native() {
+    fn capture_assistant_allowed_only_for_claude_and_codex_native() {
         use crate::cli::AgentChoice::*;
-        // Every non-Claude agent is rejected regardless of platform (#196): the
-        // opt-in cannot take effect for them, so the installer must bail.
+        // Every agent that cannot honor the opt-in is rejected regardless of
+        // platform (#196): the installer must bail rather than enable it silently.
         for agent in [
-            Codex,
             CommandCode,
             Cursor,
             GeminiCli,
@@ -5905,9 +5917,14 @@ mod tests {
                 "{agent:?} must not allow --capture-assistant"
             );
         }
-        // Claude Code tracks the native-platform gate exactly.
+        // Claude Code and Codex (#743) both carry last_assistant_message on Stop
+        // and track the native-platform gate exactly.
         assert_eq!(
             capture_assistant_allowed(ClaudeCode),
+            local_hook_policy_v1_supported()
+        );
+        assert_eq!(
+            capture_assistant_allowed(Codex),
             local_hook_policy_v1_supported()
         );
     }
@@ -9234,6 +9251,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -9249,6 +9267,65 @@ model = "gpt-5"
         assert!(
             parsed["hooks"]["SessionEnd"].is_array(),
             "SessionEnd is wired for Codex since Codex CLI 0.145.0"
+        );
+    }
+
+    /// #743: with `--capture-assistant`, the Codex Stop command carries the
+    /// `--capture-assistant` flag (and only Stop does); without it, no command
+    /// does. Mirrors the native-command bake asserted for Claude Code.
+    #[test]
+    fn codex_bakes_capture_assistant_flag_on_stop_only_when_opted_in() {
+        fn stop_and_start_commands(capture: bool) -> (String, String) {
+            let hooks_tmp = TempDir::new().unwrap();
+            stub_scripts(
+                hooks_tmp.path(),
+                &[
+                    "session-start.sh",
+                    "user-prompt-submit.sh",
+                    "pre-tool-use.sh",
+                    "post-tool-use.sh",
+                    "pre-compact.sh",
+                    "stop.sh",
+                    "session-end.sh",
+                ],
+            );
+            let config_tmp = TempDir::new().unwrap();
+            let config_path = config_tmp.path().join("hooks.json");
+            merge_codex_hooks(
+                hooks_tmp.path(),
+                "http://127.0.0.1:49374",
+                None,
+                config_tmp.path(),
+                None,
+                &config_path,
+                capture,
+            )
+            .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            let cmd = |event: &str| {
+                parsed["hooks"][event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            (cmd("Stop"), cmd("SessionStart"))
+        }
+
+        let (stop_on, start_on) = stop_and_start_commands(true);
+        assert!(
+            stop_on.contains("--capture-assistant"),
+            "opted-in Codex Stop must bake --capture-assistant: {stop_on}"
+        );
+        assert!(
+            !start_on.contains("--capture-assistant"),
+            "only Stop carries the flag, not SessionStart: {start_on}"
+        );
+
+        let (stop_off, _) = stop_and_start_commands(false);
+        assert!(
+            !stop_off.contains("--capture-assistant"),
+            "without the opt-in no command carries the flag: {stop_off}"
         );
     }
 
@@ -9284,6 +9361,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
