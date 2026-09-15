@@ -172,15 +172,20 @@ jobs:
   # install on — macOS ships the one-true-awk lineage (`original-awk` here),
   # Debian and Ubuntu default to mawk, most other Linux to gawk.
   #
-  # BusyBox awk is deliberately absent: the suite fails two tests there today
-  # (#733). Add that leg with the fix, not before, so this job lands green.
+  # BusyBox awk is included now that #737 fixed the gsub-replacement escape bug
+  # it exposed (#733) — it is the implementation on Alpine and many minimal
+  # containers, so covering it is the point of this job, not an afterthought.
   hooks-shell:
     name: hook bundle (${{ matrix.awk }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        awk: [gawk, mawk, original-awk]
+        # BusyBox joined the matrix once #737 fixed the gsub-replacement escape
+        # bug (#733): its awk is a distinct implementation the bundle runs on,
+        # and it is invoked as the `awk` applet of the `busybox` binary rather
+        # than a standalone `/usr/bin/busybox`, so the shim special-cases it.
+        awk: [gawk, mawk, original-awk, busybox]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # A PATH shim rather than `update-alternatives`, so the leg is explicit
@@ -189,11 +194,18 @@ jobs:
       - name: select ${{ matrix.awk }} as awk
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends '${{ matrix.awk }}'
-          test -x '/usr/bin/${{ matrix.awk }}'
           mkdir -p "$RUNNER_TEMP/awk-shim"
-          printf '#!/bin/sh\nexec /usr/bin/%s "$@"\n' '${{ matrix.awk }}' \
-            > "$RUNNER_TEMP/awk-shim/awk"
+          if [ '${{ matrix.awk }}' = busybox ]; then
+            sudo apt-get install -y --no-install-recommends busybox
+            test -x /usr/bin/busybox
+            printf '#!/bin/sh\nexec /usr/bin/busybox awk "$@"\n' \
+              > "$RUNNER_TEMP/awk-shim/awk"
+          else
+            sudo apt-get install -y --no-install-recommends '${{ matrix.awk }}'
+            test -x '/usr/bin/${{ matrix.awk }}'
+            printf '#!/bin/sh\nexec /usr/bin/%s "$@"\n' '${{ matrix.awk }}' \
+              > "$RUNNER_TEMP/awk-shim/awk"
+          fi
           chmod +x "$RUNNER_TEMP/awk-shim/awk"
           echo "$RUNNER_TEMP/awk-shim" >> "$GITHUB_PATH"
       - name: awk in use
