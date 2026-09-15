@@ -548,9 +548,26 @@ ai_memory_json_string() {
         BEGIN {
             probe = "X"; gsub(/X/, "\\\\", probe)
             if (length(probe) == 1) {
+                busybox = 1
                 BS = "\\\\\\\\"; QT = "\\\\\""; TB = "\\\\t"; CR = "\\\\r"
+                UP = "\\\\u"
             } else {
+                busybox = 0
                 BS = "\\\\"; QT = "\\\""; TB = "\\t"; CR = "\\r"
+                UP = "\\u"
+            }
+            # JSON forbids a raw control character (U+0000..U+001F) inside a
+            # string, but the four gsubs above only cover backslash, quote, tab
+            # and CR — so a replayed tool result carrying e.g. an ANSI colour
+            # escape (0x1b) reached stdout unescaped and Claude Code rejected
+            # the whole SessionStart packet as invalid JSON (#732). Build a
+            # \u00XX escape for every other control byte once; newline (0x0a) is
+            # never inside a record, it is the record separator handled below.
+            nc = 0
+            for (c = 1; c < 32; c++) {
+                if (c == 9 || c == 10 || c == 13) continue
+                cc[++nc] = sprintf("%c", c)
+                cr[nc] = sprintf("%s%04x", UP, c)
             }
             printf "\""
         }
@@ -559,6 +576,11 @@ ai_memory_json_string() {
             gsub(/"/, QT)
             gsub(/\t/, TB)
             gsub(/\r/, CR)
+            # After the backslash gsub, so the backslashes these introduce are
+            # not doubled. Each control byte is a literal (none is a regex
+            # metacharacter), and the pass is linear, not the per-char loop #727
+            # replaced.
+            for (k = 1; k <= nc; k++) gsub(cc[k], cr[k])
             printf "%s%s", sep, $0
             sep = "\\n"
         }

@@ -74,6 +74,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported `Updated` and failed to dedup its own prior Antigravity/Cursor/Kimi
   Code entries. It now matches both forms while still requiring the full
   `hook --event … --agent … --server-url …` argv signature (#740).
+- The POSIX shell hook bundle's `ai_memory_json_string` now escapes every JSON
+  control character (U+0000–U+001F) as `\u00XX`, not just backslash, quote, tab
+  and CR. A replayed tool result carrying an ANSI colour escape (0x1b) reached
+  stdout bare, so the managed-workstream SessionStart packet — and any handoff
+  whose summary held a control byte — was rejected as invalid JSON and the
+  resuming session started with no context. The escaping is linear and reuses
+  the same BusyBox replacement-doubling probe as the four existing escapes
+  (#732).
 
 ## [2.2.1] - 2026-09-12
 

@@ -169,6 +169,16 @@ next line'
 assert_eq "json_string escapes text" '"quoted \"thing\" \\ path\nnext line"' \
     "$(printf '%s' "$JSON_INPUT" | ai_memory_json_string)"
 
+# A raw control byte (JSON forbids U+0000..U+001F inside a string) must become
+# a \u00XX escape, not reach stdout bare -- a replayed ANSI-coloured tool
+# result otherwise made the whole SessionStart packet invalid JSON (#732).
+CTRL_OUT="$(printf 'a\033[0mb' | ai_memory_json_string)"
+case "$CTRL_OUT" in
+    *'\u001b'*) CTRL_ESCAPED=yes ;;
+    *) CTRL_ESCAPED=no ;;
+esac
+assert_eq "json_string escapes a control byte as a \u escape" "yes" "$CTRL_ESCAPED"
+
 # --- marker_qs --------------------------------------------------------
 QS=$(ai_memory_marker_qs "$TMP/a/b/c")
 assert_eq "marker_qs single key" "&cwd=$(ai_memory_url_encode "$TMP/a/b/c")&workspace=deep" "$QS"
