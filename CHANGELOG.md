@@ -20,6 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needing no manifest or public-surface edit; the same resolution moves
   `rustls-webpki` 0.103.13 → 0.103.15 and nothing else (#731).
 
+### Fixed
+- The native `ai-memory hook` session-id state file
+  (`<data_dir>/hook-state/<agent>-session-id`), introduced for Devin in #178,
+  now also covers ZCode. ZCode's hook payloads do not reliably carry a session
+  id, it fires `Stop` at the end of every turn, and it has no `SessionEnd`
+  event — without a persisted id, each turn with an id-less payload opened a
+  fresh server-side session that nothing ever closed (observed in production:
+  4 sessions with NULL `ended_at` and 398 observations stuck in episodic).
+  ZCode events without a native id now share one stable stored id per agent
+  session; events carrying a native id are passed through untouched. The stored
+  id is cleared by `finalize-session --agent zcode` (which now also removes the
+  state file) or overwritten by the next `session-start`; `Stop` never clears
+  it. Other agents are unaffected: payloads that carry a session id short-circuit
+  the state file exactly as before.
+- `memory_feedback`'s `signal` (FeedbackKind) JSON schema now declares a
+  top-level `type: "string"`, so strict function-calling gateways (Moonshot/Kimi
+  and other schema validators) accept the `tools/list` surface instead of
+  rejecting the enum for a missing type (#735, #741).
+
 ## [2.2.1] - 2026-09-12
 
 ### Fixed
