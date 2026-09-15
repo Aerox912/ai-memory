@@ -1731,6 +1731,41 @@ pub struct FinalizeSessionArgs {
     pub json: bool,
 }
 
+/// Tool-schema dialect to pin into the installed MCP URL, as the server's
+/// `?flavor=` marker (docs/mcp-install.md → Schema dialects for strict
+/// upstreams). `install-mcp` already picks one for the clients whose upstream
+/// is fixed — Kimi Code is always Moonshot, Kiro is always Bedrock — but a
+/// client that fronts several models cannot be pinned by its name alone. A
+/// Command Code or OpenCode install routed to Vertex needs `gemini`; the same
+/// client on another model does not, and forcing it there would narrow the
+/// advertised schema for no reason. So this stays an explicit operator choice.
+///
+/// Every variant is at least as permissive as each client's built-in default,
+/// so passing one can only relax the advertised schema further, never tighten
+/// it below what the client already needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SchemaFlavor {
+    /// Drop root-level `anyOf`/`oneOf`/`allOf` (Moonshot).
+    Moonshot,
+    /// Same rewrite, for Bedrock-backed clients.
+    Bedrock,
+    /// The above, plus nullable unions collapsed to a single `type` plus
+    /// `nullable: true` (Gemini / Vertex).
+    #[value(alias = "vertex")]
+    Gemini,
+}
+
+impl SchemaFlavor {
+    /// The `flavor=` query value the server matches in `restricted_schema_flavor`.
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Moonshot => "moonshot",
+            Self::Bedrock => "bedrock",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
 /// MCP client to render configuration for. Includes both the
 /// hook-capable agents (Claude Code / Codex / OpenCode — same MCP
 /// surface, also covered by `install-hooks`) and the MCP-only
@@ -2314,6 +2349,13 @@ pub struct InstallMcpArgs {
     /// `[auto_scope] mode = "per_session"` for concurrent Claude Code sessions.
     #[arg(long)]
     pub session_aware: bool,
+    /// Pin the tool-schema dialect in the installed MCP URL, for a client
+    /// whose upstream 400s on the schemas ai-memory advertises by default.
+    /// Needed when the client fronts several models and its name alone does
+    /// not say which — a Command Code or OpenCode install routed to Vertex
+    /// wants `gemini`. Kimi Code and Kiro already get theirs; this overrides.
+    #[arg(long, value_enum)]
+    pub flavor: Option<SchemaFlavor>,
 }
 
 /// Arguments for the internal Claude Code session-aware MCP bridge.

@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   selected by `CODEX_HOME`, reloads its read-only `auth.json` credentials before
   each operation, and delegates expired-token recovery to
   `codex app-server --stdio` (#716).
+- `install-mcp --flavor <moonshot|bedrock|gemini>` pins the tool-schema dialect
+  in the URL written into a client's config. The installer already picks one for
+  the clients whose upstream is fixed — Kimi Code is always Moonshot, Kiro always
+  Bedrock — but a client that fronts several models cannot be pinned by its name
+  alone, and there was no installer path to `?flavor=gemini` for any of them. A
+  Command Code or OpenCode install routed to Vertex needed the marker added by
+  hand or every model call 400'd at `tools/list`; the same client on a non-Google
+  model does not, which is why this is an explicit choice rather than another
+  per-client default. `vertex` is accepted as an alias. `uninstall` now matches
+  every marker on every client, so an entry pinned this way is still removed
+  (#735).
 
 ### Security
 - Updated `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),
@@ -103,6 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resuming session started with no context. The escaping is linear and reuses
   the same BusyBox replacement-doubling probe as the four existing escapes
   (#732).
+||||||| 74d2d31e
 
 ## [2.2.1] - 2026-09-12
 
