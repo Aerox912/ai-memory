@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New task-oriented `docs/cookbook.md` cheat sheet ("I want to do X" → how:
+  recall, durable rules, importing a knowledge base and reading a specific
+  document, two agents working together), linked from the README docs table, to
+  make it clearer what ai-memory does and how to use it (#726).
 - Codex assistant-final-turn capture: `install-hooks --agent codex --capture-assistant`
   now captures the assistant's final message on `Stop`, the same double opt-in
   (client flag + server `capture_assistant = true`) and sanitize/bound pipeline

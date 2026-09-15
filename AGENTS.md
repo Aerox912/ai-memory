@@ -536,6 +536,9 @@ Additional boundary rules:
   and milestone plan.
 - [`docs/install.md`](docs/install.md) — installation cookbook for every
   supported agent client.
+- [`docs/cookbook.md`](docs/cookbook.md) — task-oriented cheat sheet: "I want
+  to do X" → how (recall, durable rules, importing a knowledge base, two agents
+  working together).
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —

@@ -325,6 +325,7 @@ diagram, crate breakdown, schema notes, and invariants.
 
 | File | What it is |
 |---|---|
+| [`docs/cookbook.md`](docs/cookbook.md) | **Task-oriented cheat sheet.** "I want to do X" → how: recall prior work, keep a rule a project must follow, import an existing knowledge base (OKF norms/specs) and have a project read a specific document, and get two agents/repos working together. Start here if you're unsure what ai-memory can do for you. |
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
 | [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
