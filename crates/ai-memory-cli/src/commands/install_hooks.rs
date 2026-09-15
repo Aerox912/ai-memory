@@ -105,6 +105,70 @@ pub(crate) fn cursor_hooks_path() -> anyhow::Result<std::path::PathBuf> {
         .join("hooks.json"))
 }
 
+/// True when `~/.cursor/hooks.json` already registers a native ai-memory hook
+/// declared `--agent cursor`.
+///
+/// The Cursor CLI also runs the commands in Claude Code's settings, so on a
+/// host with both installs every Cursor event reaches `ai-memory hook` twice:
+/// once as `--agent cursor` and once as `--agent claude-code` carrying
+/// `cursor_version`. The hook uses this to drop the second copy (#721).
+/// Unreadable or malformed files count as "not installed" so the Claude Code
+/// path keeps capturing Cursor sessions on hosts without Cursor's own hooks.
+pub(crate) fn cursor_native_hooks_installed() -> bool {
+    cursor_hooks_path().is_ok_and(|path| cursor_native_hooks_installed_in(&path))
+}
+
+const MAX_CURSOR_HOOKS_BYTES: u64 = 1024 * 1024;
+
+pub(crate) fn cursor_native_hooks_installed_in(path: &Path) -> bool {
+    use std::io::Read as _;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut raw = String::new();
+    if file
+        .take(MAX_CURSOR_HOOKS_BYTES)
+        .read_to_string(&mut raw)
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .any(|entry| is_ai_memory_hook_entry(entry) && declares_cursor_agent(entry))
+        })
+}
+
+fn declares_cursor_agent(entry: &serde_json::Value) -> bool {
+    if let Some(args) = entry.get("args").and_then(serde_json::Value::as_array) {
+        return args
+            .windows(2)
+            .any(|pair| pair[0] == "--agent" && pair[1] == "cursor");
+    }
+    entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|command| {
+            let tokens: Vec<&str> = command
+                .split_whitespace()
+                .map(|t| t.trim_matches(['"', '\'']))
+                .collect();
+            tokens
+                .windows(2)
+                .any(|pair| pair[0] == "--agent" && pair[1] == "cursor")
+                || tokens.contains(&"--agent=cursor")
+                || command.contains("agent=cursor")
+        })
+}
+
 /// `~/.gemini/settings.json`.
 pub(crate) fn gemini_settings_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home_dir()
@@ -2058,7 +2122,58 @@ fn apply_to_cursor_settings(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    warn_unrecognized_ai_memory_hooks(&path);
     Ok(())
+}
+
+/// Warn about hook entries that mention ai-memory but are not recognised as
+/// ours, e.g. a wrapper shim that injects `cwd` before calling the binary.
+/// `install-hooks` keeps those beside the native entries it adds, so every
+/// event would then be captured twice (#721). Best effort: never fails apply.
+fn warn_unrecognized_ai_memory_hooks(path: &Path) {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    for (event, command) in unrecognized_ai_memory_hook_entries(&root) {
+        eprintln!(
+            "# warning: {} `{event}` hook `{command}` mentions ai-memory but is not an \
+             ai-memory hook entry, so it was kept beside the native one and the event \
+             may be captured twice. Remove it if it wraps ai-memory.",
+            path.display()
+        );
+    }
+}
+
+fn unrecognized_ai_memory_hook_entries(root: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(hooks) = root.get("hooks").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (event, entries) in hooks {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries.iter().filter(|e| !is_ai_memory_hook_entry(e)) {
+            let handlers = entry
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .map_or_else(|| vec![entry], |inner| inner.iter().collect());
+            for handler in handlers {
+                let Some(command) = handler.get("command").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                let lower = command.to_ascii_lowercase();
+                if lower.contains("ai-memory") || lower.contains("ai_memory") {
+                    found.push((event.clone(), command.to_string()));
+                }
+            }
+        }
+    }
+    found
 }
 
 fn merge_cursor_hooks(
@@ -8963,6 +9078,81 @@ model = "gpt-5"
         assert_eq!(
             parsed["version"], 1,
             "version: 1 must be set at the top level"
+        );
+    }
+
+    #[test]
+    fn cursor_native_hooks_detection_requires_an_ai_memory_cursor_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("hooks.json");
+        assert!(!cursor_native_hooks_installed_in(&path), "missing file");
+
+        fs::write(&path, "not json").unwrap();
+        assert!(!cursor_native_hooks_installed_in(&path), "malformed file");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"sessionStart":[
+                {"command":"/opt/third-party","args":["--agent","cursor"]},
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","session-start","--agent","claude-code","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            !cursor_native_hooks_installed_in(&path),
+            "third-party or non-cursor entries do not count"
+        );
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory","args":["hook","--event","stop","--agent","cursor","--server-url","http://h"]}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(cursor_native_hooks_installed_in(&path), "exec form");
+
+        fs::write(
+            &path,
+            r#"{"version":1,"hooks":{"stop":[
+                {"command":"/usr/bin/ai-memory hook --event stop --agent cursor --server-url http://h"}
+            ]}}"#,
+        )
+        .unwrap();
+        assert!(
+            cursor_native_hooks_installed_in(&path),
+            "command-string form"
+        );
+    }
+
+    #[test]
+    fn unrecognized_ai_memory_hook_entries_flags_wrappers_only() {
+        let root = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "sessionStart": [
+                    {"command": "/usr/bin/ai-memory", "args": ["hook", "--event", "session-start", "--agent", "cursor", "--server-url", "http://h"]},
+                    {"command": "~/bin/ai-memory-cwd-shim.sh session-start"},
+                    {"command": "/opt/other-tool --flag"}
+                ],
+                "stop": [
+                    {"matcher": "", "hooks": [{"command": "/home/u/.local/ai_memory_wrap stop"}]}
+                ]
+            }
+        });
+        let found = unrecognized_ai_memory_hook_entries(&root);
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "sessionStart".to_string(),
+                    "~/bin/ai-memory-cwd-shim.sh session-start".to_string()
+                ),
+                (
+                    "stop".to_string(),
+                    "/home/u/.local/ai_memory_wrap stop".to_string()
+                ),
+            ]
         );
     }
 

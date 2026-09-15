@@ -732,12 +732,21 @@ fn strip_legacy_orphan_tail(tail: &str) -> &str {
 /// commands invoke the `ai-memory hook --event ... --server-url ...` subcommand.
 /// Keep both signatures narrow so hook overlays and uninstall do not remove
 /// unrelated hooks that happen to use the same event names or script basenames.
+///
+/// The executable name is matched in both its hyphenated (`ai-memory`) and
+/// underscored (`ai_memory`) forms: a native command uses the current
+/// executable's path, and on Windows a test binary (and some packaging) names
+/// it with an underscore, so recognizing only the hyphen made a reapply
+/// non-idempotent — it reported `Updated` and failed to dedup its own prior
+/// entries (#740). The full `hook --event … --agent … --server-url …` argv
+/// signature still gates the match, so this does not broaden to unrelated
+/// commands whose path merely contains the string.
 pub(crate) fn hook_command_is_ours(command: &str) -> bool {
     if command.contains("AI_MEMORY_HOOK_URL=") {
         return true;
     }
     let lower = command.to_ascii_lowercase();
-    lower.contains("ai-memory")
+    (lower.contains("ai-memory") || lower.contains("ai_memory"))
         && lower.contains(" hook --event ")
         && lower.contains(" --agent ")
         && lower.contains(" --server-url ")
@@ -1520,6 +1529,20 @@ mod tests {
     fn hook_signature_matches_a_powershell_call_operator_command() {
         let cmd = r#"& "C:\Users\alice\bin\ai-memory.exe" --data-dir "C:\Users\alice\AppData\Local\ai-memory" hook --event session-start --agent codex --server-url "http://h:49374""#;
         assert!(hook_command_is_ours(cmd));
+    }
+
+    #[test]
+    fn hook_signature_matches_underscore_executable_name() {
+        // On Windows a test binary (and some packaging) names the executable
+        // `ai_memory` rather than `ai-memory`; the native command then uses that
+        // path. Recognizing only the hyphen made a reapply non-idempotent (#740).
+        let cmd = r#""C:\Users\alice\target\debug\ai_memory.exe" hook --event session-start --agent kimi-code --server-url "http://h:49374""#;
+        assert!(hook_command_is_ours(cmd));
+        // The argv signature still gates it: an unrelated `ai_memory`-named tool
+        // without our hook subcommand is not claimed.
+        assert!(!hook_command_is_ours(
+            r#""C:\bin\ai_memory_helper.exe" --do-something-else"#
+        ));
     }
 
     #[test]

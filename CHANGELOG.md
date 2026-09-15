@@ -28,6 +28,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each operation, and delegates expired-token recovery to
   `codex app-server --stdio` (#716).
 
+### Security
+- Updated `rustls` 0.23.40 → 0.23.45 for [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285),
+  in which a TLS 1.3 handshake message that follows a key-changing message in
+  the same record can be accepted at the wrong encryption level. `rustls` is a
+  direct dependency — it installs the process-wide crypto provider the MCP
+  bridge needs for HTTPS — and is also the TLS implementation every outbound
+  HTTPS call resolves to through reqwest, so the advisory failed `cargo audit`
+  and `cargo deny check` on every open pull request that inherited `main`'s
+  lockfile, including ones that change no Rust at all. `Cargo.toml` already
+  allows compatible 0.23 patch releases, so this is a lockfile-only change
+  needing no manifest or public-surface edit; the same resolution moves
+  `rustls-webpki` 0.103.13 → 0.103.15 and nothing else (#731).
+
+### Fixed
+- The native `ai-memory hook` session-id state file
+  (`<data_dir>/hook-state/<agent>-session-id`), introduced for Devin in #178,
+  now also covers ZCode. ZCode's hook payloads do not reliably carry a session
+  id, it fires `Stop` at the end of every turn, and it has no `SessionEnd`
+  event — without a persisted id, each turn with an id-less payload opened a
+  fresh server-side session that nothing ever closed (observed in production:
+  4 sessions with NULL `ended_at` and 398 observations stuck in episodic).
+  ZCode events without a native id now share one stable stored id per agent
+  session; events carrying a native id are passed through untouched. The stored
+  id is cleared by `finalize-session --agent zcode` (which now also removes the
+  state file) or overwritten by the next `session-start`; `Stop` never clears
+  it. Other agents are unaffected: payloads that carry a session id short-circuit
+  the state file exactly as before.
+- `memory_feedback`'s `signal` (FeedbackKind) JSON schema now declares a
+  top-level `type: "string"`, so strict function-calling gateways (Moonshot/Kimi
+  and other schema validators) accept the `tools/list` surface instead of
+  rejecting the enum for a missing type (#735, #741).
+- Cursor lifecycle events are no longer stored twice on a host where both
+  `install-hooks --agent cursor` and `install-hooks --agent claude-code` are
+  applied. Cursor also runs the commands in Claude Code's settings, and since
+  2.1.0 that copy is re-attributed to `cursor` by its `cursor_version`, so it
+  landed in the same session as the native event. The `--agent claude-code`
+  hook now drops a Cursor-marked payload when `~/.cursor/hooks.json` already
+  registers an ai-memory `--agent cursor` hook; without Cursor's own hooks the
+  Claude Code path keeps capturing Cursor sessions as before (#721).
+- `install-hooks --agent cursor --apply` now warns about existing
+  `~/.cursor/hooks.json` entries that mention ai-memory but are not ai-memory
+  hook entries, such as a pre-2.1.0 shim that injected `cwd`. Those entries
+  are kept beside the native ones, so every event would otherwise be captured
+  twice without any sign (#721).
+- The POSIX shell hook bundle's spool reader no longer builds the decoded value
+  in memory. `ai_memory_json_field` appended to a string that grows to the whole
+  value, so reading a multi-megabyte entry — one large tool result is enough —
+  took minutes of CPU, and a drain pass reads every entry three times (`url`,
+  `body`, `token`) while one detached pass starts behind every delivery that
+  succeeds. Once an outage had filled the spool, the passes accumulated faster
+  than they retired and saturated the machine. The value is now bounded by a
+  single regex pass over the JSON string grammar, unescaped with `gsub` over
+  whole segments and written straight to stdout, for identical output and exit
+  codes. A 2.2 MB entry of `grep` output — the shape that caused the incident,
+  where every literal backslash is an escaped pair — goes from 732 s to 5.5 s
+  under the awk macOS ships and from 9-10 s to about 1 s under mawk and gawk
+  (#727).
+- The POSIX shell hook bundle now assigns an `ingest_key` before its initial
+  delivery and preserves that key when spooling the event, preventing a replay
+  from creating a duplicate observation when the server committed the first
+  request but its response was lost (#729).
+- `install-hooks` reapply is idempotent again on Windows for agents whose
+  native command uses an underscore executable name (`ai_memory`): the hook
+  ownership predicate recognized only the hyphenated `ai-memory`, so a reapply
+  reported `Updated` and failed to dedup its own prior Antigravity/Cursor/Kimi
+  Code entries. It now matches both forms while still requiring the full
+  `hook --event … --agent … --server-url …` argv signature (#740).
+- The POSIX shell hook bundle's `ai_memory_json_string` now escapes every JSON
+  control character (U+0000–U+001F) as `\u00XX`, not just backslash, quote, tab
+  and CR. A replayed tool result carrying an ANSI colour escape (0x1b) reached
+  stdout bare, so the managed-workstream SessionStart packet — and any handoff
+  whose summary held a control byte — was rejected as invalid JSON and the
+  resuming session started with no context. The escaping is linear and reuses
+  the same BusyBox replacement-doubling probe as the four existing escapes
+  (#732).
+
+## [2.2.1] - 2026-09-12
+
+### Fixed
+- The POSIX shell hook bundle no longer drops a lifecycle event when the
+  server is unreachable or answers 5xx. A failed delivery is written to
+  `<data_dir>/hook-spool/` in the same on-disk contract `ai-memory hook-drain`
+  reads (same filename shape, same `SpoolEntry` JSON, same 0600/0700 modes,
+  tmp+rename), with an `ingest_key` minted once at spool time so a shell drain
+  and a concurrent `hook-drain` cannot double-ingest; the backlog is flushed
+  behind the next delivery that succeeds, detached from the hook so the agent
+  never waits. A 4xx stays a permanent rejection and is not retried. This is
+  the durability the generated TypeScript integrations got in #580, for the
+  path the docker deploy installs. The PowerShell bundle is unchanged (#719).
+- The POSIX shell hook bundle's `POST /hook` now hard-timeouts at 200 ms
+  rather than 500 ms, which is the budget invariant 5 documents for a script
+  hook. A real loopback round trip runs about 0.3 ms, so a local install is
+  unaffected; against a remote server the tighter ceiling is safe only because
+  a missed window now spools instead of dropping (above). The handoff GET keeps
+  its 1 s: it is fed synchronously to the agent's context, and truncating an
+  almost-ready handoff costs more than it saves (#719).
+- `ai-memory restore` no longer rejects the GNU-sparse SQLite entry that
+  `ai-memory backup` itself produces. `tar::Builder`'s default sparse
+  detection archives `db/memory.sqlite` as a GNU-sparse entry (header type
+  `S`) whenever the SQLite snapshot has real holes on disk, which
+  `validate_restore_entry`'s `is_file()`/`is_dir()` check rejected as an
+  "unsupported entry type" — a verified, valid backup could not be restored,
+  with no recovery path but hand-editing the archive. `tar` already expands
+  GNU-sparse blocks to their full logical content while iterating entries, so
+  restore now accepts the type and unpacks it exactly like a regular file
+  (#718).
+
 ## [2.2.0] - 2026-09-12
 
 ### Added
@@ -5603,7 +5710,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.1
 [2.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.0
 [2.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.1.2
 [2.1.1]: https://github.com/akitaonrails/ai-memory/compare/v2.1.0...v2.1.1
