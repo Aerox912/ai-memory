@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where every literal backslash is an escaped pair — goes from 732 s to 5.5 s
   under the awk macOS ships and from 9-10 s to about 1 s under mawk and gawk
   (#727).
+- The POSIX shell hook bundle now assigns an `ingest_key` before its initial
+  delivery and preserves that key when spooling the event, preventing a replay
+  from creating a duplicate observation when the server committed the first
+  request but its response was lost (#729).
 
 ## [2.2.1] - 2026-09-12
 
