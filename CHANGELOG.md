@@ -68,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivery and preserves that key when spooling the event, preventing a replay
   from creating a duplicate observation when the server committed the first
   request but its response was lost (#729).
+- `install-hooks` reapply is idempotent again on Windows for agents whose
+  native command uses an underscore executable name (`ai_memory`): the hook
+  ownership predicate recognized only the hyphenated `ai-memory`, so a reapply
+  reported `Updated` and failed to dedup its own prior Antigravity/Cursor/Kimi
+  Code entries. It now matches both forms while still requiring the full
+  `hook --event … --agent … --server-url …` argv signature (#740).
 
 ## [2.2.1] - 2026-09-12
 
