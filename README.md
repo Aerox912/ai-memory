@@ -58,6 +58,12 @@ ai-memory is what's on the other side of those walls.
   ceiling (~700/s) instead of a guessed one. An audit log of every
   mutation. Boring, in the way infrastructure should be.
 
+**Coming from Mem0, Zep, mcp-memory-service, Hindsight, OpenViking, or Claude
+Code's built-in memory?** [How ai-memory compares](docs/comparison.md) is a
+fair, specific rundown — where each approach wins, where ai-memory differs, the
+published benchmark, and how the field has independently validated the
+file-first, pages-over-facts bet.
+
 ## How it works
 
 ```
@@ -350,6 +356,7 @@ diagram, crate breakdown, schema notes, and invariants.
 - [`docs/use-cases.md`](docs/use-cases.md) - scenario walkthroughs.
 - [`docs/llm-providers.md`](docs/llm-providers.md) - provider configuration.
 - [`docs/security.md`](docs/security.md) - the full security model.
+- [`docs/comparison.md`](docs/comparison.md) - how ai-memory compares to other memory tools, fairly, and how the field validates the approach.
 - [`docs/research-2026-landscape.md`](docs/research-2026-landscape.md) - how the field looks and where we sit in it.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
 - [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.

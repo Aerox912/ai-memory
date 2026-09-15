@@ -539,6 +539,10 @@ Additional boundary rules:
 - [`docs/cookbook.md`](docs/cookbook.md) — task-oriented cheat sheet: "I want
   to do X" → how (recall, durable rules, importing a knowledge base, two agents
   working together).
+- [`docs/comparison.md`](docs/comparison.md) — fair, user-facing comparison
+  against other memory tools (camps, migration notes, how the field validates
+  the file-first/pages-over-facts approach). Analysis behind it:
+  `research-2026-landscape.md`.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —
