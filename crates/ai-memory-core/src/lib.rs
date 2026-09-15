@@ -12,6 +12,7 @@ pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod message;
 pub mod observation;
 pub mod okf;
 pub mod page;
@@ -56,8 +57,12 @@ pub use handoff::{
 };
 pub use ids::{
     AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
-    ManagedRunId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId,
-    WorkspaceId, WorkstreamId,
+    ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
+    UserId, WorkspaceId, WorkstreamId,
+};
+pub use message::{
+    AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
+    UNTRUSTED_MESSAGE_NOTICE,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{

@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Cross-project agent messaging: a directed, claim-once inbox/queue so an agent
+  in one project can hand a self-contained request to an agent in another
+  project without pulling that project's context into its own session. Four new
+  MCP tools (`memory_message_send` / `memory_message_list` / `memory_message_pop`
+  / `memory_message_cancel`, bringing the surface to 23) plus `ai-memory message
+  send|list|pop|cancel` CLI subcommands and `/admin/messages*` routes, backed by
+  the new `agent_messages` table (migration V64). Messages are addressed to a
+  project (any session there can pop; claim-once); the sender can retract a
+  pending message; an unknown recipient fails closed; each inbox is depth-capped.
+  A popped message is treated as untrusted cross-project input — secret-scrubbed
+  and size-capped on send, fenced with a security notice and sender provenance on
+  pop, and never auto-injected into context. See `docs/agent-messaging.md`.
+- The session-start "hot context" block now appends a non-consuming inbox notice
+  (a static count only — never message text) when a project has pending
+  cross-project mail, and `memory_briefing` reports `pending_message_count`.
 - Added an independent `codex` LLM provider that follows the Codex CLI account
   selected by `CODEX_HOME`, reloads its read-only `auth.json` credentials before
   each operation, and delegates expired-token recovery to

@@ -7,9 +7,10 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, NewHandoff,
-    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageEvidence,
-    PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
+    MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage, NewSession, ObservationId,
+    ObservationKind, OwnerFilter, PageEvidence, PageId, PagePath, ProjectId, SessionId,
+    WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -3107,6 +3108,291 @@ pub fn cancel_handoff(
     }
     tx.commit()?;
     Ok(changed > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Cross-project agent messages (inbox/queue). See docs/agent-messaging.md and
+// V64__agent_messages.sql. Modeled on the handoff claim-once discipline above.
+// ---------------------------------------------------------------------------
+
+/// Store-boundary bound for a message field (16 KiB — the last gate; MCP
+/// callers scrub and cap tighter). Reuses the handoff field budget.
+const MESSAGE_FIELD_MAX_BYTES: usize = HANDOFF_FIELD_MAX_BYTES;
+
+/// Maximum pending messages one recipient project may hold. A full inbox
+/// rejects new sends, so a hostile or buggy sender cannot flood a recipient's
+/// context or exhaust its storage (context-flood / DoS guard).
+pub const MAX_PENDING_INBOX_MESSAGES: u64 = 256;
+
+fn bound_message_field(value: &str) -> String {
+    ai_memory_core::truncate_utf8_bytes(value, MESSAGE_FIELD_MAX_BYTES)
+}
+
+/// Read one message row into the materialized view. Column order must match the
+/// SELECTs in this module and in [`crate::reader`].
+pub(crate) fn row_to_agent_message(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoreResult<ai_memory_core::AgentMessage>> {
+    use ai_memory_core::{AgentMessage, MessageOrigin, MessageState};
+    let id_bytes: Vec<u8> = row.get(0)?;
+    let from_ws: Vec<u8> = row.get(1)?;
+    let from_pj: Vec<u8> = row.get(2)?;
+    let from_agent: String = row.get(3)?;
+    let from_owner_user: Option<String> = row.get(4)?;
+    let to_ws: Vec<u8> = row.get(5)?;
+    let to_pj: Vec<u8> = row.get(6)?;
+    let subject: Option<String> = row.get(7)?;
+    let body: String = row.get(8)?;
+    let state: String = row.get(9)?;
+    let created_us: i64 = row.get(10)?;
+    let claimed_at_us: Option<i64> = row.get(11)?;
+    Ok((|| {
+        Ok(AgentMessage {
+            id: MessageId::from_slice(&id_bytes)?,
+            to_workspace_id: WorkspaceId::from_slice(&to_ws)?,
+            to_project_id: ProjectId::from_slice(&to_pj)?,
+            origin: MessageOrigin {
+                from_workspace_id: WorkspaceId::from_slice(&from_ws)?,
+                from_project_id: ProjectId::from_slice(&from_pj)?,
+                from_agent: AgentKind::from_wire(&from_agent),
+                from_owner_user,
+            },
+            subject,
+            body,
+            state: state.parse::<MessageState>().map_err(StoreError::from)?,
+            created_at: jiff::Timestamp::from_microsecond(created_us).map_err(|e| {
+                StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                    "bad created_at: {e}"
+                )))
+            })?,
+            claimed_at: claimed_at_us
+                .map(jiff::Timestamp::from_microsecond)
+                .transpose()
+                .map_err(|e| {
+                    StoreError::Memory(ai_memory_core::MemoryError::MalformedRecord(format!(
+                        "bad claimed_at: {e}"
+                    )))
+                })?,
+        })
+    })())
+}
+
+/// The stable column list backing [`row_to_agent_message`].
+pub(crate) const MESSAGE_COLUMNS: &str = "id, from_workspace_id, from_project_id, from_agent, \
+     from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at, claimed_at";
+
+/// Send a message into a recipient project's inbox.
+///
+/// Fails closed with [`StoreError::InvalidState`] when the recipient inbox is
+/// already at [`MAX_PENDING_INBOX_MESSAGES`] pending — the caller surfaces this
+/// as a full-inbox rejection rather than flooding the recipient.
+pub fn insert_message(conn: &mut Connection, m: &NewAgentMessage) -> StoreResult<MessageId> {
+    validate_identity_storage_key(m.from_owner_user.as_deref(), "message sender")?;
+    let tx = conn.transaction()?;
+    // Backpressure: bound the recipient's pending depth. Counting inside the
+    // transaction (single-writer actor) makes the check-then-insert atomic.
+    let pending: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM agent_messages \
+         WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending'",
+        params![m.to_workspace_id.as_bytes(), m.to_project_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    if pending as u64 >= MAX_PENDING_INBOX_MESSAGES {
+        return Err(StoreError::InvalidState(format!(
+            "recipient inbox is full ({MAX_PENDING_INBOX_MESSAGES} pending messages); \
+             the recipient must pop or the sender cancel before more can be sent"
+        )));
+    }
+    let id = MessageId::new();
+    let now = Timestamp::now().as_microsecond();
+    // Store-boundary bound (defense in depth): MCP callers already scrub and cap,
+    // but the store is the last gate before durable persistence.
+    let subject = m.subject.as_deref().map(bound_message_field);
+    let body = bound_message_field(&m.body);
+    let from_session: Option<&[u8]> = m.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
+    tx.execute(
+        "INSERT INTO agent_messages ( \
+             id, from_workspace_id, from_project_id, from_agent, from_session_id, \
+             from_owner_user, to_workspace_id, to_project_id, subject, body, state, created_at \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
+        params![
+            id.as_bytes(),
+            m.from_workspace_id.as_bytes(),
+            m.from_project_id.as_bytes(),
+            m.from_agent.as_str(),
+            from_session,
+            m.from_owner_user.as_deref(),
+            m.to_workspace_id.as_bytes(),
+            m.to_project_id.as_bytes(),
+            subject,
+            body,
+            now,
+        ],
+    )?;
+    // Audit records the lifecycle event under the recipient scope (the crossing
+    // point), authorless like handoffs — the row itself carries sender identity.
+    audit(
+        &tx,
+        "send_message",
+        Some(m.to_workspace_id.as_bytes()),
+        Some(m.to_project_id.as_bytes()),
+        None,
+        None,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Pop (claim exactly once) a message from a recipient project's inbox.
+///
+/// With `specific_id`, pops that message; otherwise the oldest pending one.
+/// Returns `None` when nothing matched or another session claimed it first.
+/// Mirrors [`accept_handoff_in_transaction`]'s two `state='pending'` guards.
+pub fn pop_message(
+    conn: &mut Connection,
+    claim: &MessageClaim,
+    specific_id: Option<MessageId>,
+) -> StoreResult<Option<ai_memory_core::AgentMessage>> {
+    let tx = conn.transaction()?;
+    let popped = pop_message_in_transaction(&tx, claim, specific_id)?;
+    tx.commit()?;
+    Ok(popped)
+}
+
+pub(crate) fn pop_message_in_transaction(
+    tx: &Transaction<'_>,
+    claim: &MessageClaim,
+    specific_id: Option<MessageId>,
+) -> StoreResult<Option<ai_memory_core::AgentMessage>> {
+    validate_identity_storage_key(claim.claiming_user.as_deref(), "message recipient")?;
+    // Choose the target: an explicit id, or the oldest pending in this inbox.
+    let target: Option<MessageId> = match specific_id {
+        Some(id) => Some(id),
+        None => tx
+            .query_row(
+                "SELECT id FROM agent_messages \
+                 WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending' \
+                 ORDER BY created_at ASC LIMIT 1",
+                params![claim.workspace_id.as_bytes(), claim.project_id.as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|b| MessageId::from_slice(&b))
+            .transpose()?,
+    };
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    // Guard 1: metadata lookup, scoped to the recipient coordinate. A message
+    // addressed to another project (or already popped/cancelled) is invisible.
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM agent_messages \
+             WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3 AND state = 'pending'",
+            params![
+                target.as_bytes(),
+                claim.workspace_id.as_bytes(),
+                claim.project_id.as_bytes()
+            ],
+            |_| Ok(true),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(None);
+    }
+    // Guard 2: atomic compare-and-set. Only one racing session flips
+    // 'pending' -> 'claimed'; a loser changes 0 rows and gets nothing.
+    let now = Timestamp::now().as_microsecond();
+    let session: Option<&[u8]> = claim.claiming_session.as_ref().map(|s| &s.as_bytes()[..]);
+    let changed = tx.execute(
+        "UPDATE agent_messages SET state = 'claimed', claimed_at = ?1, \
+             claimed_by_session = ?2, claimed_by_agent = ?3, claimed_by_user = ?4 \
+         WHERE id = ?5 AND to_workspace_id = ?6 AND to_project_id = ?7 AND state = 'pending'",
+        params![
+            now,
+            session,
+            claim.claiming_agent.as_str(),
+            claim.claiming_user.as_deref(),
+            target.as_bytes(),
+            claim.workspace_id.as_bytes(),
+            claim.project_id.as_bytes(),
+        ],
+    )?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    audit(
+        tx,
+        "pop_message",
+        Some(claim.workspace_id.as_bytes()),
+        Some(claim.project_id.as_bytes()),
+        None,
+        None,
+        now,
+    )?;
+    let sql = format!(
+        "SELECT {MESSAGE_COLUMNS} FROM agent_messages \
+         WHERE id = ?1 AND to_workspace_id = ?2 AND to_project_id = ?3"
+    );
+    let message = tx
+        .query_row(
+            &sql,
+            params![
+                target.as_bytes(),
+                claim.workspace_id.as_bytes(),
+                claim.project_id.as_bytes()
+            ],
+            row_to_agent_message,
+        )
+        .optional()?
+        .transpose()?;
+    Ok(message)
+}
+
+/// Cancel (retract) pending outbox messages a project has sent. With
+/// `specific_id`, cancels just that one; otherwise every still-pending message
+/// this project sent. Scoped to the SENDER coordinate, so a project can only
+/// retract its own mail. Returns the number of messages cancelled.
+pub fn cancel_messages(
+    conn: &mut Connection,
+    from_workspace_id: &WorkspaceId,
+    from_project_id: &ProjectId,
+    specific_id: Option<MessageId>,
+) -> StoreResult<u64> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let changed = match specific_id {
+        Some(id) => tx.execute(
+            "UPDATE agent_messages SET state = 'cancelled' \
+             WHERE id = ?1 AND from_workspace_id = ?2 AND from_project_id = ?3 \
+               AND state = 'pending'",
+            params![
+                id.as_bytes(),
+                from_workspace_id.as_bytes(),
+                from_project_id.as_bytes()
+            ],
+        )?,
+        None => tx.execute(
+            "UPDATE agent_messages SET state = 'cancelled' \
+             WHERE from_workspace_id = ?1 AND from_project_id = ?2 AND state = 'pending'",
+            params![from_workspace_id.as_bytes(), from_project_id.as_bytes()],
+        )?,
+    };
+    if changed > 0 {
+        audit(
+            &tx,
+            "cancel_message",
+            Some(from_workspace_id.as_bytes()),
+            Some(from_project_id.as_bytes()),
+            None,
+            None,
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed as u64)
 }
 
 fn observation_kind_as_str(kind: ObservationKind) -> &'static str {

@@ -38,6 +38,7 @@ pub mod install_skills;
 pub mod lint;
 pub mod llm_test;
 pub mod mcp_bridge;
+pub mod message;
 pub mod move_project;
 pub mod move_session;
 pub mod openclaw_plugin;

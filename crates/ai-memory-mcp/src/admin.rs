@@ -416,6 +416,33 @@ const fn default_open_handoffs_limit() -> usize {
     50
 }
 
+/// Query for `GET /admin/messages` (cross-project agent messaging, V64).
+#[derive(Debug, Deserialize)]
+struct ListMessagesQuery {
+    workspace: String,
+    project: String,
+    #[serde(rename = "box", default = "default_message_box")]
+    mailbox: String,
+    #[serde(default = "default_list_messages_limit")]
+    limit: usize,
+}
+
+fn default_message_box() -> String {
+    "inbox".into()
+}
+
+const fn default_list_messages_limit() -> usize {
+    50
+}
+
+/// Body cap for `POST /admin/messages/send` (V64). The body crosses a
+/// project-isolation boundary and is untrusted input on the receiving side;
+/// capped the same way handoff text fields are, after secret-scrubbing.
+const MESSAGE_BODY_MAX_CHARS: usize = 8000;
+
+/// Subject cap for `POST /admin/messages/send` (V64).
+const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
+
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
     workspace: String,
@@ -592,6 +619,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
         .route("/admin/handoffs/expire", post(handle_expire_handoffs))
+        .route("/admin/messages", get(handle_list_messages))
+        .route("/admin/messages/send", post(handle_send_message))
+        .route("/admin/messages/pop", post(handle_pop_message))
+        .route("/admin/messages/cancel", post(handle_cancel_messages))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -2638,6 +2669,253 @@ async fn handle_expire_handoffs(
                 "workspace": req.workspace,
                 "project": req.project,
             })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// List one side of a project's cross-project mailbox (V64): `box=inbox`
+/// (default) is mail addressed to it, `box=outbox` is mail it has sent and
+/// can still cancel. Oldest first, capped at `limit`. See
+/// `docs/agent-messaging.md`.
+async fn handle_list_messages(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ListMessagesQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let mailbox = match query.mailbox.as_str() {
+        "inbox" => ai_memory_core::MessageBox::Inbox,
+        "outbox" => ai_memory_core::MessageBox::Outbox,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("box must be \"inbox\" or \"outbox\", got {other:?}")
+                })),
+            );
+        }
+    };
+    let limit = query.limit.clamp(1, 200);
+    match state.reader.list_messages(ws, proj, mailbox, limit).await {
+        Ok(messages) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "messages": messages })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// `POST /admin/messages/send` request body (V64).
+#[derive(Debug, Deserialize)]
+struct SendMessageRequest {
+    from_workspace: String,
+    from_project: String,
+    to_workspace: String,
+    to_project: String,
+    #[serde(default)]
+    subject: Option<String>,
+    body: String,
+}
+
+/// Map a message-store failure to a response. `InvalidState` is the
+/// full-inbox rejection (`ops::MAX_PENDING_INBOX_MESSAGES`) — a caller error,
+/// not a server fault, so it surfaces as 409 rather than 500 (mirrors
+/// [`map_user_store_err`]).
+fn map_message_store_err(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        StoreError::InvalidState(msg) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
+        other => internal_err(other.to_string()),
+    }
+}
+
+/// `POST /admin/messages/send` — drop a message into another project's
+/// inbox (V64). Both scopes are resolved with the no-create lookup: sending
+/// to a typo'd project must fail closed rather than silently creating it.
+///
+/// Security: `body` and `subject` are secret-scrubbed with the same
+/// [`ai_memory_core::Sanitizer`] the hook ingress uses before they are
+/// capped and stored — this endpoint is not a path around redaction.
+async fn handle_send_message(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<SendMessageRequest>,
+) -> impl IntoResponse {
+    let (from_ws, from_proj) =
+        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.from_project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+    let (to_ws, to_proj) =
+        match lookup_ws_proj_no_create(&state, &req.to_workspace, &req.to_project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    let sanitizer = ai_memory_core::Sanitizer::builtin();
+    let body =
+        ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
+    let subject = req
+        .subject
+        .as_deref()
+        .map(|s| {
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS)
+        })
+        .filter(|s| !s.is_empty());
+
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return internal_err(e.to_string()),
+    };
+    // Owner is the sender's storage key, same as `handoff_begin` — attribution
+    // only (never a read filter), and `None` when the actor is anonymous or
+    // the deployment doesn't tell its operators apart.
+    let from_owner_user = ai_memory_core::owner_stamp(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        distinguishes,
+    );
+
+    let message = ai_memory_core::NewAgentMessage {
+        from_workspace_id: from_ws,
+        from_project_id: from_proj,
+        from_agent: AgentKind::Other,
+        from_session_id: None,
+        from_owner_user,
+        to_workspace_id: to_ws,
+        to_project_id: to_proj,
+        subject,
+        body,
+    };
+
+    match state.writer.insert_message(message).await {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message_id": id.to_string() })),
+        ),
+        Err(e) => map_message_store_err(e),
+    }
+}
+
+/// `POST /admin/messages/pop` request body (V64).
+#[derive(Debug, Deserialize)]
+struct PopMessageRequest {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+fn parse_optional_message_id(
+    raw: Option<&str>,
+) -> Result<Option<ai_memory_core::MessageId>, (StatusCode, Json<serde_json::Value>)> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::parse::<ai_memory_core::MessageId>)
+        .transpose()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "message_id must be a full UUID" })),
+            )
+        })
+}
+
+/// `POST /admin/messages/pop` — claim exactly one pending message from this
+/// project's inbox (V64). With `message_id`, pops that one; otherwise the
+/// oldest pending. Returns `{"message": null}` when nothing matched.
+async fn handle_pop_message(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<PopMessageRequest>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return internal_err(e.to_string()),
+    };
+    let claiming_user = ai_memory_core::owner_stamp(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        distinguishes,
+    );
+
+    let claim = ai_memory_core::MessageClaim {
+        workspace_id: ws,
+        project_id: proj,
+        claiming_agent: AgentKind::Other,
+        claiming_session: None,
+        claiming_user,
+    };
+
+    match state.writer.pop_message(claim, specific_id).await {
+        Ok(Some(message)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "message": message,
+                "security_notice": ai_memory_core::UNTRUSTED_MESSAGE_NOTICE,
+            })),
+        ),
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "message": null }))),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// `POST /admin/messages/cancel` request body (V64).
+#[derive(Debug, Deserialize)]
+struct CancelMessagesRequest {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+/// `POST /admin/messages/cancel` — retract still-pending outbox messages
+/// this project sent (V64). With `message_id`, cancels just that one;
+/// otherwise every pending message the project has sent.
+async fn handle_cancel_messages(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CancelMessagesRequest>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    match state.writer.cancel_messages(ws, proj, specific_id).await {
+        Ok(cancelled) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "cancelled": cancelled })),
         ),
         Err(e) => internal_err(e.to_string()),
     }

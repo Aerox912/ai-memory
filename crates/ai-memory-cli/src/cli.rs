@@ -47,6 +47,9 @@ pub enum Command {
     Resume(ResumeArgs),
     /// List open cross-agent handoffs so a stale one can be cancelled by id.
     Handoffs(HandoffsArgs),
+    /// Send, list, pop, or cancel cross-project agent messages (a directed,
+    /// claim-once mailbox between two projects — see `docs/agent-messaging.md`).
+    Message(MessageArgs),
     /// List recent managed workstreams selectable from the current checkout.
     Workstreams(WorkstreamsArgs),
     /// Rename a managed workstream in the current checkout. Metadata only:
@@ -436,6 +439,110 @@ pub struct HandoffsArgs {
     /// REQUIRED by `--expire-all`.
     #[arg(long)]
     pub confirm: bool,
+}
+
+/// Arguments for `message`.
+#[derive(Debug, Args)]
+pub struct MessageArgs {
+    /// Cross-project message action to run.
+    #[command(subcommand)]
+    pub command: MessageCommand,
+}
+
+/// Subcommands for `message`.
+#[derive(Debug, Subcommand)]
+pub enum MessageCommand {
+    /// Drop a message into another project's inbox.
+    Send(MessageSendArgs),
+    /// List pending messages in this project's mailbox.
+    List(MessageListArgs),
+    /// Claim (pop) exactly one pending message from this project's inbox.
+    Pop(MessagePopArgs),
+    /// Retract still-pending messages this project has sent.
+    Cancel(MessageCancelArgs),
+}
+
+/// Arguments for `message send`.
+#[derive(Debug, Args)]
+pub struct MessageSendArgs {
+    /// Recipient workspace.
+    #[arg(long)]
+    pub to_workspace: String,
+    /// Recipient project.
+    #[arg(long)]
+    pub to_project: String,
+    /// Optional one-line subject.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// Message body. Omitted reads the full body from stdin.
+    pub body: Option<String>,
+    /// Sender workspace (defaults to the resolved scope).
+    #[arg(long)]
+    pub from_workspace: Option<String>,
+    /// Sender project (defaults to the resolved scope).
+    #[arg(long)]
+    pub from_project: Option<String>,
+    /// Emit JSON instead of a human confirmation.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `message list`.
+#[derive(Debug, Args)]
+pub struct MessageListArgs {
+    /// Workspace to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to inspect (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// List sent, still-cancellable mail instead of the inbox.
+    #[arg(long)]
+    pub outbox: bool,
+    /// Maximum messages to list.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=200))]
+    pub limit: u16,
+    /// Emit JSON instead of the human listing.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `message pop`.
+#[derive(Debug, Args)]
+pub struct MessagePopArgs {
+    /// Workspace to pop from (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to pop from (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Pop this specific message instead of the oldest pending one.
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Emit JSON instead of the human rendering.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `message cancel`.
+#[derive(Debug, Args)]
+pub struct MessageCancelArgs {
+    /// Workspace to cancel from (defaults to the resolved scope).
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project to cancel from (defaults to the resolved scope).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Cancel this specific message.
+    #[arg(long, conflicts_with = "all")]
+    pub id: Option<String>,
+    /// Cancel every pending message this project has sent. Requires exactly
+    /// one of `--id` or `--all`.
+    #[arg(long, conflicts_with = "id")]
+    pub all: bool,
+    /// Emit JSON instead of a human confirmation.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
