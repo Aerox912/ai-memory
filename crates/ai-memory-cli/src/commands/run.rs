@@ -90,7 +90,9 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
     let mut native_args = args.native_args;
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
+    let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
     let force_fresh = args.fresh || trailing_fresh;
+    let no_autowire = args.no_autowire || trailing_no_autowire;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -214,6 +216,14 @@ pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Resu
         resolved_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
+    // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
+    // here, so managed launch "just works" for capture and recall without a
+    // manual install step. One-time, idempotent, best-effort (it never blocks or
+    // fails the launch); opt out with `--no-autowire` or AI_MEMORY_RUN_AUTOWIRE=false.
+    // Runs before the child spawns so the harness picks up the fresh hooks.
+    if config.run_autowire && !no_autowire {
+        super::run_autowire::ensure_wired(config, harness);
+    }
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
         harness,
@@ -777,6 +787,12 @@ fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+fn remove_wrapper_no_autowire(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--no-autowire"));
+    args.len() != before
+}
+
 fn build_preflighted_launch_plan(
     harness: ManagedHarness,
     executable: Option<OsString>,
@@ -1027,7 +1043,7 @@ fn write_private(path: &Path, content: &[u8]) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn native_home(config: &Config) -> Option<PathBuf> {
+pub(crate) fn native_home(config: &Config) -> Option<PathBuf> {
     config
         .home_dir
         .as_deref()
@@ -1993,6 +2009,25 @@ mod tests {
 
         let mut trailing = ["--fresh", "--model", "opus"].map(OsString::from).to_vec();
         assert!(remove_wrapper_fresh(&mut trailing));
+        assert_eq!(trailing, ["--model", "opus"].map(OsString::from));
+    }
+
+    #[test]
+    fn wrapper_no_autowire_parses_before_or_after_the_harness() {
+        // Before the harness: clap binds it as the wrapper flag.
+        let cli = Cli::try_parse_from(["ai-memory", "run", "--no-autowire", "kimi"]).unwrap();
+        let CliCommand::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.no_autowire);
+
+        // After the harness: trailing_var_arg swallows it into native_args, so it
+        // must be extracted rather than forwarded to the harness (which would
+        // reject an unknown flag).
+        let mut trailing = ["--no-autowire", "--model", "opus"]
+            .map(OsString::from)
+            .to_vec();
+        assert!(remove_wrapper_no_autowire(&mut trailing));
         assert_eq!(trailing, ["--model", "opus"].map(OsString::from));
     }
 

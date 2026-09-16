@@ -825,6 +825,19 @@ where
         }
     }
 
+    // session-start: if this checkout has never had the one-time boot backfill
+    // attempted, spawn it detached. It self-gates (config opt-out, empty-store
+    // check) and records the attempt, so this is at most one extra process the
+    // first time a project is opened after installing hooks — never inline, so
+    // the SessionStart budget is untouched. Best-effort; a spawn failure must
+    // not affect session start.
+    if args.event == "session-start"
+        && let Ok(trigger_cwd) = std::env::current_dir()
+        && !super::backfill::sentinel_path(&dd, &trigger_cwd).exists()
+    {
+        let _ = hook_drain_process::spawn_backfill(&dd);
+    }
+
     // session-start: drain any backlog (e.g. from a previous session that ended
     // abruptly), then fetch + inject the pending handoff for the resuming agent.
     if args.event == "session-start" {

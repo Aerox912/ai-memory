@@ -511,7 +511,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 19 (see `docs/ARCHITECTURE.md`).
+  The tool count is currently 23 (see `docs/ARCHITECTURE.md`).
 - **Semantic versioning:** patch = fixes; minor = additive (new CLI
   subcommands, MCP tools, config keys, a new agent harness or LLM
   provider); major = breaking (on-disk format without migration, removed
@@ -536,6 +536,13 @@ Additional boundary rules:
   and milestone plan.
 - [`docs/install.md`](docs/install.md) — installation cookbook for every
   supported agent client.
+- [`docs/cookbook.md`](docs/cookbook.md) — task-oriented cheat sheet: "I want
+  to do X" → how (recall, durable rules, importing a knowledge base, two agents
+  working together).
+- [`docs/comparison.md`](docs/comparison.md) — fair, user-facing comparison
+  against other memory tools (camps, migration notes, how the field validates
+  the file-first/pages-over-facts approach). Analysis behind it:
+  `research-2026-landscape.md`.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —
@@ -544,5 +551,7 @@ Additional boundary rules:
   four-rung auth ladder.
 - [`docs/managed-workstreams.md`](docs/managed-workstreams.md) —
   `ai-memory run` cross-harness continuity.
+- [`docs/agent-messaging.md`](docs/agent-messaging.md) — cross-project
+  agent-to-agent inbox/queue and the on-start hot-context notice.
 - [`docs/companion-crates.md`](docs/companion-crates.md) — boundary for
   optional companion projects (e.g. the importer).

@@ -58,6 +58,12 @@ ai-memory is what's on the other side of those walls.
   ceiling (~700/s) instead of a guessed one. An audit log of every
   mutation. Boring, in the way infrastructure should be.
 
+**Coming from Mem0, Zep, mcp-memory-service, Hindsight, OpenViking, or Claude
+Code's built-in memory?** [How ai-memory compares](docs/comparison.md) is a
+fair, specific rundown — where each approach wins, where ai-memory differs, the
+published benchmark, and how the field has independently validated the
+file-first, pages-over-facts bet.
+
 ## How it works
 
 ```
@@ -582,8 +588,6 @@ works out of the box: the "current project" pointer is isolated per caller
 by default (v1.39+). See [`docs/auto-scope.md`](docs/auto-scope.md) for the
 optional session-aware Claude Code bridge and the details.
 
-Managed workstreams are optional and add cross-harness *session* continuity
-on top of shared memory:
 The same bridge can serve stdio-only Codex or Antigravity clients without a
 Claude session id. Deployment wrappers that already resolved a repository can
 run it with `--require-scope-pin --workspace <name> --project <name>` so every
@@ -631,14 +635,23 @@ The Docker wrapper also bridges thin-client commands such as
 loopback server. With the local Docker quick start above, no
 `AI_MEMORY_SERVER_URL` override is needed.
 
-Managed workstreams are optional. They execute the harness on the host while
-the server may remain local or remote:
+**If in doubt, start your harness with `ai-memory run`.** It is the preferred
+way to launch: the first time it runs a harness it auto-installs that harness's
+ai-memory hooks + MCP if they are missing (so capture and recall just work —
+no separate `install-hooks`/`install-mcp` step to forget), it wires the right
+project scope by construction, and it adds cross-harness *session* continuity on
+top of shared memory. Everything is idempotent and one-time per harness.
 
 ```bash
 ai-memory run claude
 ai-memory run codex --yolo   # later: same workstream, different harness
 ai-memory continue           # resume the newest managed checkout
 ```
+
+Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
+`AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with
+`install-hooks` / `install-mcp` (e.g. for a harness you never launch through
+`ai-memory run`).
 
 `ai-memory uninstall --apply` removes everything ai-memory installed,
 and only what it installed. Install commands are idempotent and write
@@ -691,7 +704,8 @@ The full model is in [`docs/security.md`](docs/security.md),
 
 Optional. Everything works with zero LLM calls; adding a provider
 upgrades session summaries and enables semantic search. Anthropic,
-OpenAI (incl. OAuth/Codex), GitHub Copilot, Gemini, OpenCode (Go and Zen), and
+OpenAI (including OAuth), Codex CLI credential reuse, GitHub Copilot, Gemini,
+OpenCode (Go and Zen), and
 any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
 for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
 endpoints for embeddings. Configuration lives in
@@ -723,9 +737,11 @@ diagram, crate breakdown, schema notes, and invariants.
 
 | File | What it is |
 |---|---|
+| [`docs/cookbook.md`](docs/cookbook.md) | **Task-oriented cheat sheet.** "I want to do X" → how: recall prior work, keep a rule a project must follow, import an existing knowledge base (OKF norms/specs) and have a project read a specific document, and get two agents/repos working together. Start here if you're unsure what ai-memory can do for you. |
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. The preferred way to launch — it auto-installs a harness's hooks + MCP on first run. |
+| [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue so an agent in one project can hand a self-contained request to an agent in another, plus the on-start "you have mail" notice. Four `memory_message_*` MCP tools + `ai-memory message` CLI. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
@@ -742,11 +758,12 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md) | Proposed opt-in fallback-chain design for transient LLM-provider failures; not yet a supported configuration surface. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
-| Research docs under `docs/` | Karpathy LLM Wiki notes, Hermes Agent, agentmemory / basic-memory / cognee deep-dives, lessons-learned from upstream issues. |
+| Research docs under `docs/` | Karpathy LLM Wiki notes, Hermes Agent, agentmemory / basic-memory / cognee / hindsight deep-dives, the 2026 landscape survey (Zep/Graphiti, Letta, Mem0, mcp-memory-service, OpenViking, …), and lessons-learned from upstream issues. |
 - [`docs/support-matrix.md`](docs/support-matrix.md) - the full agent/platform matrix with notes.
 - [`docs/use-cases.md`](docs/use-cases.md) - scenario walkthroughs.
 - [`docs/llm-providers.md`](docs/llm-providers.md) - provider configuration.
 - [`docs/security.md`](docs/security.md) - the full security model.
+- [`docs/comparison.md`](docs/comparison.md) - how ai-memory compares to other memory tools, fairly, and how the field validates the approach.
 - [`docs/research-2026-landscape.md`](docs/research-2026-landscape.md) - how the field looks and where we sit in it.
 - [`docs/ROADMAP-2.0.md`](docs/ROADMAP-2.0.md) - the plan for the 2.0 release, one item at a time.
 - [`docs/okf.md`](docs/okf.md) - the wiki is natively an Open Knowledge Format (OKF v0.2) bundle; design and field mapping.

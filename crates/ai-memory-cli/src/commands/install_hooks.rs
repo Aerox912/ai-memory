@@ -496,6 +496,20 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
              break cross-agent continuity."
         );
     }
+    // Preserve an existing `--capture-assistant` opt-in on a bare re-apply. There
+    // is no negative flag, so a re-run without `--capture-assistant` (notably the
+    // `ai-memory run` auto-wire, which always passes it off) must NOT silently
+    // downgrade a user who had enabled assistant capture. An explicit
+    // `--capture-assistant` still forces it on; this only fills in the unset case
+    // from what is already installed. Gated to the agents where assistant capture
+    // is allowed (Claude Code, Codex), whose configs share the nested-hooks shape.
+    if args.apply
+        && !args.capture_assistant
+        && capture_assistant_allowed(args.agent)
+        && existing_capture_assistant_opt_in(&args)
+    {
+        args.capture_assistant = true;
+    }
     if args.apply {
         // #446: settle the capture failure mode before any agent-specific
         // work, and say which mode is in force. A protection the operator
@@ -869,6 +883,54 @@ fn baked_claude_prompt_capture(existing: &str) -> Option<bool> {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry)),
     )
+}
+
+/// Whether the currently-installed config for this agent already bakes the
+/// `--capture-assistant` opt-in. Used to preserve that opt-in across a bare
+/// re-apply (e.g. `ai-memory run` auto-wire) instead of dropping it. Only the
+/// agents where assistant capture is allowed (Claude Code, Codex) reach here,
+/// and both write the nested-hooks JSON shape.
+fn existing_capture_assistant_opt_in(args: &InstallHooksArgs) -> bool {
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(baked_capture_assistant)
+        .unwrap_or(false)
+}
+
+/// `Some(true|false)` when `existing` is a recognizable ai-memory install and
+/// whether its Stop command carries `--capture-assistant`; `None` when it is not
+/// an ai-memory install at all (so there is nothing to preserve).
+fn baked_capture_assistant(existing: &str) -> Option<bool> {
+    let document: serde_json::Value = serde_json::from_str(existing).ok()?;
+    let hooks = document.get("hooks")?.as_object()?;
+    let mut saw_ai_memory = false;
+    let mut has_marker = false;
+    for entries in hooks.values().filter_map(serde_json::Value::as_array) {
+        for entry in entries {
+            // Nested (`hooks:[{command}]`) or flat (`{command}`) shape.
+            let nested = entry.get("hooks").and_then(serde_json::Value::as_array);
+            let commands: Vec<&str> = match nested {
+                Some(inner) => inner
+                    .iter()
+                    .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
+                    .collect(),
+                None => entry
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .into_iter()
+                    .collect(),
+            };
+            for command in commands {
+                if hook_command_is_ours(command) {
+                    saw_ai_memory = true;
+                    if command.contains("--capture-assistant") {
+                        has_marker = true;
+                    }
+                }
+            }
+        }
+    }
+    saw_ai_memory.then_some(has_marker)
 }
 
 /// Read the config file `--apply` will update for the selected agent.
@@ -1262,7 +1324,7 @@ fn find_grok_project_overlay(cwd: &Path, repo_root: Option<&Path>) -> Option<Pat
         .find(|path| path.exists())
 }
 
-fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
+pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
     match agent {
         AgentChoice::ClaudeCode => Some(McpClient::ClaudeCode),
         AgentChoice::Codex => Some(McpClient::Codex),
@@ -1554,11 +1616,14 @@ fn overlay_kiro_cli_event_hooks(
 /// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
 /// user has wired up to other tools.
 /// Whether `--capture-assistant` may take effect for this agent + platform
-/// (#196): Claude Code on a native hook platform only. Any other agent or a
-/// script-fallback platform cannot honor the opt-in, so the installer bails
-/// instead of enabling it silently.
+/// (#196, #743): Claude Code and Codex on a native hook platform. Both carry
+/// `last_assistant_message` on their `Stop` payload (see
+/// `ai_memory_hooks::assistant_capture`). Any other agent or a script-fallback
+/// platform cannot honor the opt-in, so the installer bails instead of enabling
+/// it silently.
 fn capture_assistant_allowed(agent: AgentChoice) -> bool {
-    matches!(agent, AgentChoice::ClaudeCode) && local_hook_policy_v1_supported()
+    matches!(agent, AgentChoice::ClaudeCode | AgentChoice::Codex)
+        && local_hook_policy_v1_supported()
 }
 
 fn prompt_capture_options_allowed(agent: AgentChoice) -> bool {
@@ -1890,6 +1955,8 @@ fn apply_to_command_code_settings_with_staged(
         "command-code",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Command Code is refused by `capture_assistant_allowed`; never bake it.
+        false,
     );
     apply_to_command_code_settings_with_payload(payload, args)
 }
@@ -2006,6 +2073,10 @@ fn apply_to_codex_settings_with_staged(
         "codex",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        // Codex Stop carries last_assistant_message (#743); bake the opt-in when
+        // asked. `capture_assistant_allowed` already gated it, so this only bakes
+        // on a native path.
+        args.capture_assistant,
     );
     apply_to_codex_settings_with_payload(payload, args)
 }
@@ -2051,6 +2122,7 @@ fn merge_codex_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    capture_assistant: bool,
 ) -> Result<ApplyOutcome> {
     // Build the Codex-flavoured payload. The JSON shape is identical
     // to Claude Code's matcher + nested hooks form — the event list
@@ -2063,6 +2135,7 @@ fn merge_codex_hooks(
         "codex",
         Some(data_dir),
         project_strategy,
+        capture_assistant,
     );
     merge_codex_payload(payload, config_path)
 }
@@ -2209,6 +2282,7 @@ fn merge_cursor_hooks(
         "cursor",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2301,6 +2375,7 @@ fn merge_gemini_hooks(
         "gemini-cli",
         Some(data_dir),
         project_strategy,
+        false,
     );
     let our_hooks = payload
         .get("hooks")
@@ -5894,12 +5969,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn capture_assistant_allowed_only_for_claude_native() {
+    fn capture_assistant_allowed_only_for_claude_and_codex_native() {
         use crate::cli::AgentChoice::*;
-        // Every non-Claude agent is rejected regardless of platform (#196): the
-        // opt-in cannot take effect for them, so the installer must bail.
+        // Every agent that cannot honor the opt-in is rejected regardless of
+        // platform (#196): the installer must bail rather than enable it silently.
         for agent in [
-            Codex,
             CommandCode,
             Cursor,
             GeminiCli,
@@ -5922,9 +5996,14 @@ mod tests {
                 "{agent:?} must not allow --capture-assistant"
             );
         }
-        // Claude Code tracks the native-platform gate exactly.
+        // Claude Code and Codex (#743) both carry last_assistant_message on Stop
+        // and track the native-platform gate exactly.
         assert_eq!(
             capture_assistant_allowed(ClaudeCode),
+            local_hook_policy_v1_supported()
+        );
+        assert_eq!(
+            capture_assistant_allowed(Codex),
             local_hook_policy_v1_supported()
         );
     }
@@ -7948,6 +8027,80 @@ model = "gpt-5"
         );
     }
 
+    fn claude_apply_args(
+        settings: &std::path::Path,
+        hooks_dir: &std::path::Path,
+        capture_assistant: bool,
+    ) -> InstallHooksArgs {
+        InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            capture_assistant,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(settings.to_path_buf()),
+            hooks_dir: Some(hooks_dir.to_path_buf()),
+            ..default_hook_args()
+        }
+    }
+
+    /// Regression for the auto-wire capture-downgrade (post-audit S1): a bare
+    /// `--apply` without `--capture-assistant` — exactly what `ai-memory run`
+    /// auto-wire issues — must PRESERVE a user's existing assistant-capture
+    /// opt-in, not silently strip it.
+    ///
+    /// Unix-gated: `--capture-assistant` is baked onto the native Stop command on
+    /// POSIX-native platforms; the Windows Claude command form does not carry the
+    /// flag in its rendered JSON, so there is nothing to drop or preserve there.
+    /// The preserve logic itself (`baked_capture_assistant`) has no platform
+    /// branch.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_reapply_preserves_an_existing_capture_assistant_opt_in() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, true)).expect("first install");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "the explicit opt-in must be baked on the first install"
+        );
+
+        // A bare re-apply (the auto-wire shape: capture_assistant = false).
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("bare re-apply");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a bare re-apply must preserve the existing --capture-assistant opt-in"
+        );
+    }
+
+    /// The preserve logic must not false-positive: a fresh install without the
+    /// flag stays off.
+    #[test]
+    fn a_fresh_install_without_the_flag_leaves_assistant_capture_off() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("fresh install");
+        assert!(
+            !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a fresh install without the flag must not enable assistant capture"
+        );
+    }
+
     #[test]
     fn hook_source_candidates_include_native_package_dir() {
         let candidates = hook_source_candidates(
@@ -9307,6 +9460,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -9322,6 +9476,65 @@ model = "gpt-5"
         assert!(
             parsed["hooks"]["SessionEnd"].is_array(),
             "SessionEnd is wired for Codex since Codex CLI 0.145.0"
+        );
+    }
+
+    /// #743: with `--capture-assistant`, the Codex Stop command carries the
+    /// `--capture-assistant` flag (and only Stop does); without it, no command
+    /// does. Mirrors the native-command bake asserted for Claude Code.
+    #[test]
+    fn codex_bakes_capture_assistant_flag_on_stop_only_when_opted_in() {
+        fn stop_and_start_commands(capture: bool) -> (String, String) {
+            let hooks_tmp = TempDir::new().unwrap();
+            stub_scripts(
+                hooks_tmp.path(),
+                &[
+                    "session-start.sh",
+                    "user-prompt-submit.sh",
+                    "pre-tool-use.sh",
+                    "post-tool-use.sh",
+                    "pre-compact.sh",
+                    "stop.sh",
+                    "session-end.sh",
+                ],
+            );
+            let config_tmp = TempDir::new().unwrap();
+            let config_path = config_tmp.path().join("hooks.json");
+            merge_codex_hooks(
+                hooks_tmp.path(),
+                "http://127.0.0.1:49374",
+                None,
+                config_tmp.path(),
+                None,
+                &config_path,
+                capture,
+            )
+            .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+            let cmd = |event: &str| {
+                parsed["hooks"][event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            (cmd("Stop"), cmd("SessionStart"))
+        }
+
+        let (stop_on, start_on) = stop_and_start_commands(true);
+        assert!(
+            stop_on.contains("--capture-assistant"),
+            "opted-in Codex Stop must bake --capture-assistant: {stop_on}"
+        );
+        assert!(
+            !start_on.contains("--capture-assistant"),
+            "only Stop carries the flag, not SessionStart: {start_on}"
+        );
+
+        let (stop_off, _) = stop_and_start_commands(false);
+        assert!(
+            !stop_off.contains("--capture-assistant"),
+            "without the opt-in no command carries the flag: {stop_off}"
         );
     }
 
@@ -9357,6 +9570,7 @@ model = "gpt-5"
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 

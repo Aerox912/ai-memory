@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_core::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffContent, HandoffId,
-    HandoffLifecycle, HandoffOrigin, HandoffScope, HandoffState, IdentityKey, ManagedRunId,
-    Observation, ObservationId, ObservationKind, OwnerFilter, PageId, PagePath, ProjectId,
-    SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
+    AgentKind, AgentMessage, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffContent,
+    HandoffId, HandoffLifecycle, HandoffOrigin, HandoffScope, HandoffState, IdentityKey,
+    ManagedRunId, MessageBox, Observation, ObservationId, ObservationKind, OwnerFilter, PageId,
+    PagePath, ProjectId, SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -1158,6 +1158,10 @@ pub struct BriefingSnapshot {
     pub last_observation_at: Option<String>,
     /// Number of open (un-accepted) handoffs.
     pub pending_handoff_count: u64,
+    /// Number of pending cross-project messages in this project's inbox (V64).
+    /// Surfaced so a resuming agent knows it has mail; popping stays a
+    /// deliberate `memory_message_pop` call. Project-scoped briefings only.
+    pub pending_message_count: u64,
     /// All pages currently under `_rules/` — small, surfaced verbatim
     /// because they're the highest-signal type of memory.
     pub rules: Vec<BriefingPage>,
@@ -5033,6 +5037,69 @@ impl ReaderPool {
         .await
     }
 
+    /// List pending cross-project messages for one side of a project's mailbox
+    /// (V64). `Inbox` = mail addressed to the project (what it can pop);
+    /// `Outbox` = mail the project has sent and can still cancel. Oldest first,
+    /// capped at `limit`. See `docs/agent-messaging.md`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_messages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        mailbox: MessageBox,
+        limit: usize,
+    ) -> StoreResult<Vec<AgentMessage>> {
+        let limit = limit.clamp(1, 200);
+        self.with_conn(move |conn| {
+            // Scope by the coordinate that owns this side of the mailbox: a
+            // project only ever sees mail TO it (inbox) or FROM it (outbox).
+            let predicate = match mailbox {
+                MessageBox::Inbox => "to_workspace_id = ?1 AND to_project_id = ?2",
+                MessageBox::Outbox => "from_workspace_id = ?1 AND from_project_id = ?2",
+            };
+            let sql = format!(
+                "SELECT {cols} FROM agent_messages \
+                 WHERE {predicate} AND state = 'pending' \
+                 ORDER BY created_at ASC LIMIT {limit}",
+                cols = crate::ops::MESSAGE_COLUMNS,
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                crate::ops::row_to_agent_message,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Count pending messages addressed to a project's inbox (V64). Backs the
+    /// on-start inbox notice and `memory_briefing`'s `pending_message_count`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn pending_message_count(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<u64> {
+        self.with_conn(move |conn| {
+            count_bound(
+                conn,
+                "SELECT COUNT(*) FROM agent_messages \
+                 WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending'",
+                &[workspace_id.as_bytes(), project_id.as_bytes()],
+            )
+        })
+        .await
+    }
+
     /// List a project's handoffs, newest first.
     ///
     /// The system had no handoff listing at all: every reader fetched "the
@@ -5290,6 +5357,9 @@ impl ReaderPool {
                 activity_30d,
                 last_observation_at,
                 pending_handoff_count,
+                // No single recipient project for a current/default- or
+                // workspace-scope briefing; the inbox count is project-scoped.
+                pending_message_count: 0,
                 rules,
                 slots,
                 recent_pages,
@@ -5409,6 +5479,14 @@ impl ReaderPool {
                 ),
                 &owner_binds,
             )?;
+            // Pending cross-project inbox mail addressed to THIS project (V64).
+            // Not owner-filtered: the inbox is project-addressed and shared.
+            let pending_message_count = count_bound(
+                conn,
+                "SELECT COUNT(*) FROM agent_messages \
+                 WHERE to_workspace_id = ?1 AND to_project_id = ?2 AND state = 'pending'",
+                &[workspace_id.as_bytes(), project_id.as_bytes()],
+            )?;
 
             let mut rules_stmt = conn.prepare_cached(&format!(
                 "SELECT path, title, {kind_expr} AS kind, \
@@ -5508,6 +5586,7 @@ impl ReaderPool {
                 activity_30d,
                 last_observation_at,
                 pending_handoff_count,
+                pending_message_count,
                 rules,
                 slots,
                 recent_pages,
@@ -5920,6 +5999,9 @@ impl ReaderPool {
                 activity_30d,
                 last_observation_at,
                 pending_handoff_count,
+                // No single recipient project for a current/default- or
+                // workspace-scope briefing; the inbox count is project-scoped.
+                pending_message_count: 0,
                 rules,
                 slots,
                 recent_pages,

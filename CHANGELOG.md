@@ -7,12 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.2.2-aerox.1] - 2026-09-16
+## [2.3.0-aerox.1] - 2026-09-16
 
 ### Changed
-- Integrated canonical snapshot `801d5e4b4e1495314db38ef03d669d251f507d82`, preserving Aerox file-backed authentication and native release packaging.
+- Integrated canonical v2.3.0, preserving Aerox scoped MCP profiles, file-backed authentication, and native release packaging.
+
+## [2.3.0] - 2026-09-16
+
+### Added
+- `ai-memory run <harness>` now auto-installs that harness's ai-memory hooks and
+  MCP server the first time it launches the harness, if they are not already
+  wired — so managed launch (the recommended way to start a harness) captures
+  and can query memory without a separate `install-hooks` / `install-mcp` step.
+  It is idempotent and one-time per harness + binary version (a per-agent
+  sentinel under `<data_dir>/autowire-state/`), preserves any unrelated user
+  config the installers touch, runs before the child spawns so the harness picks
+  up the fresh hooks, and is best-effort (a failure warns and the launch still
+  proceeds). Harnesses without installer support (e.g. Crush) are skipped
+  cleanly, and Pi wires hooks but has no MCP client to write. Opt out with
+  `ai-memory run --no-autowire`, `AI_MEMORY_RUN_AUTOWIRE=false`, or
+  `run_autowire = false`. Documented as the preferred launch path ("if in
+  doubt, run with ai-memory").
+- Boot-time backfill of pre-hook local history, on by default. When a project's
+  ai-memory store is brand new (empty), the SessionStart hook triggers a
+  one-time, bounded import of that project's existing local harness transcripts
+  so installing hooks mid-project no longer starts amnesiac about the very
+  session you are resuming. It replays each local transcript through `/hook` —
+  the same ingress live capture uses — so the history becomes real sessions and
+  observations that consolidate into pages and are searchable via `memory_query`,
+  **sanitized and bounded on the server exactly like live capture** and
+  attributed to the original harness. It only ever bootstraps an empty project
+  (never overwrites an established one; live capture from install-time forward
+  and backfill of before-install history do not overlap), is hard-capped (newest
+  25 sessions, 50k events), and runs detached so session start is never blocked.
+  New `ai-memory backfill`
+  subcommand runs it by hand (`--dry-run`, `--force`, `--session`, `--json`).
+  Opt out with `AI_MEMORY_BACKFILL_ON_START=false` / `backfill_on_start = false`.
+- New `ai-memory doctor` command: a capture-coverage check that, for the current
+  project, compares every known harness's local (on-disk) native session store
+  against what the server actually captured (`GET /admin/sessions/by-agent`) and
+  warns when a harness ran here recently but has zero captured sessions — the
+  silent "its hook was never installed" gap — printing the exact
+  `install-hooks --agent <name> --apply` to fix it. Read-only on the local side;
+  supports `--json`, `--since-days`, and explicit `--workspace`/`--project`.
+- New task-oriented `docs/cookbook.md` cheat sheet ("I want to do X" → how:
+  recall, durable rules, importing a knowledge base and reading a specific
+  document, two agents working together), linked from the README docs table, to
+  make it clearer what ai-memory does and how to use it (#726).
+- Codex assistant-final-turn capture: `install-hooks --agent codex --capture-assistant`
+  now captures the assistant's final message on `Stop`, the same double opt-in
+  (client flag + server `capture_assistant = true`) and sanitize/bound pipeline
+  as Claude Code. Codex's `Stop` payload carries `last_assistant_message`
+  (verified on codex-cli 0.154.0); the installer previously refused the flag for
+  Codex and now bakes it on a native hook platform. Only `(Codex, Stop)` is added
+  — Codex has no `SubagentStop` (#743).
+- Cross-project agent messaging: a directed, claim-once inbox/queue so an agent
+  in one project can hand a self-contained request to an agent in another
+  project without pulling that project's context into its own session. Four new
+  MCP tools (`memory_message_send` / `memory_message_list` / `memory_message_pop`
+  / `memory_message_cancel`, bringing the surface to 23) plus `ai-memory message
+  send|list|pop|cancel` CLI subcommands and `/admin/messages*` routes, backed by
+  the new `agent_messages` table (migration V64). Messages are addressed to a
+  project (any session there can pop; claim-once); the sender can retract a
+  pending message; an unknown recipient fails closed; each inbox is depth-capped.
+  A popped message is treated as untrusted cross-project input — secret-scrubbed
+  and size-capped on send, fenced with a security notice and sender provenance on
+  pop, and never auto-injected into context. See `docs/agent-messaging.md`.
+- The session-start "hot context" block now appends a non-consuming inbox notice
+  (a static count only — never message text) when a project has pending
+  cross-project mail, and `memory_briefing` reports `pending_message_count`.
+- Added an independent `codex` LLM provider that follows the Codex CLI account
+  selected by `CODEX_HOME`, reloads its read-only `auth.json` credentials before
+  each operation, and delegates expired-token recovery to
+  `codex app-server --stdio` (#716).
+- `install-mcp --flavor <moonshot|bedrock|gemini>` pins the tool-schema dialect
+  in the URL written into a client's config. The installer already picks one for
+  the clients whose upstream is fixed — Kimi Code is always Moonshot, Kiro always
+  Bedrock — but a client that fronts several models cannot be pinned by its name
+  alone, and there was no installer path to `?flavor=gemini` for any of them. A
+  Command Code or OpenCode install routed to Vertex needed the marker added by
+  hand or every model call 400'd at `tools/list`; the same client on a non-Google
+  model does not, which is why this is an explicit choice rather than another
+  per-client default. `vertex` is accepted as an alias. `uninstall` now matches
+  every marker on every client, so an entry pinned this way is still removed
+  (#735).
+- `AI_MEMORY_EMBEDDING_PROVIDER=copilot` adds GitHub Copilot as an embedding
+  provider, reusing the `copilot` LLM provider's OAuth login and GitHub-token
+  exchange (no separate API key). Defaults to `text-embedding-3-small`,
+  1536-dim; calls Copilot's `/embeddings` endpoint following the
+  OpenAI-compatible contract Copilot documents for chat (#739).
 
 ### Fixed
+- `install-hooks --apply` now preserves an existing `--capture-assistant` opt-in
+  on a bare re-apply (one with no `--capture-assistant` flag). Previously a
+  refresh without the flag silently stripped assistant capture; this most
+  affected the new `ai-memory run` auto-wire, which always re-applies without the
+  flag. The flag still explicitly enables it; an unset flag now keeps whatever is
+  already installed (Claude Code and Codex).
 - `install-hooks --apply` no longer aborts the entire install when the hook
   bearer token cannot be persisted under the data dir. This bit the docker
   wrapper, where `data_dir` is `/data` — a container volume the host hooks
@@ -5846,7 +5937,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.0
 [2.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.2
 [2.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.1
 [2.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.0

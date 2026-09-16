@@ -138,6 +138,37 @@ sub-scores, gains concentrated where structured temporal memory should
 help), and a reminder the serious players now publish numbers. Full
 analysis in [`research-hindsight.md`](research-hindsight.md).
 
+**Biggest-backed new entrant: `volcengine/OpenViking`** (~37.5K stars,
+ByteDance/Volcano-Engine, AGPLv3 core + Apache-2.0 CLI/examples, three
+papers incl. **VikingMem** at VLDB 2026, arXiv:2605.29640). Positioned as a
+"self-evolving context database" that unifies memory + RAG + skills. It is
+LLM-**required** (a VLM for extraction/compilation plus an embedding model)
+over a vector store fronted by a `viking://` virtual filesystem, so it sits
+in the opposite corner from our zero-LLM, file-first default — and, like
+Hindsight, it validates our substrate from there: memory is
+document/directory-scoped, not atomic facts, and a background pass
+(*commit session → extract → compare candidates for create/merge/skip*, and
+optional VikingBot "compile" into wikis/KGs) is our consolidation +
+auto-improve loop under other names. Two ideas are genuinely worth carrying
+forward. First, **progressive-disclosure tiers**: every memory is loadable
+at **L0 (one-sentence abstract, for relevance checks)**, **L1 (overview, for
+planning)**, or **L2 (full original, read only when needed)** — the reported
+34-91% input-token reduction (LoCoMo) is almost entirely this deferral, and
+it maps directly onto work we already have (V61 abstract embeddings, the
+session brief) rather than a new architecture. Second, **directory-scoped
+retrieval** (a "TrieHI" prefix-tree vector index that narrows a query to a
+path subtree before ranking) — a cheaper cousin of our per-project scoping,
+one level down at the `_rules/` / `norms/` path prefix. Read the numbers
+with the same skepticism the rest of this report earns: the LoCoMo lifts
+(24->82%, 33->83%, 57->80%) are **in-house** (Volcengine) against
+agent-native/stateless and simple-RAG baselines, not against other memory
+systems, and the papers are VLDB-2026/submitted, not yet peer-reviewed.
+What to avoid is unchanged from the camp it belongs to: LLM-required
+capture, an opaque swappable-storage story, AGPLv3 on the core, and the
+SaaS/enterprise-licensing weight that pulls against a single self-contained
+binary. Per the research-doc convention, OpenViking has no standalone
+deep-dive; this section is its record.
+
 ## 4. Research developments worth knowing
 
 - **"Rethinking How to Remember: Beyond Atomic Facts in Lifelong LLM
@@ -242,6 +273,26 @@ Competitors ship all-MiniLM locally by default; it removes the provider
 dependency from vector search and makes hybrid retrieval a zero-config
 default rather than an opt-in. The `ort` crate is the known path.
 
+**R7 - Progressive-disclosure retrieval/brief tiers (medium; evaluate
+first, design doc before code).** From OpenViking's L0/L1/L2 model, whose
+reported 34-91% input-token cut is almost entirely deferring full content.
+We already have the pieces: `memory_query` returns ~24-word snippets (an
+L0), `memory_read_page` returns the full body (an L2), and V61 abstract
+embeddings + the session brief exist. The gap is an explicit **L1
+"overview" tier** and, more concretely, a **tiered on-start brief** that
+leads with per-page abstracts and expands to full bodies only on demand
+instead of loading core-page bodies up front (`render_session_brief`
+today spends its whole char budget on L2). This is a token-efficiency
+win on the exact hot path — every opted-in session start — with no new
+storage: reuse the abstract already embedded at V61. Worth a design doc
+that decides where the L1 overview comes from (frontmatter summary,
+first-paragraph extraction, or the existing abstract) before any code;
+it composes with R5 (the cross-session abstraction pass produces good
+L1 summaries) rather than competing with it. Directory-scoped retrieval
+(OpenViking's TrieHI) is the lower-priority half — a path-prefix filter
+on `memory_query` within a project — worth noting but not scheduling
+until R7's tiering lands.
+
 **Deliberately not recommended:** joining the memory-OS camp (agent
 self-editing its memory - token-expensive, and Letta itself is hedging);
 adopting a graph database (bi-temporal-lite on SQLite covers the useful
@@ -269,6 +320,12 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
   LongMemEval reproduction attributed to Virginia Tech Sanghani Center +
   The Washington Post (co-developing collaborators, not arms-length).
   Full analysis: [`research-hindsight.md`](research-hindsight.md).
+- OpenViking: github.com/volcengine/OpenViking (README, `ov` CLI docs,
+  AGPLv3 core / Apache-2.0 examples); blog.openviking.ai benchmark-results
+  post + `./benchmark/` reproduction scripts (LoCoMo, tau2-bench,
+  in-house); arXiv:2605.29640 (VikingMem, VLDB 2026) plus Directory-Aware
+  Query and VikingRAG papers (submitted/unreviewed). Analyzed inline in §3
+  per the no-standalone-doc convention.
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).

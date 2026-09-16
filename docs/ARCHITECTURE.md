@@ -287,6 +287,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version — consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Surfaced as `evidence_count` in `memory_query(explain=true)` and used to order the opt-in `settled_first` briefing. Ranking-inert: the confidence→authority factor is deferred behind the eval harness (`docs/design-hindsight-borrowings.md` P2). |
+| `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`). Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
@@ -364,7 +365,7 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (19 tools)
+## MCP tool surface (23 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
@@ -379,6 +380,10 @@ invariants below.
 | `memory_handoff_list` | read-only | List open own/shared handoffs with inspectable body and identity fields; does not claim or expire. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
+| `memory_message_send` | destructive | Send a directed cross-project message into another project's inbox (V64). Requires `to_workspace` + `to_project`; the recipient must already exist (fail-closed, never created). Body is secret-scrubbed and size-capped. The one tool that crosses project isolation on purpose. |
+| `memory_message_list` | read-only | List pending mail for this project — `box="inbox"` (poppable, default) or `box="outbox"` (cancellable). Bodies are untrusted cross-project input. |
+| `memory_message_pop` | destructive | Claim ONE inbox message exactly once (oldest, or a specific `message_id`); returns it fenced as untrusted input with sender provenance, or `null` when empty. |
+| `memory_message_cancel` | destructive | Retract a pending sent message by `message_id`, or clear the whole outbox when omitted. Scoped to the sender project. |
 
 `memory_handoff_list` is the inspect-without-claim path for clients that cannot inject SessionStart stdout. `memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
 handoffs for a project, oldest first, with their ids — read-only, and
@@ -512,7 +517,8 @@ reorg                purge-project        rename-project
 move-project         move-session         uninstall
 auth                 user                 completions
 handoffs             purge-session        compact
-api-key              export-okf
+api-key              export-okf           message
+doctor               backfill
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -578,6 +584,22 @@ prefixed `AI_MEMORY_*`.
 bind = "127.0.0.1:49374"
 log_level = "info"
 
+# Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
+# override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
+# AI_MEMORY_RUN_AUTOWIRE).
+capture_assistant = false          # server-side opt-in: honor a Claude Code / Codex
+                                   # client's sanitized assistant-final-message marker
+                                   # on Stop (#196). Client half is baked separately by
+                                   # `install-hooks --capture-assistant`.
+backfill_on_start = true           # on first SessionStart in a brand-new (empty) project,
+                                   # import that project's existing local harness history
+                                   # once so hooks-mid-project isn't amnesiac. Only ever
+                                   # bootstraps an empty project; hard-capped. `ai-memory
+                                   # backfill` runs it by hand.
+run_autowire = true                # `ai-memory run <harness>` auto-installs that harness's
+                                   # hooks + MCP on first launch if missing (idempotent,
+                                   # one-time per harness+version). Also `--no-autowire`.
+
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively
 sigma = 0.6                        # ↑ to reward query-hits more
@@ -639,7 +661,7 @@ abstract_vectors = false          # fifth RRF stream over page_abstract_embeddin
 
 **LLM provider env** (opt-in):
 ```
-AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | copilot |
+AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | codex | copilot |
                            gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
@@ -677,6 +699,7 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            `llm_headers = [...]` in config.toml for that.
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
+AI_MEMORY_CODEX_EXECUTABLE optional Codex executable; defaults to codex on PATH
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
 ```
@@ -742,6 +765,12 @@ editor-plugin agent GitHub's Copilot API expects.
 refresh token in `<data_dir>/auth.json`; it is separate from MCP/server bearer
 auth and from OpenAI Platform API keys.
 
+`codex` reads only the access token and account id from the Codex CLI-owned
+`auth.json`, resolved from `CODEX_HOME` or the platform home. It never persists
+Codex credentials. A single 401 recovery is serialized and delegated to
+`codex app-server --stdio`, with bounded JSONL/stdout/stderr and a 30-second
+maximum recovery timeout.
+
 `copilot` uses `auth login copilot` or `COPILOT_GITHUB_TOKEN`, exchanges the
 GitHub token through `/copilot_internal/v2/token`, and calls Copilot Chat with
 the `vscode-chat` integration headers. The raw GitHub token is not sent to the
@@ -749,10 +778,10 @@ Copilot chat endpoint.
 
 **Embedder env** (opt-in):
 ```
-AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini | openai-compat
+AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini | openai-compat | copilot
 AI_MEMORY_EMBEDDING_MODEL      e.g. text-embedding-3-small, gemini-embedding-001
 AI_MEMORY_EMBEDDING_BASE_URL   optional override; required for openai-compat
-AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google);
+AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI, Copilot), 1024 (Voyage), 768 (Google);
                                required explicitly for openai-compat
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 LLM_API_KEY                    accepted for openai with a custom base URL and as
@@ -774,6 +803,16 @@ when a custom embedding base URL is set, exactly as before. `voyage` and
 no safe shared model or dimensionality default. It sends no authorization header
 when both `EMBEDDING_API_KEY` and `LLM_API_KEY` are absent and stores vectors
 under the distinct `provider="openai-compat"` identity.
+
+`copilot` takes no API key at all: it resolves the same `CopilotAuth` as the
+`copilot` LLM provider (`auth login copilot`, `COPILOT_GITHUB_TOKEN`, or
+`GITHUB_COPILOT_API_TOKEN`) and shares its GitHub-token -> short-lived
+Copilot-API-token exchange (`CopilotAuthState` in `ai-memory-llm::copilot`) —
+no separate exchange path. It defaults to `text-embedding-3-small` / dim 1536
+and calls Copilot's `/embeddings` endpoint with the same `vscode-chat`
+integration headers as chat. That endpoint's wire shape follows the
+OpenAI-compatible contract Copilot documents for chat, not a published
+embeddings spec, and is not covered by a live test against Copilot here.
 
 ## Future work
 

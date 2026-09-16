@@ -563,19 +563,21 @@ opt-in** — enable the server first, then the client:
 1. **Server:** set `capture_assistant = true` in the live
    `<data_dir>/config.toml` (or the service's configured TOML file), or set
    `AI_MEMORY_CAPTURE_ASSISTANT=true`, then restart `ai-memory serve`.
-2. **Client:** re-install the Claude Code hooks with the flag:
+2. **Client:** re-install the Claude Code (or Codex) hooks with the flag:
 
    ```bash
    ai-memory install-hooks --agent claude-code --capture-assistant --apply
+   # Codex is supported too — its Stop payload carries last_assistant_message:
+   ai-memory install-hooks --agent codex --capture-assistant --apply
    ```
 
 The client sanitizes (built-in patterns) and truncates the excerpt before it
 touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
 before storing. If either side is off — or the marker is malformed — the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` removes
-the flag (idempotent). `--capture-assistant` is Claude Code + native-platform
-only; on any other agent or the script fallback the installer refuses it rather
-than enabling something that cannot take effect. Assistant text is
+the flag (idempotent). `--capture-assistant` is Claude Code and Codex on a
+native hook platform only; on any other agent or the script fallback the
+installer refuses it rather than enabling something that cannot take effect. Assistant text is
 privacy-sensitive — read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.
@@ -1574,6 +1576,7 @@ ai-memory works in three intensity tiers:
 | **+ LLM consolidation** | LLM rewrites session pages as coherent narratives; PreCompact checkpoints; LLM-driven contradiction lint | `AI_MEMORY_LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | ~$0.01–0.05 / session |
 | **+ Anthropic via subscription** | Same LLM features using a Claude Pro/Max subscription instead of an API key | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` + `ANTHROPIC_OAUTH_TOKEN` | Uses your Claude subscription |
 | **+ ChatGPT/Codex OAuth** | Same LLM features using a ChatGPT Pro/Plus login instead of an OpenAI Platform key | `AI_MEMORY_LLM_PROVIDER=openai-oauth` + `ai-memory auth login openai-oauth` | Uses your ChatGPT subscription |
+| **+ Codex credential reuse** | Same LLM features using the Codex CLI-owned login without copying or owning its refresh token | `AI_MEMORY_LLM_PROVIDER=codex` + an authenticated Codex CLI | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
 | **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
@@ -1588,6 +1591,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once; set `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
+| `AI_MEMORY_LLM_PROVIDER=codex` | `gpt-5.6-luna` | Reuses only `access_token` and `account_id` from Codex's `auth.json`; token renewal is delegated to `codex app-server --stdio`. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. GPT-5.6 Luna uses Go's Responses endpoint; other models use Chat Completions. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias. |
@@ -1597,6 +1601,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=copilot` | `text-embedding-3-small` (1536-dim) | Reuses the `copilot` LLM provider's OAuth login (`ai-memory auth login copilot`, `COPILOT_GITHUB_TOKEN`, or `GITHUB_COPILOT_API_TOKEN`) — no separate API key. Calls Copilot's `/embeddings` endpoint following the OpenAI-compatible contract Copilot documents for chat; that endpoint's exact shape is not covered by a live test against Copilot here, so treat it as needing a real-Copilot smoke test. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
@@ -1733,6 +1738,29 @@ Use `ai-memory auth status` to check whether a token is present and
 > `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` so hidden thought tokens
 > do not eat the JSON budget. Reserve high-effort reasoning for your
 > coding agent.
+
+### Codex credential reuse
+
+The independent `codex` provider reads `$CODEX_HOME/auth.json`, falling back to
+the platform home's `.codex/auth.json`. It materializes only
+`tokens.access_token` and `tokens.account_id`, reloads them before every call,
+and never copies or writes the file. On the first 401, it asks
+`codex app-server --stdio` to refresh the Codex-owned credential and retries
+the Responses request once.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=codex
+export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
+export AI_MEMORY_LLM_REASONING_EFFORT=medium
+ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
+ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
+```
+
+`AI_MEMORY_CODEX_EXECUTABLE` optionally selects another Codex binary. File
+storage is supported; `auto` is supported when it resolves to the same
+`auth.json`. Keyring-only and ephemeral storage are not supported. Docker is
+outside the automatic setup path: both the executable and credentials must be
+available inside the same container/environment.
 
 ### GitHub Copilot
 
@@ -2348,7 +2376,28 @@ the wrapper requires `<url>.sha256` unless
 
 When the upgraded server starts, it applies SQLite schema migrations and
 pending wiki-structure migrations automatically. No manual database
-reset or wiki rewrite is required for normal upgrades.
+reset or wiki rewrite is required for normal upgrades. Migrations are
+forward-only: after a newer version has applied its schema, an older binary
+will refuse to open that data dir (it fails closed rather than risk
+corruption), so take a `ai-memory backup` before upgrading if you might need
+to roll back to the previous version.
+
+### Upgrading to 2.3.0
+
+2.3.0 is a normal forward upgrade (the only new migration, `V64`, just adds the
+cross-project `agent_messages` table — nothing existing is altered or removed).
+Two capture/UX conveniences are **on by default**; both are additive and
+non-destructive, but worth knowing about for your first session after upgrading:
+
+- **First `ai-memory run <harness>` auto-installs that harness's hooks + MCP** if
+  they were not already wired (idempotent, one-time per harness; it preserves
+  your existing hook config, including a `--capture-assistant` opt-in). Disable
+  with `ai-memory run --no-autowire` or `AI_MEMORY_RUN_AUTOWIRE=false`.
+- **The first session in a brand-new (empty) project imports that project's
+  existing local harness history once**, so installing ai-memory mid-project is
+  not amnesiac. It only ever runs on an empty project (never touches one that
+  already has captured memory) and is hard-capped. Disable with
+  `AI_MEMORY_BACKFILL_ON_START=false`; run it by hand with `ai-memory backfill`.
 
 If the server runs on another host, `ai-memory upgrade` refreshes only
 the local wrapper, local image, and local hook scripts. Redeploy the

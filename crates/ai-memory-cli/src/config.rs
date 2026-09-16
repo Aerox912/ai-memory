@@ -175,7 +175,8 @@ pub struct Config {
     pub home_dir: Option<String>,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
-    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `copilot`).
+    /// Optional LLM provider (`anthropic`, `openai`, `gemini`, `openai-compat`,
+    /// `openai-oauth`, `codex`, `copilot`).
     pub llm_provider: Option<String>,
     /// Optional LLM model override.
     pub llm_model: Option<String>,
@@ -263,6 +264,23 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
+    /// On by default. When the project's ai-memory store is brand new (empty),
+    /// the SessionStart hook triggers a one-time, bounded import of this
+    /// project's existing local harness session history so installing hooks
+    /// mid-project does not start amnesiac. The import is read-only on the local
+    /// side, sanitized on the server exactly like live capture, and only ever
+    /// bootstraps an empty project (never overwrites an established one). Turn
+    /// off with `AI_MEMORY_BACKFILL_ON_START=false` or `backfill_on_start =
+    /// false`; `ai-memory backfill` remains available to run it by hand.
+    pub backfill_on_start: bool,
+    /// On by default. The first time `ai-memory run <harness>` launches a
+    /// harness (per harness + binary version), it auto-installs that harness's
+    /// ai-memory lifecycle hooks and MCP server if they are not already wired,
+    /// so managed launches capture and can query memory without a manual
+    /// `install-hooks` / `install-mcp` step. Idempotent and one-time per
+    /// harness. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
+    /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
+    pub run_autowire: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -400,6 +418,9 @@ pub struct Config {
 pub struct RuntimeEnv {
     data_dir: Option<PathBuf>,
     home_dir: Option<String>,
+    platform_home: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    codex_executable: Option<PathBuf>,
     server_url: Option<String>,
     auth_token: Option<String>,
     auth_token_file: Option<PathBuf>,
@@ -429,6 +450,9 @@ impl RuntimeEnv {
         Self {
             data_dir: env_path("AI_MEMORY_DATA_DIR"),
             home_dir: env_string("AI_MEMORY_HOME").or_else(|| env_string("HOME")),
+            platform_home: dirs::home_dir(),
+            codex_home: env_path("CODEX_HOME"),
+            codex_executable: env_path("AI_MEMORY_CODEX_EXECUTABLE"),
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             auth_token_file: env_path("AI_MEMORY_AUTH_TOKEN_FILE"),
@@ -715,6 +739,8 @@ impl Default for Config {
             llm_fallback_configs: Vec::new(),
             consolidate_on_session_end: false,
             capture_assistant: false,
+            backfill_on_start: true,
+            run_autowire: true,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -1225,7 +1251,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
             ))
         })?;
         let model = match non_empty(self.llm_model.as_deref()) {
@@ -1236,6 +1262,7 @@ impl Config {
                 ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
+                ProviderChoice::Codex => "gpt-5.6-luna".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
                 ProviderChoice::OpenAiCompat => {
                     return Err(LlmError::NotConfigured(
@@ -1284,7 +1311,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "llm_fallbacks[{index}].provider={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|copilot|anthropic-oauth|opencode"
+                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
@@ -1339,6 +1366,16 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
+            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
+                resolve_codex_auth_file(
+                    self.runtime_env.codex_home.as_deref(),
+                    self.runtime_env.platform_home.as_deref(),
+                ),
+                self.runtime_env
+                    .codex_executable
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("codex")),
+            ),
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
                 self.runtime_env.copilot_github_token.clone(),
@@ -1455,10 +1492,11 @@ impl Config {
             "google" | "gemini" => EmbedderChoice::Google,
             "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
             "local" => EmbedderChoice::Local,
+            "copilot" => EmbedderChoice::Copilot,
             other => {
                 return Err(LlmError::NotConfigured(format!(
                     "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
-                     openai|voyage|google|gemini|openai-compat|local|none"
+                     openai|voyage|google|gemini|openai-compat|local|copilot|none"
                 )));
             }
         };
@@ -1476,6 +1514,7 @@ impl Config {
                     ));
                 }
                 EmbedderChoice::Local => ai_memory_llm::LOCAL_MODEL.to_string(),
+                EmbedderChoice::Copilot => ai_memory_llm::COPILOT_DEFAULT_EMBED_MODEL.to_string(),
             },
         };
         let dim = match self.embedding_dim {
@@ -1516,6 +1555,8 @@ impl Config {
                 .unwrap_or_else(|| SecretString::from(String::new())),
             // In-process: no key, ever.
             EmbedderChoice::Local => SecretString::from(String::new()),
+            // OAuth-backed: no API key, ever; see `copilot_auth` below.
+            EmbedderChoice::Copilot => SecretString::from(String::new()),
         };
         let base_url = self.embedding_base_url.clone();
         if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
@@ -1523,6 +1564,17 @@ impl Config {
                 "AI_MEMORY_EMBEDDING_BASE_URL required for openai-compat embeddings".into(),
             ));
         }
+        // Resolve Copilot auth only when the embedding provider is actually
+        // copilot (invariant 14: auth resolves before construction). Mirrors
+        // exactly how the chat-provider path builds `ProviderAuth::copilot`.
+        let copilot_auth = if provider == EmbedderChoice::Copilot {
+            Some(
+                self.provider_auth(ProviderChoice::Copilot, None)
+                    .require_copilot_auth()?,
+            )
+        } else {
+            None
+        };
         Ok(Some(EmbedderConfig {
             provider,
             model,
@@ -1530,6 +1582,7 @@ impl Config {
             api_key,
             base_url,
             models_dir: Some(self.data_dir.join("models")),
+            copilot_auth,
             defaulted,
         }))
     }
@@ -1543,6 +1596,7 @@ impl Config {
             ProviderChoice::Gemini => self.runtime_env.gemini_api_key.clone(),
             ProviderChoice::OpenAiCompat => self.runtime_env.llm_api_key.clone(),
             ProviderChoice::OpenAiOAuth => None,
+            ProviderChoice::Codex => None,
             ProviderChoice::Copilot => None,
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
@@ -1559,6 +1613,17 @@ impl Config {
     #[must_use]
     pub fn openai_oauth_token_path(&self) -> PathBuf {
         self.auth_token_path()
+    }
+
+    /// Codex CLI-owned auth file resolved from the Codex or platform home.
+    #[must_use]
+    pub fn codex_auth_file_path(&self) -> PathBuf {
+        let platform_home = self
+            .runtime_env
+            .platform_home
+            .as_deref()
+            .or_else(|| self.runtime_env.home_dir.as_deref().map(Path::new));
+        resolve_codex_auth_file(self.runtime_env.codex_home.as_deref(), platform_home)
     }
 
     /// Shared Copilot auth token file path.
@@ -1607,6 +1672,13 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
+            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
+                self.codex_auth_file_path(),
+                self.runtime_env
+                    .codex_executable
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("codex")),
+            ),
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
                 self.runtime_env.copilot_github_token.clone(),
@@ -1689,6 +1761,7 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "gemini" | "google" => ProviderChoice::Gemini,
         "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
         "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "codex" => ProviderChoice::Codex,
         "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
         "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
@@ -1709,6 +1782,16 @@ fn env_string(name: &str) -> Option<String> {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     env_string(name).map(PathBuf::from)
+}
+
+fn resolve_codex_auth_file(codex_home: Option<&Path>, platform_home: Option<&Path>) -> PathBuf {
+    if let Some(home) = codex_home.filter(|path| !path.as_os_str().is_empty()) {
+        return home.join("auth.json");
+    }
+    platform_home
+        .unwrap_or_else(|| Path::new("."))
+        .join(".codex")
+        .join("auth.json")
 }
 
 fn env_secret(name: &str) -> Option<SecretString> {
@@ -2734,6 +2817,68 @@ mod tests {
     }
 
     #[test]
+    fn copilot_embedding_defaults_model_dim_and_reuses_copilot_auth() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            embedding_provider: Some("copilot".into()),
+            runtime_env: RuntimeEnv {
+                copilot_github_token: Some(SecretString::from("ghu-test")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.provider, EmbedderChoice::Copilot);
+        assert_eq!(embedder.model, "text-embedding-3-small");
+        assert_eq!(embedder.dim, 1536);
+        assert!(embedder.api_key.expose_secret().is_empty());
+        let auth = embedder
+            .copilot_auth
+            .expect("copilot embedder config carries resolved Copilot auth");
+        assert_eq!(auth.token_file, tmp.path().join("auth.json"));
+        assert_eq!(auth.github_token.unwrap().expose_secret(), "ghu-test");
+    }
+
+    #[test]
+    fn copilot_embedding_without_credentials_still_resolves_auth_material() {
+        // `embedder_config` only resolves auth *inputs*, mirroring the chat
+        // provider path (`copilot_provider_uses_data_dir_token_file_and_env_token`);
+        // whether a usable credential exists is checked at construction time
+        // by `CopilotEmbedder::new` (`ai-memory-llm`), not here.
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            embedding_provider: Some("copilot".into()),
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        let auth = embedder.copilot_auth.expect("copilot auth is resolved");
+        assert!(auth.github_token.is_none());
+        assert!(auth.direct_api_token.is_none());
+    }
+
+    #[test]
+    fn non_copilot_embedding_leaves_copilot_auth_unresolved() {
+        // Auth resolution must be gated on the embedding provider actually
+        // being copilot — resolving it unconditionally would fail closed for
+        // every operator who has not logged into Copilot at all.
+        let cfg = Config {
+            embedding_provider: Some("openai".into()),
+            runtime_env: RuntimeEnv {
+                openai_api_key: Some(SecretString::from("sk-embed-key")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert!(embedder.copilot_auth.is_none());
+    }
+
+    #[test]
     fn openai_embedding_does_not_use_llm_api_key_without_custom_base_url() {
         let cfg = Config {
             embedding_provider: Some("openai".into()),
@@ -2923,6 +3068,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_provider_uses_codex_home_auth_and_default_model() {
+        let tmp = TempDir::new().unwrap();
+        let codex_home = tmp.path().join("custom-codex-home");
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                codex_home: Some(codex_home.clone()),
+                codex_executable: Some(PathBuf::from("codex-custom")),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Codex);
+        assert_eq!(provider.model, "gpt-5.6-luna");
+        assert_eq!(auth.auth_file, codex_home.join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex-custom"));
+    }
+
+    #[test]
+    fn codex_provider_falls_back_to_platform_home() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                platform_home: Some(tmp.path().to_path_buf()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_codex_auth().unwrap();
+
+        assert_eq!(auth.auth_file, tmp.path().join(".codex").join("auth.json"));
+        assert_eq!(auth.executable, Path::new("codex"));
+    }
+
+    #[test]
     fn provider_config_forwards_the_operator_headers() {
         let tmp = TempDir::new().unwrap();
         let cfg = Config {
@@ -2936,6 +3123,24 @@ mod tests {
         assert_eq!(
             provider.extra_headers,
             ExtraHeaders::parse(["x-opencode-session=ses-1"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_auth_resolution_treats_empty_codex_home_as_unset() {
+        let platform_home = Path::new("/platform/home");
+
+        assert_eq!(
+            resolve_codex_auth_file(None, Some(platform_home)),
+            platform_home.join(".codex").join("auth.json")
+        );
+        assert_eq!(
+            resolve_codex_auth_file(Some(Path::new("")), Some(platform_home)),
+            platform_home.join(".codex").join("auth.json")
+        );
+        assert_eq!(
+            resolve_codex_auth_file(Some(Path::new("/custom/codex")), Some(platform_home)),
+            Path::new("/custom/codex").join("auth.json")
         );
     }
 
