@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenAI-compatible contract Copilot documents for chat (#739).
 
 ### Fixed
+- `install-hooks --apply` now preserves an existing `--capture-assistant` opt-in
+  on a bare re-apply (one with no `--capture-assistant` flag). Previously a
+  refresh without the flag silently stripped assistant capture; this most
+  affected the new `ai-memory run` auto-wire, which always re-applies without the
+  flag. The flag still explicitly enables it; an unset flag now keeps whatever is
+  already installed (Claude Code and Codex).
 - `install-hooks --apply` no longer aborts the entire install when the hook
   bearer token cannot be persisted under the data dir. This bit the docker
   wrapper, where `data_dir` is `/data` — a container volume the host hooks

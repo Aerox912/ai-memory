@@ -218,17 +218,22 @@ cross-link them — doctor is the ongoing check, backfill is the one-time bootst
 - **Multi-session**: two concurrent boots → exactly one import (lease claim-once), the
   other no-ops — the invariant-#16 concurrency shape, proven at integration level.
 
-## Open questions for the plan
+## Open questions — resolved as built
 
-1. **Ingest path A vs B** — confirm the lifecycle-free workstream-import endpoint is worth
-   adding versus an observation replay. (Recommend A for the cursor.)
-2. **Shared-server default** — auto-on everywhere, or auto-on only in the single-operator
-   posture with explicit `ai-memory backfill` required on multi-user servers?
-3. **Notice delivery** — Claude discards SessionStart stdout; reuse the same
-   "deliver on first user prompt" path the hot-context block already uses for Kimi/Claude?
-4. **Consolidation quality** — should a first pass gate on a small eval that backfilled
-   pre-hook ledgers produce pages of comparable quality to forward capture before making
-   full-project bootstrap the default, or ship behind the cap and iterate?
+These were the pre-implementation questions; the shipped feature (see the **As-built
+note** at the top) resolved each:
+
+1. **Ingest path A vs B** — resolved to **B** (replay through `/hook`). A live smoke proved
+   path A populated the workstream continuity ledger, not the searchable memory pipeline
+   (observation count stayed zero), so it was abandoned.
+2. **Shared-server default** — shipped **on by default** with `AI_MEMORY_BACKFILL_ON_START=false`
+   / `--no`-style opt-out; the emptiness gate makes it safe on any posture (it only ever
+   bootstraps an empty project).
+3. **Notice delivery** — the automatic path runs detached and silent (like Claude Code's
+   own auto-memory); the summary shows on a manual `ai-memory backfill`. Surfacing it in
+   the next session's on-start context remains a possible follow-up.
+4. **Consolidation quality** — shipped **behind the hard cap** (newest 25 sessions / 50k
+   events) and iterating; a dedicated eval remains a follow-up.
 
 ## Semver
 

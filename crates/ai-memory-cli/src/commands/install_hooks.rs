@@ -496,6 +496,20 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
              break cross-agent continuity."
         );
     }
+    // Preserve an existing `--capture-assistant` opt-in on a bare re-apply. There
+    // is no negative flag, so a re-run without `--capture-assistant` (notably the
+    // `ai-memory run` auto-wire, which always passes it off) must NOT silently
+    // downgrade a user who had enabled assistant capture. An explicit
+    // `--capture-assistant` still forces it on; this only fills in the unset case
+    // from what is already installed. Gated to the agents where assistant capture
+    // is allowed (Claude Code, Codex), whose configs share the nested-hooks shape.
+    if args.apply
+        && !args.capture_assistant
+        && capture_assistant_allowed(args.agent)
+        && existing_capture_assistant_opt_in(&args)
+    {
+        args.capture_assistant = true;
+    }
     if args.apply {
         // #446: settle the capture failure mode before any agent-specific
         // work, and say which mode is in force. A protection the operator
@@ -869,6 +883,54 @@ fn baked_claude_prompt_capture(existing: &str) -> Option<bool> {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|entries| entries.iter().any(is_ai_memory_hook_entry)),
     )
+}
+
+/// Whether the currently-installed config for this agent already bakes the
+/// `--capture-assistant` opt-in. Used to preserve that opt-in across a bare
+/// re-apply (e.g. `ai-memory run` auto-wire) instead of dropping it. Only the
+/// agents where assistant capture is allowed (Claude Code, Codex) reach here,
+/// and both write the nested-hooks JSON shape.
+fn existing_capture_assistant_opt_in(args: &InstallHooksArgs) -> bool {
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(baked_capture_assistant)
+        .unwrap_or(false)
+}
+
+/// `Some(true|false)` when `existing` is a recognizable ai-memory install and
+/// whether its Stop command carries `--capture-assistant`; `None` when it is not
+/// an ai-memory install at all (so there is nothing to preserve).
+fn baked_capture_assistant(existing: &str) -> Option<bool> {
+    let document: serde_json::Value = serde_json::from_str(existing).ok()?;
+    let hooks = document.get("hooks")?.as_object()?;
+    let mut saw_ai_memory = false;
+    let mut has_marker = false;
+    for entries in hooks.values().filter_map(serde_json::Value::as_array) {
+        for entry in entries {
+            // Nested (`hooks:[{command}]`) or flat (`{command}`) shape.
+            let nested = entry.get("hooks").and_then(serde_json::Value::as_array);
+            let commands: Vec<&str> = match nested {
+                Some(inner) => inner
+                    .iter()
+                    .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
+                    .collect(),
+                None => entry
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .into_iter()
+                    .collect(),
+            };
+            for command in commands {
+                if hook_command_is_ours(command) {
+                    saw_ai_memory = true;
+                    if command.contains("--capture-assistant") {
+                        has_marker = true;
+                    }
+                }
+            }
+        }
+    }
+    saw_ai_memory.then_some(has_marker)
 }
 
 /// Read the config file `--apply` will update for the selected agent.
@@ -7962,6 +8024,73 @@ model = "gpt-5"
             crate::config::read_hook_auth_token(&config.data_dir),
             None,
             "the token must not have been persisted in the failure case"
+        );
+    }
+
+    fn claude_apply_args(
+        settings: &std::path::Path,
+        hooks_dir: &std::path::Path,
+        capture_assistant: bool,
+    ) -> InstallHooksArgs {
+        InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            capture_assistant,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            config_file: Some(settings.to_path_buf()),
+            hooks_dir: Some(hooks_dir.to_path_buf()),
+            ..default_hook_args()
+        }
+    }
+
+    /// Regression for the auto-wire capture-downgrade (post-audit S1): a bare
+    /// `--apply` without `--capture-assistant` — exactly what `ai-memory run`
+    /// auto-wire issues — must PRESERVE a user's existing assistant-capture
+    /// opt-in, not silently strip it.
+    #[test]
+    fn a_bare_reapply_preserves_an_existing_capture_assistant_opt_in() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, true)).expect("first install");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "the explicit opt-in must be baked on the first install"
+        );
+
+        // A bare re-apply (the auto-wire shape: capture_assistant = false).
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("bare re-apply");
+        assert!(
+            std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a bare re-apply must preserve the existing --capture-assistant opt-in"
+        );
+    }
+
+    /// The preserve logic must not false-positive: a fresh install without the
+    /// flag stays off.
+    #[test]
+    fn a_fresh_install_without_the_flag_leaves_assistant_capture_off() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+        let hooks_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+
+        run(&config, claude_apply_args(&settings, &hooks_dir, false)).expect("fresh install");
+        assert!(
+            !std::fs::read_to_string(&settings)
+                .unwrap()
+                .contains("--capture-assistant"),
+            "a fresh install without the flag must not enable assistant capture"
         );
     }
 

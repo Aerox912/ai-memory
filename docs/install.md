@@ -2376,7 +2376,28 @@ the wrapper requires `<url>.sha256` unless
 
 When the upgraded server starts, it applies SQLite schema migrations and
 pending wiki-structure migrations automatically. No manual database
-reset or wiki rewrite is required for normal upgrades.
+reset or wiki rewrite is required for normal upgrades. Migrations are
+forward-only: after a newer version has applied its schema, an older binary
+will refuse to open that data dir (it fails closed rather than risk
+corruption), so take a `ai-memory backup` before upgrading if you might need
+to roll back to the previous version.
+
+### Upgrading to 2.3.0
+
+2.3.0 is a normal forward upgrade (the only new migration, `V64`, just adds the
+cross-project `agent_messages` table — nothing existing is altered or removed).
+Two capture/UX conveniences are **on by default**; both are additive and
+non-destructive, but worth knowing about for your first session after upgrading:
+
+- **First `ai-memory run <harness>` auto-installs that harness's hooks + MCP** if
+  they were not already wired (idempotent, one-time per harness; it preserves
+  your existing hook config, including a `--capture-assistant` opt-in). Disable
+  with `ai-memory run --no-autowire` or `AI_MEMORY_RUN_AUTOWIRE=false`.
+- **The first session in a brand-new (empty) project imports that project's
+  existing local harness history once**, so installing ai-memory mid-project is
+  not amnesiac. It only ever runs on an empty project (never touches one that
+  already has captured memory) and is hard-capped. Disable with
+  `AI_MEMORY_BACKFILL_ON_START=false`; run it by hand with `ai-memory backfill`.
 
 If the server runs on another host, `ai-memory upgrade` refreshes only
 the local wrapper, local image, and local hook scripts. Redeploy the

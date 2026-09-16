@@ -550,6 +550,22 @@ prefixed `AI_MEMORY_*`.
 bind = "127.0.0.1:49374"
 log_level = "info"
 
+# Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
+# override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
+# AI_MEMORY_RUN_AUTOWIRE).
+capture_assistant = false          # server-side opt-in: honor a Claude Code / Codex
+                                   # client's sanitized assistant-final-message marker
+                                   # on Stop (#196). Client half is baked separately by
+                                   # `install-hooks --capture-assistant`.
+backfill_on_start = true           # on first SessionStart in a brand-new (empty) project,
+                                   # import that project's existing local harness history
+                                   # once so hooks-mid-project isn't amnesiac. Only ever
+                                   # bootstraps an empty project; hard-capped. `ai-memory
+                                   # backfill` runs it by hand.
+run_autowire = true                # `ai-memory run <harness>` auto-installs that harness's
+                                   # hooks + MCP on first launch if missing (idempotent,
+                                   # one-time per harness+version). Also `--no-autowire`.
+
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively
 sigma = 0.6                        # ↑ to reward query-hits more
