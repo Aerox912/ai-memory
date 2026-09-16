@@ -817,8 +817,14 @@ mod tests {
             ("invalid", "invalid JSON"),
             ("oversized", "exceeded its limit"),
             ("stderr", "stderr exceeded its limit"),
-            ("exit", "ended before replying"),
-            ("exit-nonzero", "ended before replying"),
+            // An abrupt exit is a race between the stdout reader (EOF ->
+            // "...ended before replying") and the stderr monitor (EOF ->
+            // "...ended before completing"); both are correct early-exit
+            // errors, and which wins is timing-dependent (it flaked on a loaded
+            // CI runner). Assert the shared, meaningful part rather than the
+            // racy tail.
+            ("exit", "recovery process ended before"),
+            ("exit-nonzero", "recovery process ended before"),
         ] {
             fs::write(dir.path().join("fake-mode"), mode).unwrap();
             let error = recover_with_codex(&auth, Duration::from_secs(3))
