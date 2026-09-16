@@ -111,7 +111,6 @@ pub fn backfill_command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
             OsString::from("--quiet"),
         ],
         stderr_log: data_dir.join("logs").join("backfill.log"),
-        live_token: None,
     })
 }
 
@@ -119,7 +118,7 @@ pub fn backfill_command_spec(data_dir: &Path) -> io::Result<DrainCommandSpec> {
 /// Best-effort: a spawn failure must never break session start.
 pub fn spawn_backfill(data_dir: &Path) -> io::Result<()> {
     let spec = backfill_command_spec(data_dir)?;
-    spawn_spec(&spec)
+    spawn_spec(&spec, None)
 }
 
 /// Build the stdio/detach shape used when spawning.
