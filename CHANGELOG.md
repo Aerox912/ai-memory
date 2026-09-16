@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-09-16
+
 ### Added
 - `ai-memory run <harness>` now auto-installs that harness's ai-memory hooks and
   MCP server the first time it launches the harness, if they are not already
@@ -5793,7 +5795,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.2.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.0
 [2.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.2
 [2.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.1
 [2.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.0
