@@ -104,8 +104,10 @@ ai-memory serve                      # run the server
 
 ## When it isn't doing what you expect
 
-- **Nothing is being remembered**: hooks may not be installed — `ai-memory
-  install-hooks --agent <your-agent> --apply`, and check `ai-memory status`.
+- **Nothing is being remembered**: hooks may not be installed. Easiest fix —
+  start the harness with `ai-memory run <harness>`, which auto-installs its
+  hooks + MCP on first launch; or wire it by hand with `ai-memory install-hooks
+  --agent <your-agent> --apply`. Then check `ai-memory status` / `ai-memory doctor`.
 - **Only *some* agents are being remembered**: run `ai-memory doctor`. It lists
   every harness that has local sessions in this project and whether the server
   captured them — so a harness you rotated in without installing its hook (a

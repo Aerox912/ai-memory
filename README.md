@@ -238,14 +238,23 @@ works out of the box: the "current project" pointer is isolated per caller
 by default (v1.39+). See [`docs/auto-scope.md`](docs/auto-scope.md) for the
 optional session-aware Claude Code bridge and the details.
 
-Managed workstreams are optional and add cross-harness *session* continuity
-on top of shared memory:
+**If in doubt, start your harness with `ai-memory run`.** It is the preferred
+way to launch: the first time it runs a harness it auto-installs that harness's
+ai-memory hooks + MCP if they are missing (so capture and recall just work —
+no separate `install-hooks`/`install-mcp` step to forget), it wires the right
+project scope by construction, and it adds cross-harness *session* continuity on
+top of shared memory. Everything is idempotent and one-time per harness.
 
 ```bash
 ai-memory run claude
 ai-memory run codex --yolo   # later: same workstream, different harness
 ai-memory continue           # resume the newest managed checkout
 ```
+
+Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
+`AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with
+`install-hooks` / `install-mcp` (e.g. for a harness you never launch through
+`ai-memory run`).
 
 `ai-memory uninstall --apply` removes everything ai-memory installed,
 and only what it installed. Install commands are idempotent and write

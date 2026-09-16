@@ -7,6 +7,20 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+**`ai-memory run` is the preferred way to start a harness — "if in doubt, run
+with ai-memory."** Beyond session continuity, the first time it launches a given
+harness it **auto-installs that harness's ai-memory hooks and MCP** if they are
+not already wired, so capture and recall work without a separate `install-hooks`
+/ `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
+nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
+one-time per harness + binary version, preserves unrelated user config, runs
+before the harness starts so it picks up the fresh hooks, and is best-effort —
+if an install fails it warns and still launches. Harnesses without installer
+support (Crush) are skipped; Pi wires hooks but has no MCP client to write. Turn
+it off with `ai-memory run --no-autowire`, `AI_MEMORY_RUN_AUTOWIRE=false`, or
+`run_autowire = false` in config; manual `install-hooks` / `install-mcp` remain
+available for harnesses you never launch through `run`.
+
 The launcher resolves its executable name through `PATH` directly — it does
 not go through an interactive shell, so a `claude` defined only as a shell
 `alias` in `.bashrc`/`.zshrc` is invisible to it. If you switch Claude

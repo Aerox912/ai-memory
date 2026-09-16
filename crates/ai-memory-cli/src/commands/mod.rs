@@ -73,6 +73,7 @@ pub mod restore;
 pub mod restore_page;
 pub mod resume;
 pub mod run;
+pub mod run_autowire;
 pub mod search;
 pub mod serve;
 pub mod setup_agent;

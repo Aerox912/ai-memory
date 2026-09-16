@@ -1262,7 +1262,7 @@ fn find_grok_project_overlay(cwd: &Path, repo_root: Option<&Path>) -> Option<Pat
         .find(|path| path.exists())
 }
 
-fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
+pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
     match agent {
         AgentChoice::ClaudeCode => Some(McpClient::ClaudeCode),
         AgentChoice::Codex => Some(McpClient::Codex),

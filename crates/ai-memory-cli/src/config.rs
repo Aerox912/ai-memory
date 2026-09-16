@@ -273,6 +273,14 @@ pub struct Config {
     /// off with `AI_MEMORY_BACKFILL_ON_START=false` or `backfill_on_start =
     /// false`; `ai-memory backfill` remains available to run it by hand.
     pub backfill_on_start: bool,
+    /// On by default. The first time `ai-memory run <harness>` launches a
+    /// harness (per harness + binary version), it auto-installs that harness's
+    /// ai-memory lifecycle hooks and MCP server if they are not already wired,
+    /// so managed launches capture and can query memory without a manual
+    /// `install-hooks` / `install-mcp` step. Idempotent and one-time per
+    /// harness. Turn off with `AI_MEMORY_RUN_AUTOWIRE=false` /
+    /// `run_autowire = false`, or per launch with `ai-memory run --no-autowire`.
+    pub run_autowire: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -728,6 +736,7 @@ impl Default for Config {
             consolidate_on_session_end: false,
             capture_assistant: false,
             backfill_on_start: true,
+            run_autowire: true,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,

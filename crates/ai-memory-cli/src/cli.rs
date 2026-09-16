@@ -255,6 +255,12 @@ pub struct RunArgs {
     /// resuming or adopting an existing harness session.
     #[arg(long)]
     pub fresh: bool,
+    /// Skip the one-time auto-install of this harness's ai-memory hooks + MCP.
+    /// Auto-wire is on by default so a managed launch captures without a manual
+    /// `install-hooks`/`install-mcp` step; pass this (or set
+    /// `AI_MEMORY_RUN_AUTOWIRE=false`) to launch without touching harness config.
+    #[arg(long)]
+    pub no_autowire: bool,
     /// Agent harness to launch. When omitted, continue the newest managed or
     /// checkout-local session among the auto-detected harnesses. Any value
     /// starting with `claude` (e.g. `claude-corp`, `claude-personal`) also

@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ai-memory run <harness>` now auto-installs that harness's ai-memory hooks and
+  MCP server the first time it launches the harness, if they are not already
+  wired — so managed launch (the recommended way to start a harness) captures
+  and can query memory without a separate `install-hooks` / `install-mcp` step.
+  It is idempotent and one-time per harness + binary version (a per-agent
+  sentinel under `<data_dir>/autowire-state/`), preserves any unrelated user
+  config the installers touch, runs before the child spawns so the harness picks
+  up the fresh hooks, and is best-effort (a failure warns and the launch still
+  proceeds). Harnesses without installer support (e.g. Crush) are skipped
+  cleanly, and Pi wires hooks but has no MCP client to write. Opt out with
+  `ai-memory run --no-autowire`, `AI_MEMORY_RUN_AUTOWIRE=false`, or
+  `run_autowire = false`. Documented as the preferred launch path ("if in
+  doubt, run with ai-memory").
 - Boot-time backfill of pre-hook local history, on by default. When a project's
   ai-memory store is brand new (empty), the SessionStart hook triggers a
   one-time, bounded import of that project's existing local harness transcripts
