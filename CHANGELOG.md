@@ -55,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1536-dim; calls Copilot's `/embeddings` endpoint following the
   OpenAI-compatible contract Copilot documents for chat (#739).
 
+### Fixed
+- `install-hooks --apply` no longer aborts the entire install when the hook
+  bearer token cannot be persisted under the data dir. This bit the docker
+  wrapper, where `data_dir` is `/data` — a container volume the host hooks
+  never read from and that the container user frequently cannot write — so the
+  persist step failed with `Permission denied` and left the operator with *no*
+  hooks and no capture at all. The installer now falls back to embedding the
+  credential inline in the rendered hook config (the pre-#552 behavior), warns
+  that the token is then readable in that file and how to restore the secure
+  on-disk path (a writable host data dir, e.g.
+  `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for the docker wrapper, or
+  a native binary), and completes the install so capture keeps working.
+
 ## [2.2.2] - 2026-09-15
 
 ### Security

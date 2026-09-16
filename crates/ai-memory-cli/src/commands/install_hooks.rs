@@ -412,13 +412,30 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     let persisted = if args.apply
         && let Some(token) = auth_token_owned.as_deref()
     {
-        crate::config::store_hook_auth_token(&config.data_dir, token).with_context(|| {
-            format!(
-                "storing the hook auth token under {}",
-                config.data_dir.display()
-            )
-        })?;
-        true
+        // A failure here must NOT abort the whole install (#743-audit F5). The
+        // common case is a docker-wrapper run where `data_dir` is `/data`, a
+        // named volume the container user cannot write — and which the HOST
+        // hooks would not read from anyway (they look under the host's
+        // `~/.local/share/ai-memory`). Aborting left the operator with no hooks
+        // and no capture. Fall back to embedding the credential the pre-#552 way
+        // (into the rendered hook config/env) so the hooks still authenticate,
+        // and warn loudly about the reduced protection and how to get the secure
+        // path back.
+        match crate::config::store_hook_auth_token(&config.data_dir, token) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "[ai-memory] warning: could not persist the hook auth token under {} ({e}); \
+                     embedding it in the rendered hook config instead so capture still works. \
+                     The token is then readable in that file / process argv. To keep it out \
+                     (recommended), install with a writable host data dir — e.g. \
+                     `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for the docker wrapper — \
+                     or a native `ai-memory` binary.",
+                    config.data_dir.display()
+                );
+                false
+            }
+        }
     } else {
         false
     };
@@ -7892,6 +7909,59 @@ model = "gpt-5"
                 .unwrap()
                 .contains("SEKRIT-BEARER-552"),
             "the curl header file must carry it too"
+        );
+    }
+
+    /// F5 (docker-wrapper audit), the regression guard: when the bearer
+    /// *cannot* be persisted under the data dir, `--apply` must still install
+    /// working hooks by embedding the credential inline instead of aborting the
+    /// whole install with no hooks at all.
+    ///
+    /// The real case is the docker wrapper: `data_dir` is `/data`, a container
+    /// volume the host hooks never read from and that the container user often
+    /// cannot write. Before this fix a persist failure hard-aborted, leaving the
+    /// operator with neither the secure path nor any capture at all.
+    #[test]
+    fn apply_falls_back_to_inline_bearer_when_persisting_fails() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+
+        // Make ONLY the secret write fail — like a data dir the installer cannot
+        // write the token into — while leaving hook staging (which writes under
+        // `<data_dir>/hooks/`) fully working: pre-create the `<data_dir>/auth-token`
+        // path as a *directory*, so `write_secret`'s file open returns EISDIR.
+        std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
+
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("FALLBACK-BEARER-F5".to_string()),
+            config_file: Some(settings.clone()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        // The whole point of the fix: a persist failure must not abort the install.
+        run(&config, args).expect("apply must not abort when the bearer cannot be persisted");
+
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            rendered.contains("FALLBACK-BEARER-F5"),
+            "the bearer must be embedded inline so the hooks still authenticate: {rendered}"
+        );
+
+        // It genuinely took the fallback, not the secure path: nothing persisted.
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir),
+            None,
+            "the token must not have been persisted in the failure case"
         );
     }
 
