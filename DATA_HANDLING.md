@@ -13,20 +13,42 @@ ai-memory does not phone home. There is no analytics, crash reporting, or
 usage telemetry built into the binary. Everything it stores — wiki pages and
 the SQLite database — lives under a single, operator-controlled data
 directory on the local filesystem (`SECURITY.md`, "Local data
-confidentiality"). No data leaves the host unless one of the two opt-in
-features below is explicitly enabled, or you point ai-memory's own LLM/
-embedding-provider config at a cloud API for its core functionality (the same
-way any AI coding tool needs a model to call).
+confidentiality"). No data leaves the host unless one of the three opt-in
+paths below is explicitly enabled — the **embedding provider** being the one
+most likely to matter to a reviewer, since it's the default-on question of
+whether stored content reaches a cloud API at all.
+
+The out-of-the-box default is local-only: `config.default.toml` configures
+in-process local embeddings (all-MiniLM-L6-v2, 384-dim) with no API key and
+no data egress. See [`docs/local-embeddings.md`](docs/local-embeddings.md).
 
 There is no encryption at rest in v1; ai-memory relies on OS filesystem
 permissions (owner-only directories/files on Unix, ACLs on Windows —
 `SECURITY.md`, same section).
 
-## The two opt-in paths that send data externally
+## The three opt-in paths that send data externally
 
-Both are off by default and each requires a deliberate step to turn on.
+All three are off by default (local embeddings need no key or network call)
+and each requires a deliberate config change to turn on.
 
-1. **Assistant/Stop capture** (`SECURITY.md`, "Assistant/Stop capture is
+| path | what leaves the host |
+|---|---|
+| `embedding_provider = openai\|voyage\|google\|openai-compat` | the text of every stored page |
+| `capture_assistant` (double opt-in) | the assistant's final-turn text |
+| `AI_MEMORY_RERANKER=llm` | each live query + bounded page titles/snippets |
+
+1. **Embedding provider.** This is the broadest path by far, and the one
+   most likely to answer a reviewer's actual question ("does our source
+   material reach a cloud provider?"). `OpenAiEmbedder`, `VoyageEmbedder`,
+   and `GoogleEmbedder` each call their provider's embedding endpoint for
+   every page that needs a vector. This isn't limited to new writes:
+   switching a running install from `local` to a cloud provider triggers a
+   backfill of the **existing corpus** (`POST /admin/embed`, `ai-memory embed
+   --force`), so changing this setting later can retroactively send content
+   that was previously local-only. Leave `embedding_provider` on `local` (the
+   default) to keep this off; see
+   [`docs/local-embeddings.md`](docs/local-embeddings.md).
+2. **Assistant/Stop capture** (`SECURITY.md`, "Assistant/Stop capture is
    opt-in and sanitized"). Persisting the coding assistant's final-turn text
    requires a double opt-in: `capture_assistant` on the server *and*
    `install-hooks --capture-assistant` on the client. Once enabled, captured
@@ -34,16 +56,19 @@ Both are off by default and each requires a deliberate step to turn on.
    separately configured a cloud LLM provider — is sent to that provider. The
    flag is global to the install; there is no per-project exclusion once it's
    on.
-2. **LLM-based search reranking** (`SECURITY.md`, "Search reranking is an
+3. **LLM-based search reranking** (`SECURITY.md`, "Search reranking is an
    outbound-data opt-in"). Setting `AI_MEMORY_RERANKER=llm` sends each live
    query plus bounded page titles/snippets to the configured LLM provider.
    Leave this unset, or point it at a local provider, to keep queries and
    recalled snippets on-host.
 
-Both paths pass through a sanitizer that strips obvious credentials before
-anything is transmitted, but the sanitizer is documented as best-effort, not
-a guarantee — see the "Stored-content prompt injection" and reranking notes
-in `SECURITY.md` for the exact caveats.
+Paths 2 and 3 pass through a sanitizer that strips obvious credentials before
+anything is transmitted; the sanitizer is documented as best-effort, not a
+guarantee — see the "Stored-content prompt injection" and reranking notes in
+`SECURITY.md` for the exact caveats. The embedding path (1) sends full page
+text to the provider's embedding endpoint and is not sanitized the same way,
+so it is the path to leave on `local` when stored content must not leave the
+server.
 
 ## Is this "personal data" under GDPR?
 
