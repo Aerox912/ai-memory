@@ -8047,6 +8047,13 @@ model = "gpt-5"
     /// `--apply` without `--capture-assistant` — exactly what `ai-memory run`
     /// auto-wire issues — must PRESERVE a user's existing assistant-capture
     /// opt-in, not silently strip it.
+    ///
+    /// Unix-gated: `--capture-assistant` is baked onto the native Stop command on
+    /// POSIX-native platforms; the Windows Claude command form does not carry the
+    /// flag in its rendered JSON, so there is nothing to drop or preserve there.
+    /// The preserve logic itself (`baked_capture_assistant`) has no platform
+    /// branch.
+    #[cfg(unix)]
     #[test]
     fn a_bare_reapply_preserves_an_existing_capture_assistant_opt_in() {
         let home = TempDir::new().unwrap();

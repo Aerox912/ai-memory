@@ -712,6 +712,11 @@ mod tests {
     /// workstream path encoder: a Claude transcript planted under the actual
     /// `~/.claude/projects/<enc-cwd>/` layout for this cwd is discovered, and a
     /// transcript for a different cwd is ignored.
+    ///
+    /// Unix-gated: the fixture uses a POSIX-encoded projects path; cross-platform
+    /// native-store discovery is owned and tested by `ai-memory-workstream`. The
+    /// pure selection/cap tests above run on every platform.
+    #[cfg(unix)]
     #[tokio::test]
     async fn collect_local_sessions_finds_a_planted_claude_session_for_this_cwd() {
         let home = tempfile::tempdir().unwrap();

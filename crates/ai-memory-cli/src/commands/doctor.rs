@@ -449,6 +449,11 @@ mod tests {
     /// a foreign-cwd transcript must be ignored. This is the detector guard the
     /// pure verdict tests cannot give, since the encoding lives in the
     /// workstream crate.
+    ///
+    /// Unix-gated: the fixture plants a POSIX-encoded `~/.claude/projects/<cwd>`
+    /// path, and cross-platform native-store path handling is owned and tested by
+    /// `ai-memory-workstream`. The pure aggregation tests above run everywhere.
+    #[cfg(unix)]
     #[tokio::test]
     async fn scan_local_detects_a_planted_claude_session_for_this_cwd() {
         let home = tempfile::tempdir().unwrap();
