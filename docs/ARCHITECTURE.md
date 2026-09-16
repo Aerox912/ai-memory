@@ -484,6 +484,7 @@ move-project         move-session         uninstall
 auth                 user                 completions
 handoffs             purge-session        compact
 api-key              export-okf           message
+doctor
 ```
 
 Run `ai-memory --help` for the full tree.

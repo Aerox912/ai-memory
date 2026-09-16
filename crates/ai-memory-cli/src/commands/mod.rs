@@ -20,6 +20,7 @@ pub mod continue_session;
 pub mod curator;
 pub mod data_purge;
 pub mod delete_page;
+pub mod doctor;
 pub mod embed;
 pub mod export_okf;
 pub mod finalize_session;

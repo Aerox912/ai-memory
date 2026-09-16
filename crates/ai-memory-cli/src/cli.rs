@@ -33,6 +33,10 @@ pub enum Command {
     Init(InitArgs),
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
+    /// Check capture coverage: compare local harness session stores for this
+    /// project against what the server captured, and warn when a harness ran
+    /// here recently but has no captured sessions (its hook is likely missing).
+    Doctor(DoctorArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
     /// Native arguments are forwarded except exact wrapper flags such as
     /// `--yolo` and `--fresh`.
@@ -1359,6 +1363,24 @@ pub struct InitArgs {
 /// Arguments for `status`.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
+    /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `doctor`.
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Workspace name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// A local harness session counts as "recent" if it was updated within
+    /// this many days. Set to 0 to consider every on-disk session recent.
+    #[arg(long, default_value_t = 30)]
+    pub since_days: u32,
     /// Emit the report as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,

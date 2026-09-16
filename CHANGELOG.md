@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New `ai-memory doctor` command: a capture-coverage check that, for the current
+  project, compares every known harness's local (on-disk) native session store
+  against what the server actually captured (`GET /admin/sessions/by-agent`) and
+  warns when a harness ran here recently but has zero captured sessions — the
+  silent "its hook was never installed" gap — printing the exact
+  `install-hooks --agent <name> --apply` to fix it. Read-only on the local side;
+  supports `--json`, `--since-days`, and explicit `--workspace`/`--project`.
 - New task-oriented `docs/cookbook.md` cheat sheet ("I want to do X" → how:
   recall, durable rules, importing a knowledge base and reading a specific
   document, two agents working together), linked from the README docs table, to

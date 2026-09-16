@@ -1027,7 +1027,7 @@ fn write_private(path: &Path, content: &[u8]) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-fn native_home(config: &Config) -> Option<PathBuf> {
+pub(crate) fn native_home(config: &Config) -> Option<PathBuf> {
     config
         .home_dir
         .as_deref()

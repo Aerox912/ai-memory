@@ -93,6 +93,7 @@ Most people never need these — the agent does it — but they exist:
 
 ```bash
 ai-memory status                     # counts, paths, health
+ai-memory doctor                     # is every harness that ran here captured?
 ai-memory write-page …               # save a durable page
 ai-memory handoffs                   # list open handoffs for the project
 ai-memory message list               # cross-project inbox
@@ -104,6 +105,11 @@ ai-memory serve                      # run the server
 
 - **Nothing is being remembered**: hooks may not be installed — `ai-memory
   install-hooks --agent <your-agent> --apply`, and check `ai-memory status`.
+- **Only *some* agents are being remembered**: run `ai-memory doctor`. It lists
+  every harness that has local sessions in this project and whether the server
+  captured them — so a harness you rotated in without installing its hook (a
+  silent gap: it keeps its own local history while capturing nothing) shows up
+  as a warning with the exact `install-hooks` command to fix it.
 - **A search misses something you saved**: confirm the scope — memory is
   per-project; a page saved in project A is not returned in project B unless it
   was written to the global scope or you query with an explicit scope.
