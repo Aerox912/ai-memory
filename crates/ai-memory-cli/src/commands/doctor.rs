@@ -36,7 +36,7 @@ use crate::http_client::{ServerEndpoint, get_json};
 /// an [`AgentKind`] (Kiro v2/v3, OpenCode v1/v2) are both scanned — they read
 /// distinct on-disk stores — and their local counts fold together under the
 /// one agent kind the server records.
-const SCANNED_HARNESSES: &[ManagedHarness] = &[
+pub(crate) const SCANNED_HARNESSES: &[ManagedHarness] = &[
     ManagedHarness::Claude,
     ManagedHarness::Codex,
     ManagedHarness::OpenCode,
@@ -236,7 +236,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         super::run::native_home(config).context("locating the local harness session stores")?;
 
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
-    let captured: BTreeMap<String, u64> = get_json::<ByAgentResponse>(
+    let captured: BTreeMap<String, u64> = match get_json::<ByAgentResponse>(
         &ep,
         "/admin/sessions/by-agent",
         &[
@@ -245,13 +245,22 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         ],
     )
     .await
-    .with_context(|| {
-        format!("asking the server for captured session counts for {workspace}/{project}")
-    })?
-    .by_agent
-    .into_iter()
-    .map(|c| (c.agent, c.sessions))
-    .collect();
+    {
+        Ok(response) => response
+            .by_agent
+            .into_iter()
+            .map(|c| (c.agent, c.sessions))
+            .collect(),
+        // A project that has never been captured into does not exist
+        // server-side yet (404) — that is "nothing captured", not an error, so
+        // every local harness correctly reads as uncaptured.
+        Err(error) if super::is_scope_not_found(&error) => BTreeMap::new(),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("asking the server for captured session counts for {workspace}/{project}")
+            });
+        }
+    };
 
     let local = scan_local(&home, &cwd, args.since_days).await;
     let rows = build_rows(&local, &captured);

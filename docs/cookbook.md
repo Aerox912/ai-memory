@@ -94,6 +94,7 @@ Most people never need these — the agent does it — but they exist:
 ```bash
 ai-memory status                     # counts, paths, health
 ai-memory doctor                     # is every harness that ran here captured?
+ai-memory backfill                   # import prior local history into an empty store
 ai-memory write-page …               # save a durable page
 ai-memory handoffs                   # list open handoffs for the project
 ai-memory message list               # cross-project inbox
@@ -110,6 +111,13 @@ ai-memory serve                      # run the server
   captured them — so a harness you rotated in without installing its hook (a
   silent gap: it keeps its own local history while capturing nothing) shows up
   as a warning with the exact `install-hooks` command to fix it.
+- **I just installed hooks in a project I've worked in for a while**: the first
+  time you open the project after installing, ai-memory imports your existing
+  local session history once (bounded, sanitized on the server, only into an
+  empty store) so it isn't starting from nothing. It runs automatically in the
+  background; you can trigger or preview it yourself with `ai-memory backfill`
+  (`--dry-run` to see what it would import), or turn it off with
+  `AI_MEMORY_BACKFILL_ON_START=false`.
 - **A search misses something you saved**: confirm the scope — memory is
   per-project; a page saved in project A is not returned in project B unless it
   was written to the global scope or you query with an explicit scope.

@@ -1,9 +1,32 @@
-# Design proposal: boot-time backfill of pre-hook local history
+# Design: boot-time backfill of pre-hook local history
 
-**Status: proposal for review — not implemented.** This is the design pass for the
-"pre-load existing session history when the store is new" idea. It adds a new default-on
-capture behavior and touches the trust boundary (retroactive untrusted text enters the
-store), so it is deliberately separated from implementation.
+**Status: implemented on `release/2.3`.** This is the design pass for the "pre-load
+existing session history when the store is new" idea; it adds a default-on capture
+behavior and touches the trust boundary (retroactive untrusted text enters the store).
+
+**As-built note.** Two deviations from the approved plan, both verified by a live smoke:
+
+1. **Ingest path is B, not A.** The plan recommended path A (reuse the managed-workstream
+   begin → link → finish endpoints, for the incremental cursor). A live smoke proved A
+   populates the *workstream continuity ledger*, not the `sessions`/`observations`/`pages`
+   pipeline — `observation` count stayed zero after import, so the history was not
+   recall-able via `memory_query`. The implementation therefore **replays each transcript
+   through `/hook/batch`** (the same ingress live capture uses, as the companion importer
+   does): `export_transcript` normalizes the native transcript, then each event is posted
+   as a session-start / `user-prompt` / backfill-extension observation, attributed to the
+   original harness + native session id. The re-run smoke confirmed
+   `sessions 0→1, observations 0→5, pages 0→1`, by-agent `claude-code: 1`, and a correct
+   no-op on the second run.
+2. **No new lease table (V65 dropped).** "Import exactly once" is held by the emptiness
+   gate (only bootstrap a project with zero captured sessions) plus a per-checkout local
+   sentinel (`<data_dir>/backfill-state/<hash(cwd)>`) that stops the SessionStart trigger
+   re-spawning. Live hook capture (install-time forward) and backfill (before-install
+   history) do not overlap, so there is no double-capture to reconcile.
+
+The automatic path runs detached and silent (like Claude Code's own auto-memory); the
+`📼 imported N session(s)` summary is shown on a **manual** `ai-memory backfill` only.
+Surfacing the count in the next session's on-start context is a possible follow-up
+(§ "Notice delivery" describes the delivery path it would reuse).
 
 ## Problem
 

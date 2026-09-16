@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Boot-time backfill of pre-hook local history, on by default. When a project's
+  ai-memory store is brand new (empty), the SessionStart hook triggers a
+  one-time, bounded import of that project's existing local harness transcripts
+  so installing hooks mid-project no longer starts amnesiac about the very
+  session you are resuming. It replays each local transcript through `/hook` —
+  the same ingress live capture uses — so the history becomes real sessions and
+  observations that consolidate into pages and are searchable via `memory_query`,
+  **sanitized and bounded on the server exactly like live capture** and
+  attributed to the original harness. It only ever bootstraps an empty project
+  (never overwrites an established one; live capture from install-time forward
+  and backfill of before-install history do not overlap), is hard-capped (newest
+  25 sessions, 50k events), and runs detached so session start is never blocked.
+  New `ai-memory backfill`
+  subcommand runs it by hand (`--dry-run`, `--force`, `--session`, `--json`).
+  Opt out with `AI_MEMORY_BACKFILL_ON_START=false` / `backfill_on_start = false`.
 - New `ai-memory doctor` command: a capture-coverage check that, for the current
   project, compares every known harness's local (on-disk) native session store
   against what the server actually captured (`GET /admin/sessions/by-agent`) and

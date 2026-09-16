@@ -264,6 +264,15 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
+    /// On by default. When the project's ai-memory store is brand new (empty),
+    /// the SessionStart hook triggers a one-time, bounded import of this
+    /// project's existing local harness session history so installing hooks
+    /// mid-project does not start amnesiac. The import is read-only on the local
+    /// side, sanitized on the server exactly like live capture, and only ever
+    /// bootstraps an empty project (never overwrites an established one). Turn
+    /// off with `AI_MEMORY_BACKFILL_ON_START=false` or `backfill_on_start =
+    /// false`; `ai-memory backfill` remains available to run it by hand.
+    pub backfill_on_start: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -718,6 +727,7 @@ impl Default for Config {
             llm_fallback_configs: Vec::new(),
             consolidate_on_session_end: false,
             capture_assistant: false,
+            backfill_on_start: true,
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,

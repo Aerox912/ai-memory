@@ -37,6 +37,11 @@ pub enum Command {
     /// project against what the server captured, and warn when a harness ran
     /// here recently but has no captured sessions (its hook is likely missing).
     Doctor(DoctorArgs),
+    /// One-time import of this project's existing local harness session history
+    /// into a brand-new (empty) ai-memory store, so installing hooks
+    /// mid-project doesn't start amnesiac. No-op once the store has any
+    /// sessions unless `--force`.
+    Backfill(BackfillArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
     /// Native arguments are forwarded except exact wrapper flags such as
     /// `--yolo` and `--fresh`.
@@ -1366,6 +1371,43 @@ pub struct StatusArgs {
     /// Emit the report as JSON instead of human-readable text.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `backfill`.
+#[derive(Debug, Args)]
+pub struct BackfillArgs {
+    /// Workspace name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Project name. Defaults to the current project's resolved scope.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Import only this one harness-native session id instead of every local
+    /// session for the project.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Import even when the store already has sessions. Off by default: the
+    /// automatic path is a one-time bootstrap of an empty project only.
+    #[arg(long)]
+    pub force: bool,
+    /// Report what would be imported without importing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Import at most this many of the newest local sessions.
+    #[arg(long, default_value_t = 25)]
+    pub max_sessions: usize,
+    /// Emit the report as JSON instead of human-readable text.
+    #[arg(long)]
+    pub json: bool,
+    /// Suppress the human summary line (used by the automatic SessionStart
+    /// trigger, which runs detached).
+    #[arg(long)]
+    pub quiet: bool,
+    /// Internal: this run was spawned by the SessionStart trigger. Honors the
+    /// `backfill_on_start` opt-out and records that the automatic bootstrap has
+    /// been attempted for this checkout. Not for interactive use.
+    #[arg(long, hide = true)]
+    pub auto: bool,
 }
 
 /// Arguments for `doctor`.

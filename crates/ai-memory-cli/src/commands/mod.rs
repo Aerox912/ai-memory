@@ -4,12 +4,26 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 
+/// Whether a server error is a no-create scope lookup missing its
+/// `(workspace, project)` — a `404`. Read/count endpoints fail closed on an
+/// unknown scope (invariant: reads never create), so a project that has never
+/// been written to answers `404` rather than "empty". Callers that ask "does
+/// this project have anything?" must treat that as **nothing there**, not a
+/// hard error — otherwise the brand-new-project case (exactly the one
+/// `doctor` and `backfill` exist for) fails on itself.
+pub(crate) fn is_scope_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::http_client::ServerResponseError>()
+        .is_some_and(|response| response.status() == reqwest::StatusCode::NOT_FOUND)
+}
+
 pub mod api_key;
 pub mod apply_shared;
 pub mod audit_contamination;
 pub mod auth;
 pub mod auto_improve;
 pub mod auto_improve_report;
+pub mod backfill;
 pub mod backup;
 pub mod bootstrap;
 pub mod checkpoints;
