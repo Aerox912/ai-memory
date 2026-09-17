@@ -301,7 +301,10 @@ paths or invert to allowlist mode.
 
 The full model is in [`docs/security.md`](docs/security.md),
 [`docs/users.md`](docs/users.md), and
-[`docs/https-via-proxy.md`](docs/https-via-proxy.md).
+[`docs/https-via-proxy.md`](docs/https-via-proxy.md). For data-flow,
+identity/SSO, and offline-install questions specifically, see
+[`DATA_HANDLING.md`](DATA_HANDLING.md), [`docs/sso.md`](docs/sso.md), and
+[`docs/airgapped-install.md`](docs/airgapped-install.md).
 
 ## LLM providers
 
@@ -358,6 +361,9 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) | Auto-improvement design notes: Hermes-inspired scheduled review, auto-approval default, manual review opt-in, pending proposal storage, and curator work. |
 | [`docs/companion-crates.md`](docs/companion-crates.md) | Boundary and implementation plan for optional companion projects, including the standalone importer at [`companions/ai-memory-importer`](companions/ai-memory-importer), without widening core ai-memory. |
 | [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md) | Empirical notes behind the recommended LLM defaults. |
+| [`DATA_HANDLING.md`](DATA_HANDLING.md) | **Data-flow reference for security/legal review.** What's stored, what's local-only, the two opt-in paths that send data externally, and how deletion/retention work. |
+| [`docs/sso.md`](docs/sso.md) | Enterprise identity: the existing OIDC device-auth flow, what it does and doesn't cover, and how to front the server with an OIDC-aware gateway. |
+| [`docs/airgapped-install.md`](docs/airgapped-install.md) | Offline/air-gapped install: self-contained build, checksum-verified release binaries, and the offline path for local embedding models. |
 | [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md) | Proposed opt-in fallback-chain design for transient LLM-provider failures; not yet a supported configuration surface. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
 | [`docs/design-decisions.md`](docs/design-decisions.md) | The full v1 spec. |
