@@ -940,6 +940,16 @@ async fn build_okf_bundle_file(
                 if name == "index.md" || name == "log.md" {
                     continue; // regenerated / not adopted
                 }
+                // A rotated event ledger is the same raw hook capture as the
+                // `log.md` above, only past a month boundary — it carries no
+                // frontmatter, so the conformance gate below failed the whole
+                // export for every project that ever captured an observation
+                // (#748). The check is content-gated exactly like the
+                // migration scan's (#669), so a prose page that happens to be
+                // named `log-2026-09.md` still ships and still has to conform.
+                if ai_memory_wiki::is_rotated_event_ledger(&path) {
+                    continue;
+                }
                 let raw = std::fs::read_to_string(&path)?;
                 let fm = ai_memory_wiki::parse(&raw)
                     .map(|m| m.frontmatter)
@@ -8566,15 +8576,89 @@ mod tests {
         );
     }
 
-    /// A bundle with a non-conformant page must fail the export rather
-    /// than ship something a strict reader rejects.
+    /// The project root of any store that ever captured an observation
+    /// holds a rotated hook ledger (`log-YYYY-MM.md`, no frontmatter).
+    /// It is raw capture, not a concept file: the export drops it the
+    /// way it already drops `log.md`, instead of failing the whole
+    /// bundle on the conformance gate (#748). Both shapes are covered —
+    /// a bare ledger and one the OKF migration stamped frontmatter onto.
     #[tokio::test]
-    async fn export_okf_refuses_a_nonconformant_page() {
+    async fn export_okf_skips_the_rotated_event_ledger() {
         let (tmp, router) = read_page_test_router();
         post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
-        // Fabricate a pre-migration file next to it. The wiki root also
-        // holds `.git`; read_dir order is arbitrary, so select the
-        // UUID-named scope dirs explicitly.
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::write(
+            proj_dir.join("log-2026-08.md"),
+            "## [2026-08-01T00:00:00Z] session_start | opened scratch\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_dir.join("log-2026-07.md"),
+            "---\ntype: Note\n---\n\n## [2026-07-01T00:00:00Z] session_start | opened scratch\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "notes/a.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("log-")),
+            "raw event ledgers must not ship: {names:?}"
+        );
+    }
+
+    /// Content gate control for #748: the ledger carve-out keys off the
+    /// body, so an ordinary page named like a ledger is still a page —
+    /// it ships in the bundle, and it still has to declare a `type`.
+    #[tokio::test]
+    async fn export_okf_still_conforms_a_prose_page_named_like_a_ledger() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::write(
+            proj_dir.join("log-2026-09.md"),
+            "---\ntitle: September log\n---\n\nProse about last month, not hook output.\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The single project scope dir under a freshly seeded `scratch`
+    /// store. The wiki root also holds `.git`, and `read_dir` order is
+    /// arbitrary, so the UUID-named scope dirs are selected explicitly.
+    fn scratch_project_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
         let uuid_dir = |parent: &std::path::Path| {
             std::fs::read_dir(parent)
                 .unwrap()
@@ -8583,8 +8667,17 @@ mod tests {
                 .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
                 .expect("scope dir")
         };
-        let ws_dir = uuid_dir(&tmp.path().join("wiki"));
-        let proj_dir = uuid_dir(&ws_dir);
+        uuid_dir(&uuid_dir(&data_dir.join("wiki")))
+    }
+
+    /// A bundle with a non-conformant page must fail the export rather
+    /// than ship something a strict reader rejects.
+    #[tokio::test]
+    async fn export_okf_refuses_a_nonconformant_page() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        // Fabricate a pre-migration file next to it.
+        let proj_dir = scratch_project_dir(tmp.path());
         std::fs::write(
             proj_dir.join("notes/legacy.md"),
             "---\ntitle: Legacy\n---\nno type here",

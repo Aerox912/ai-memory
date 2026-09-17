@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `export-okf` no longer refuses to export any project that has captured an
+  observation. The bundle walk skipped the reserved names `index.md` and
+  `log.md`, but not the rotated hook ledger `log-YYYY-MM.md` the server itself
+  appends to — which carries no frontmatter, so `okf::is_conformant` failed it
+  and aborted the whole export with `422 page log-YYYY-MM.md is not
+  OKF-conformant; run the server once to migrate before exporting`. Migrating
+  could not help: the OKF migration deliberately skips ledgers (#669), so the
+  file the export demanded be conformed stays frontmatter-less forever. The
+  ledger is raw capture rather than a concept file, so it is now dropped from
+  the bundle exactly as `log.md` already was, sharing the migration scan's
+  content gate — a prose page that happens to be named `log-2026-09.md` still
+  ships and still has to declare a `type`. (#748)
+
 ## [2.3.0] - 2026-09-16
 
 ### Added
