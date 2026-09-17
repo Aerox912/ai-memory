@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1] - 2026-09-17
+
 ### Added
 - `DATA_HANDLING.md`, `docs/sso.md`, and `docs/airgapped-install.md`,
   consolidating existing data-flow, OIDC, and offline-install facts from
@@ -5818,7 +5820,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.1
 [2.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.0
 [2.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.2
 [2.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.1
