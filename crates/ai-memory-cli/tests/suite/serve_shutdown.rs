@@ -53,6 +53,12 @@ mod slow {
             .arg("sh")
             .arg(BIN)
             .env("AI_MEMORY_DATA_DIR", data_dir.path())
+            // Hermetic, the way the other two server-spawning suites already
+            // are: the 2.0 embedder default would start a background model
+            // download on this server, and an ambient RUST_LOG below info
+            // would delete the very line this test waits a minute for.
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+            .env("RUST_LOG", "info")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
