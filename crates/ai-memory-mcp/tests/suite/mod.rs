@@ -16,6 +16,7 @@ mod admin_read_page;
 mod admin_rename;
 mod admin_status_search;
 mod admin_write_page;
+mod agent_messages_briefing;
 mod agent_messages_tools;
 mod autoscope_multiuser;
 mod handoff_admission;
