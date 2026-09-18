@@ -60,6 +60,33 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 | Platform-native | Claude Code auto-memory | Zero setup, on by default | Machine-local, **no sync**, single-agent, repo-scoped, no tool-lifecycle capture, no team |
 | **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | Below the reranking leaders on raw R@5; LLM-optional means no VLM fact-extraction sophistication |
 
+## Maturity and maintenance
+
+This is a crowded, fast-moving field, and it is only fair to say so: **every tool
+compared here is actively maintained** (as of 2026-09-18, all had commits within
+the last ~10 days — none stale, none archived). Raw GitHub popularity, though,
+tracks funding and app-developer reach more than coding-agent fitness — the
+star leaders are the app-personalization and hosted-context players (a different
+buyer), while the tools closest to ai-memory's file-first, self-hosted,
+coding-continuity niche are smaller by design.
+
+| Project | Stars (~) | Latest release | Maintenance |
+|---|---|---|---|
+| Mem0 | 65.6k | 2026-09-18 | active |
+| OpenViking | 38.0k | 2026-09-14 | active |
+| Zep/Graphiti | 31.0k | 2026-09-08 | active |
+| Cognee | 30.8k | 2026-09-15 | active |
+| Supermemory | 30.1k | 2026-08-17 | active |
+| agentmemory | 28.6k | 2026-08-16 | active |
+| Letta | 24.8k | 2026-05-14 | active (releases lag code) |
+| Hindsight | 23.9k | 2026-09-14 | active |
+| Honcho | 7.2k | tag v3.2.0 | active |
+| basic-memory | 4.0k | 2026-08-25 | active |
+| mcp-memory-service | 2.0k | 2026-09-14 | active |
+| LangMem | 1.7k | PyPI-only | active |
+
+Full figures, sources, and per-tool caveats: [`research-2026-landscape.md`](research-2026-landscape.md#popularity-and-maintenance-signal-as-of-2026-09-18).
+
 ## How the field validates the approach
 
 The strongest endorsement of ai-memory's design is that others arrived at its

@@ -252,6 +252,41 @@ transcripts, not *coding-project* recall — a different task we are not competi
 on. Per the research-doc convention, Honcho has no standalone deep-dive; this
 section is its record.
 
+### Popularity and maintenance signal (as of 2026-09-18)
+
+None of the tracked competitors is stale or abandoned — every repo below had a
+commit within the last ~10 days and grades **ACTIVE**. Star counts are GitHub's
+raw figures (approximate; the biggest few were sanity-checked against prior
+research). This is a healthy, crowded, fast-moving field: "we picked a dead
+space" is not a claim we can make, and none of these can be dismissed as
+unmaintained.
+
+| Project | Stars (~) | Last commit | Latest release | Status |
+|---|---|---|---|---|
+| Mem0 | 65.6k | 2026-09-18 | openclaw-v1.2.0 (2026-09-18) | ACTIVE |
+| OpenViking | 38.0k | 2026-09-18 | v0.4.20 (2026-09-14) | ACTIVE |
+| Zep/Graphiti | 31.0k | 2026-09-17 | v0.30.2 (2026-09-08) | ACTIVE |
+| Cognee | 30.8k | 2026-09-18 | v1.5.4rc1 (2026-09-15) | ACTIVE |
+| Supermemory | 30.1k | 2026-09-18 | server-v0.0.8 (2026-08-17) | ACTIVE |
+| agentmemory | 28.6k | 2026-09-14 | v0.9.29 (2026-08-16) | ACTIVE |
+| Letta | 24.8k | 2026-09-10 | 0.16.8 (2026-05-14) | ACTIVE (releases lag code) |
+| Hindsight | 23.9k | 2026-09-18 | v0.10.0 (2026-09-14) | ACTIVE |
+| Honcho | 7.2k | 2026-09-18 | tag v3.2.0 (no GH release) | ACTIVE |
+| basic-memory | 4.0k | 2026-09-16 | v0.23.2 (2026-08-25) | ACTIVE |
+| mcp-memory-service | 2.0k | 2026-09-18 | v11.12.0 (2026-09-14) | ACTIVE |
+| LangMem | 1.7k | 2026-09-09 | none (PyPI-versioned) | ACTIVE |
+
+Reading it honestly: raw stars track **funding and app-developer reach**, not
+coding-agent fitness — the leaders (Mem0, OpenViking, the KG/cloud entrants) are
+the app-personalization and hosted-context players, a different buyer from ours
+(see §5 and [`competitive-parity.md`](competitive-parity.md)). Our true
+architectural siblings sit lower on the star curve (basic-memory ~4.0k,
+mcp-memory-service ~2.0k) precisely because the self-hosted, file-first,
+coding-continuity niche is smaller and less VC-amplified — that is the segment we
+lead, not the whole chart. Two mild flags: Letta ships commits actively but its
+last *tagged* release is from May 2026 (formal releases lag the code), and
+LangMem/Honcho publish no GitHub *releases* (PyPI/tag-only versioning).
+
 ## 4. Research developments worth knowing
 
 - **"Rethinking How to Remember: Beyond Atomic Facts in Lifelong LLM
