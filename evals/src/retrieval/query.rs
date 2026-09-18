@@ -3,6 +3,8 @@
 //! `workspace` + `project` args scope each call to one question's
 //! haystack (the documented pattern for static MCP clients).
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
@@ -18,6 +20,25 @@ pub struct Retrieved {
     pub session_uuid: Option<uuid::Uuid>,
 }
 
+/// Outcome of one `memory_query` call: the ranked hits plus the two
+/// R2 observability signals — how long the round trip took and how much
+/// context the agent would have to read to consume the result.
+#[derive(Debug, Clone)]
+pub struct QueryOutcome {
+    /// Flattened ranked session attributions (index 0 = best).
+    pub retrieved: Vec<Retrieved>,
+    /// Wall-clock of the `memory_query` MCP round trip (request send →
+    /// response parsed).
+    pub latency: Duration,
+    /// Estimated tokens an agent would ingest from this result: the total
+    /// character count of every returned hit's `title` + `snippet`
+    /// (pages and raw observations), divided by 4 (the documented
+    /// chars/4 heuristic). The snippet is exactly what `memory_query`
+    /// puts in front of the agent, so this is the context cost of the
+    /// retrieval, not of the underlying full pages.
+    pub context_tokens: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct QueryResponse {
     #[serde(default)]
@@ -29,11 +50,27 @@ struct QueryResponse {
 #[derive(Debug, Deserialize)]
 struct PageHitLite {
     path: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    snippet: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawHitLite {
     session_id: uuid::Uuid,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    snippet: String,
+}
+
+/// Divisor for the chars/4 token estimator (see [`QueryOutcome::context_tokens`]).
+const CHARS_PER_TOKEN: usize = 4;
+
+/// chars/4 token estimate for one string (Unicode scalar count).
+fn estimate_tokens(chars: usize) -> usize {
+    chars.div_ceil(CHARS_PER_TOKEN)
 }
 
 /// Call `memory_query` and flatten the response into ranked session
@@ -46,21 +83,27 @@ pub async fn memory_query(
     project: &str,
     query: &str,
     limit: usize,
-) -> Result<Vec<Retrieved>> {
+    extra_args: &serde_json::Map<String, serde_json::Value>,
+) -> Result<QueryOutcome> {
+    // Extra config-supplied args first, then the scoping/limit the harness
+    // controls, so a config can A/B a `memory_query` knob (e.g. a future
+    // `pin_first`/`include_superseded`) without ever redirecting the query
+    // off its question's private haystack.
+    let mut arguments = extra_args.clone();
+    arguments.insert("query".into(), json!(query));
+    arguments.insert("workspace".into(), json!(workspace));
+    arguments.insert("project".into(), json!(project));
+    arguments.insert("limit".into(), json!(limit));
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
             "name": "memory_query",
-            "arguments": {
-                "query": query,
-                "workspace": workspace,
-                "project": project,
-                "limit": limit,
-            }
+            "arguments": arguments,
         }
     });
+    let started = Instant::now();
     let resp = client
         .post(format!("{base_url}/mcp"))
         .bearer_auth(EVAL_AUTH_TOKEN)
@@ -120,22 +163,32 @@ pub async fn memory_query(
         .ok_or_else(|| anyhow::anyhow!("memory_query returned no text content: {result}"))?;
     let parsed: QueryResponse =
         serde_json::from_str(text).with_context(|| format!("parsing memory_query JSON: {text}"))?;
-    Ok(flatten(parsed))
+    let (retrieved, context_tokens) = flatten(parsed);
+    Ok(QueryOutcome {
+        retrieved,
+        latency: started.elapsed(),
+        context_tokens,
+    })
 }
 
-fn flatten(resp: QueryResponse) -> Vec<Retrieved> {
+/// Flatten pages + raw hits into ranked session attributions, and sum the
+/// context-token estimate over every hit's `title` + `snippet`.
+fn flatten(resp: QueryResponse) -> (Vec<Retrieved>, usize) {
     let mut out = Vec::new();
+    let mut chars = 0usize;
     for hit in resp.hits {
+        chars += hit.title.chars().count() + hit.snippet.chars().count();
         out.push(Retrieved {
             session_uuid: session_uuid_from_path(&hit.path),
         });
     }
     for hit in resp.raw_hits {
+        chars += hit.title.chars().count() + hit.snippet.chars().count();
         out.push(Retrieved {
             session_uuid: Some(hit.session_id),
         });
     }
-    out
+    (out, estimate_tokens(chars))
 }
 
 /// `sessions/<uuid>.md` → the owning session; anything else → None.
@@ -166,12 +219,48 @@ mod tests {
         let resp = QueryResponse {
             hits: vec![PageHitLite {
                 path: format!("sessions/{a}.md"),
+                title: String::new(),
+                snippet: String::new(),
             }],
-            raw_hits: vec![RawHitLite { session_id: b }],
+            raw_hits: vec![RawHitLite {
+                session_id: b,
+                title: String::new(),
+                snippet: String::new(),
+            }],
         };
-        let flat = flatten(resp);
+        let (flat, _) = flatten(resp);
         assert_eq!(flat.len(), 2);
         assert_eq!(flat[0].session_uuid, Some(a));
         assert_eq!(flat[1].session_uuid, Some(b));
+    }
+
+    #[test]
+    fn context_tokens_sum_title_and_snippet_over_all_hits() {
+        let a = uuid::Uuid::now_v7();
+        let b = uuid::Uuid::now_v7();
+        let resp = QueryResponse {
+            // 4 + 4 = 8 chars → 2 tokens
+            hits: vec![PageHitLite {
+                path: format!("sessions/{a}.md"),
+                title: "abcd".into(),
+                snippet: "efgh".into(),
+            }],
+            // 4 + 4 = 8 chars → +2 tokens
+            raw_hits: vec![RawHitLite {
+                session_id: b,
+                title: "ijkl".into(),
+                snippet: "mnop".into(),
+            }],
+        };
+        let (_, tokens) = flatten(resp);
+        assert_eq!(tokens, 4);
+    }
+
+    #[test]
+    fn token_estimate_rounds_up() {
+        // 5 chars / 4 = 1.25 → ceil 2
+        assert_eq!(estimate_tokens(5), 2);
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(8), 2);
     }
 }
