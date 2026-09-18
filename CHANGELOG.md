@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `memory_query` gained an opt-in `include_superseded` argument (default false;
+  targets the 2.4 line). When set, project and explicit-scope searches also
+  return superseded (older) page versions across the FTS/entity/vector/graph
+  streams, each hit labelled `superseded: true` so callers can tell historical
+  versions from the current one; the current version is never marked. Default-off
+  behaviour is byte-identical to the previous latest-only retrieval, and
+  `global=true` and `as_of` time-travel are unaffected (#773).
+
 ### Fixed
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can

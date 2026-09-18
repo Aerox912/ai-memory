@@ -22,6 +22,7 @@ mod autoscope_multiuser;
 mod handoff_admission;
 mod handoff_identity;
 mod mcp_stateless_http;
+mod query_superseded;
 mod retrieval_via_tools;
 mod slot_identity;
 mod stress_autoscope;

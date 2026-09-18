@@ -203,7 +203,10 @@ developer, user, and canonical project instructions.\n\
   reserved `_global` scope; treat them as context that applies to \
   every project. Expired pages are hidden by default; use \
   `include_expired=true` only when the user explicitly wants to inspect \
-  expired historical memory. Use `explain=true` only when diagnosing \
+  expired historical memory. Superseded (older) page versions are hidden \
+  by default; pass `include_superseded=true` when the user wants a page's \
+  history or an answer a later edit removed — each older hit is labelled \
+  `superseded: true`. Use `explain=true` only when diagnosing \
   project/scopes ranking; it adds score provenance, while global search \
   reports only its distinct FTS stream.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
@@ -548,6 +551,13 @@ struct QueryArgs {
     /// default; they are deleted by the next forget sweep). Default false.
     #[serde(default)]
     include_expired: Option<bool>,
+    /// Also return superseded (older) page versions, not just the current
+    /// one. Each superseded hit is labelled `superseded: true` so you can
+    /// tell it from the live version. Use when you need the history of a
+    /// page or an answer that a later edit removed. Ignored on `global`
+    /// search and folded into `as_of` time-travel. Default false.
+    #[serde(default)]
+    include_superseded: Option<bool>,
     /// Attach `score_details` to project/scopes hits: per-stream ranks
     /// (FTS5, entity, vector, graph), raw scores, and RRF contributions, plus a
     /// top-level `streams_active` list. A `global=true` query uses a
@@ -623,6 +633,7 @@ struct ProjectSearchOptions<'a> {
     limit: usize,
     include_expired: bool,
     explain: bool,
+    include_superseded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1765,6 +1776,7 @@ impl AiMemoryServer {
                     dim,
                     options.limit,
                     expiry_cutoff,
+                    options.include_superseded,
                 )
                 .await?
                 .into_iter()
@@ -1782,6 +1794,7 @@ impl AiMemoryServer {
                     dim,
                     options.limit,
                     expiry_cutoff,
+                    options.include_superseded,
                 )
                 .await?
                 .into_iter()
@@ -2023,6 +2036,7 @@ impl AiMemoryServer {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
+        let include_superseded = args.include_superseded.unwrap_or(false);
         let explain = args.explain.unwrap_or(false);
         // A repo that opted into `[recall] default_global` (published on the
         // ActiveProject by the hook) makes a query with NO explicit scoping
@@ -2154,6 +2168,7 @@ impl AiMemoryServer {
                             limit: candidate_limit,
                             include_expired,
                             explain,
+                            include_superseded,
                         },
                     )
                     .await
@@ -2197,6 +2212,7 @@ impl AiMemoryServer {
                     limit: candidate_limit,
                     include_expired,
                     explain,
+                    include_superseded,
                 },
             )
             .await
@@ -2281,6 +2297,7 @@ impl AiMemoryServer {
                                     limit,
                                     include_expired,
                                     explain,
+                                    include_superseded,
                                 },
                             )
                             .await
@@ -5272,6 +5289,7 @@ mod tests {
                         title: format!("Page {idx}"),
                         snippet: format!("candidate {idx}"),
                         rank: idx as f64,
+                        superseded: false,
                     },
                     Some(ai_memory_store::SearchExplain::default()),
                 )
@@ -5468,6 +5486,7 @@ mod tests {
                         ],
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
                         explain: Some(true),
                         as_of: None,
                     }),
@@ -5499,6 +5518,7 @@ mod tests {
                         scopes: Vec::new(),
                         global: Some(true),
                         include_expired: None,
+                        include_superseded: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -7226,6 +7246,7 @@ mod tests {
             workspace: Some("default".into()),
             global,
             include_expired: None,
+            include_superseded: None,
             explain: Some(true),
             as_of,
         };
@@ -7264,6 +7285,7 @@ mod tests {
                     workspace: Some("default".into()),
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: Some(true),
                     as_of: Some(jiff::Timestamp::now().to_string()),
                 }),
@@ -7333,6 +7355,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7358,6 +7381,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: Some(true),
                     as_of: None,
                 }),
@@ -7451,6 +7475,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
                         explain: Some(true),
                         as_of: None,
                     }),
@@ -7538,6 +7563,7 @@ mod tests {
             workspace: workspace.map(str::to_string),
             global: None,
             include_expired: None,
+            include_superseded: None,
             explain: None,
             as_of: None,
         };
@@ -7615,6 +7641,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7743,6 +7770,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7822,6 +7850,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7917,6 +7946,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -7983,6 +8013,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -8025,6 +8056,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -8100,6 +8132,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        include_superseded: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -8166,6 +8199,7 @@ mod tests {
                     workspace: Some("practice".into()),
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9209,6 +9243,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: Some(true),
                     as_of: None,
                 }),
@@ -9318,6 +9353,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    include_superseded: None,
                     explain: Some(true),
                     as_of: None,
                 }),
@@ -9365,6 +9401,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: Some(true),
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9445,6 +9482,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9477,6 +9515,7 @@ mod tests {
                     workspace: Some("ops".into()),
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9513,6 +9552,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -12378,6 +12418,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -12412,6 +12453,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    include_superseded: None,
                     explain: None,
                     as_of: None,
                 }),
