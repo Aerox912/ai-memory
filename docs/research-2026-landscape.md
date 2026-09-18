@@ -76,7 +76,7 @@ The market has consolidated into recognizable camps:
 | Temporal knowledge graphs | **Zep/Graphiti** (20K+ stars, 25K weekly PyPI installs), Cognee | Facts as bi-temporal graph edges: *when true in the world* vs *when observed*, superseded rather than deleted |
 | Memory OS / self-editing | **Letta**, MemOS, EverMemOS, MIRIX | The agent edits its own tiered memory via tools; "sleep-time compute" does consolidation off the hot path |
 | Fact extractors | **Mem0**, LangMem | LLM extracts atomic facts per turn; lightweight personalization |
-| Hosted memory API (hybrid) | **Supermemory** | Chunk-RAG + LLM temporal fact-graph + per-user profiles, answered in one query; managed connectors + multimodal; cloud-first (see below) |
+| Hosted memory API (hybrid) | **Supermemory**, **LiquidLM** | Chunk-RAG + LLM temporal fact-graph + per-user profiles, answered in one query; managed connectors + multimodal; cloud-first (see below) |
 | User-modeling / theory-of-mind | **Honcho** (Plastic Labs) | Memory as a *reasoning* problem: derive what each "peer" knows/believes about another over time; model the human, not the project (see below) |
 | **File-first wiki memory** | **us**, basic-memory, OKF, Letta's filesystem result, mempalace (nominally) | Markdown source of truth, derived indexes, human-editable |
 | Code intelligence | **DeusData/codebase-memory-mcp** (~42K stars) | Index the *codebase* (162 languages, tree-sitter → SQLite graph, static C binary) rather than the *session* - adjacent, not competing: it remembers what the code is, not what you did (see `research-codebase-memory-mcp.md`) |
@@ -208,6 +208,39 @@ accuracy / latency / context-tokens "MemScore" triple are open and worth
 borrowing (see R8). Per the research-doc convention, Supermemory has no
 standalone deep-dive; this section is its record.
 
+**Solo-built Supermemory-style hosted API: `liquidlm.com`** (**LiquidLM**,
+closed-source cloud SaaS, no funding — a single independent maker, Carlos Souza).
+Its own tagline is "persistent AI agent memory and RAG as a service." It is the
+same *camp* as Supermemory — a proprietary hosted memory API with entity/
+relationship extraction, temporal metadata, and an MCP surface on top — but a
+smaller, indie, individual-priced take on it (Free / $20 Pro / $200 Ultra,
+usage-based by ingestion volume). You ingest files/notes/links/media into cloud
+**"Vaults"**; it extracts entities, relationships, timestamps, and **staleness/
+`supersedes` signals**, then serves hybrid semantic+FTS retrieval with rerank and
+grounded, cited chat. It is on **every axis we deliberately chose against**: the
+**vault is an opaque hosted store** (no git, no markdown, no self-host, nothing to
+`grep`/diff), **LLM is intrinsic and not optional** (Gemini-class extraction/
+embeddings — no zero-LLM mode), and the memory engine is **closed-source** (the
+only open artifact is the MIT npm client `@liquidlm/cli`, v0.1.5 published
+2026-09-17; the GitHub `cli` repo is archived and empty). Where it is genuinely
+interesting is **breadth of ingestion and a clean MCP tool surface**: heavy
+multimodal capture (video/audio/image/PDF/Office, auto-transcription, a
+`yt-dlp`-fetch-locally pattern), a GitHub repo-sync connector, and eight native
+MCP tools worth studying by name — `put/get/list/search_knowledge`,
+`list_entities`, `get_related`, **`follow_references`** (walk the citation graph),
+**`pin_knowledge`** (standing context surfaced *before* search), and
+`forget_knowledge`. Tested harnesses: Claude Code, ChatGPT, Codex CLI, OpenCode
+over a hosted MCP endpoint (OAuth or scoped PAT). **No retrieval benchmarks** are
+published (only ROI marketing). It is **not in our lane and a weak migration
+target either way**: it captures by *explicit upload/sync* into a general "second
+brain," where we capture *automatically via lifecycle hooks* compiled into
+per-project coding pages you own — different job, different buyer. Two ideas are
+worth borrowing conceptually (never the substrate): the explicit **`pin_knowledge`
+= "seen before they search"** contract over our existing `pinned` pages, and
+**`follow_references`/`get_related` as first-class graph-walk MCP tools** over the
+link-neighbor RRF we already compute internally. Per the research-doc convention,
+LiquidLM has no standalone deep-dive; this section is its record.
+
 **Adjacent, not head-to-head: `plastic-labs/honcho`** (~7K stars, AGPL-3.0
 core + managed cloud, **$5.35M pre-seed** led by Variant/White Star/Betaworks).
 Honcho is the archetype of a **new camp** this report had no bucket for:
@@ -275,6 +308,7 @@ unmaintained.
 | basic-memory | 4.0k | 2026-09-16 | v0.23.2 (2026-08-25) | ACTIVE |
 | mcp-memory-service | 2.0k | 2026-09-18 | v11.12.0 (2026-09-14) | ACTIVE |
 | LangMem | 1.7k | 2026-09-09 | none (PyPI-versioned) | ACTIVE |
+| LiquidLM | n/a (closed) | n/a (engine closed) | `@liquidlm/cli` 0.1.5 (2026-09-17) | ACTIVE (young, pre-1.0, solo) |
 
 Reading it honestly: raw stars track **funding and app-developer reach**, not
 coding-agent fitness — the leaders (Mem0, OpenViking, the KG/cloud entrants) are
@@ -285,7 +319,10 @@ mcp-memory-service ~2.0k) precisely because the self-hosted, file-first,
 coding-continuity niche is smaller and less VC-amplified — that is the segment we
 lead, not the whole chart. Two mild flags: Letta ships commits actively but its
 last *tagged* release is from May 2026 (formal releases lag the code), and
-LangMem/Honcho publish no GitHub *releases* (PyPI/tag-only versioning).
+LangMem/Honcho publish no GitHub *releases* (PyPI/tag-only versioning); and
+LiquidLM is **closed-source**, so it has no repo signal at all — its only public,
+open artifact is the MIT npm client `@liquidlm/cli` (v0.1.5, 2026-09-17), which is
+what dates it as active but young.
 
 ## 4. Research developments worth knowing
 
@@ -505,6 +542,13 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
   hermes-agent.nousresearch.com Honcho integration. Benchmarks are
   vendor-reported and not independently reproduced. Analyzed inline in §3
   per the no-standalone-doc convention.
+- LiquidLM: liquidlm.com (+ /about, /docs, /docs/assistants, /docs/mcp — Vaults,
+  MCP tool surface, per-harness support with test dates), github.com/liquidlm
+  (org: an archived empty `cli` repo + a homebrew tap, no engine source), and the
+  npm registry metadata for `@liquidlm/cli` (MIT, v0.1.5 published 2026-09-17).
+  Solo maker (Carlos Souza), closed-source cloud engine, no benchmarks; the
+  backend internals, model, and any numbers are undisclosed/vendor framing.
+  Analyzed inline in §3 per the no-standalone-doc convention.
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).

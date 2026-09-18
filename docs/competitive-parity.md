@@ -57,12 +57,13 @@ None of the competitors below has more than one or two of these; none has all.
 | **Mem0** | **Mostly no — different buyer** (app end-user personalization). Yes only if you (mis)used it as coding-session memory | Zero-LLM, per-repo, cross-harness, editable pages, no API spend | Mem0's SDK/integration ecosystem + managed cloud personalization |
 | **Letta / MemOS** | **No** if you're building your agent *on* Letta; **yes** if you only wanted your existing coding agent to remember | Additive memory under your existing harness, zero-LLM, no runtime adoption | The ADE + agent-framework machinery (which you don't need unless building on Letta) |
 | **Honcho** (Plastic Labs) | **No — different problem.** It models the *human* (theory-of-mind peer representations); we remember the *project* | If you (mis)used it for coding continuity: file-first git truth, zero-LLM, single-binary self-host, per-project scoping, no mandatory LLM egress | Its user-psychology reasoning engine (Deriver/Dreamer/Dialectic), published user-recall benchmarks, managed cloud — none of which a coding-memory user needs |
-| **Mem0/Zep for apps; OpenViking, Supermemory, Honcho** | different buyer (app/user personalization, hosted context DB, user-modeling) — **not migration targets** | — | — |
+| **LiquidLM** (solo-built hosted memory API, Supermemory camp) | **Weak — different job.** It's a cloud "second brain" with multimodal RAG; we're automatic, file-first coding memory | Data ownership (markdown+git, no opaque cloud), zero-LLM default, single-binary self-host, automatic hook capture, per-project team sharing, no API/subscription spend | Its multimodal ingestion (video/audio/PDF/Office), polished web app + grounded chat, managed hosting, GitHub-sync connector, and out-of-the-box rerank |
+| **Mem0/Zep for apps; OpenViking, Supermemory, LiquidLM, Honcho** | different buyer (app/user personalization, hosted context DB / RAG-as-a-service, user-modeling) — **not migration targets** | — | — |
 
 Net: the premise holds where it should. For a **self-hosted, multi-harness,
 team, zero-LLM, data-ownership** coding-memory use case, ai-memory does the basics
 and adds a moat none of them fully have — migration is justified. It does *not*
-hold for app/user personalization (Mem0/Supermemory), user-modeling /
+hold for app/user personalization (Mem0/Supermemory/LiquidLM), user-modeling /
 theory-of-mind (Honcho), enterprise graph queries (Zep Cloud), agent-building
 runtimes (Letta), or a solo dev happy with Claude's built-in — those are
 different buyers, and we should say so rather than overclaim.
@@ -129,9 +130,14 @@ implemented without a separate decision.** Ordered by leverage.
    graph visualization in `/web`; a first-class TS SDK story for ecosystem parity;
    an optional **dialectic/oracle query** (ask-a-question → synthesized answer)
    and a **reasoning-tier knob** (Honcho) — but strictly as opt-in LLM layers
-   *over* the zero-LLM FTS/RRF core, never a requirement. Deliberately out of
-   scope: Honcho's theory-of-mind user-modeling engine (off-mission for coding
-   memory; the global-scope preferences page already covers the useful slice).
+   *over* the zero-LLM FTS/RRF core, never a requirement; a **pin-before-search
+   contract** and a first-class **`follow_references`/`get_related` graph-walk
+   MCP tool** (LiquidLM) exposing the link-neighbor RRF we already compute, plus
+   a **"hide superseded unless asked" retrieval knob** over our supersession
+   chains. Deliberately out of scope: Honcho's theory-of-mind user-modeling
+   engine and LiquidLM's opaque-cloud / LLM-mandatory / multimodal-second-brain
+   substrate (all off-mission for file-first, zero-LLM coding memory; the
+   global-scope preferences page already covers the useful user-prefs slice).
 7. **Fix doc staleness the audit surfaced** (accuracy, not features):
    `research-basic-memory.md` understates basic-memory's shipped cross-encoder
    reranking + Teams tier; `research-agentmemory.md` says 53 tools / 124 endpoints
