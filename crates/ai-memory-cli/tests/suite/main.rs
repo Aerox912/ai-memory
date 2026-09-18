@@ -9,6 +9,7 @@ mod autoscope_env;
 mod backfill_e2e;
 mod completions;
 mod doctor_e2e;
+mod e2e_support;
 mod hook_drain;
 mod hook_payload;
 mod marker_scope;

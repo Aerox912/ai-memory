@@ -28,12 +28,13 @@
 /// Spawns a server and several subprocesses: seconds, not milliseconds, so this
 /// lives in the slow tier (`cargo tf` / CI), not the everyday loop.
 mod slow {
-    use std::net::TcpListener;
     use std::path::Path;
-    use std::process::{Child, Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
+
+    use crate::e2e_support::{ServerGuard, free_port, hermetic, run_cli, session_count};
 
     const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
     const WORKSPACE: &str = "message-e2e-ws";
@@ -43,65 +44,6 @@ mod slow {
     const RECIPIENT: &str = "message-e2e-b";
     /// A third, uninvolved project — it must never see A→B mail.
     const BYSTANDER: &str = "message-e2e-c";
-
-    /// Start from a clean, hermetic environment: drop every ambient
-    /// `AI_MEMORY_*` var (a developer box or this project's own MCP config may
-    /// export `AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_SERVER_URL`, scope names, …)
-    /// so the child sees only what this test sets. Without this the spawned
-    /// server would inherit an auth token and reject the test's own requests.
-    fn hermetic(program: &str) -> Command {
-        let mut cmd = Command::new(program);
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("AI_MEMORY_") {
-                cmd.env_remove(key);
-            }
-        }
-        cmd
-    }
-
-    /// Kill the spawned server when the test ends, pass or fail.
-    struct ServerGuard(Child);
-    impl Drop for ServerGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    /// A free loopback port. The brief unbind→rebind race is acceptable for a
-    /// slow-tier test and is the same approach the shell smoke test uses.
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind ephemeral port")
-            .local_addr()
-            .expect("local addr")
-            .port()
-    }
-
-    /// Sum the server's per-agent session counts for a scope. A 404 (the
-    /// no-create scope lookup for a project that has never been written to)
-    /// counts as zero — the pre-existence state.
-    async fn session_count(client: &reqwest::Client, base: &str, project: &str) -> u64 {
-        let resp = client
-            .get(format!("{base}/admin/sessions/by-agent"))
-            .query(&[("workspace", WORKSPACE), ("project", project)])
-            .send()
-            .await
-            .expect("by-agent request");
-        if !resp.status().is_success() {
-            return 0;
-        }
-        let body: Value = resp.json().await.expect("by-agent json");
-        body["by_agent"]
-            .as_array()
-            .map(|agents| {
-                agents
-                    .iter()
-                    .filter_map(|a| a["sessions"].as_u64())
-                    .sum::<u64>()
-            })
-            .unwrap_or(0)
-    }
 
     /// Fire one `session-start` hook for `project`, then wait until the server
     /// has committed it — which both creates the project scope (so a later send
@@ -139,7 +81,7 @@ mod slow {
         );
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if session_count(client, base, project).await >= 1 {
+            if session_count(client, base, WORKSPACE, project).await >= 1 {
                 break;
             }
             assert!(
@@ -148,30 +90,6 @@ mod slow {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    }
-
-    /// Run a subcommand of the built binary to completion, returning its stdout.
-    /// The scope/server/home environment is shared with the spawned server so
-    /// the client talks to the same store the way a real install does.
-    fn run_cli(args: &[&str], data_dir: &Path, home: &Path, base: &str) -> String {
-        let out = hermetic(BIN)
-            .args(args)
-            .env("AI_MEMORY_DATA_DIR", data_dir)
-            .env("AI_MEMORY_HOME", home)
-            .env("AI_MEMORY_SERVER_URL", base)
-            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
-            .env("RUST_LOG", "off")
-            .output()
-            .unwrap_or_else(|e| panic!("spawn `{}`: {e}", args.join(" ")));
-        assert!(
-            out.status.success(),
-            "`{}` failed: {}\nstdout: {}\nstderr: {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        String::from_utf8(out.stdout).expect("stdout utf8")
     }
 
     /// `ai-memory message send` A→B with `--json`, returning the new message id.
@@ -195,6 +113,7 @@ mod slow {
             ],
             data_dir,
             home,
+            None,
             base,
         );
         let report: Value = serde_json::from_str(&out).expect("send --json report");
@@ -218,7 +137,7 @@ mod slow {
         if outbox {
             args.push("--outbox");
         }
-        let out = run_cli(&args, data_dir, home, base);
+        let out = run_cli(&args, data_dir, home, None, base);
         serde_json::from_str(&out).expect("list --json array")
     }
 
@@ -328,6 +247,7 @@ mod slow {
             ],
             data_dir.path(),
             home.path(),
+            None,
             &base,
         );
         assert!(
@@ -360,6 +280,7 @@ mod slow {
             ],
             data_dir.path(),
             home.path(),
+            None,
             &base,
         );
         let second: Value = serde_json::from_str(&second_pop).expect("second pop --json");
@@ -397,6 +318,7 @@ mod slow {
             ],
             data_dir.path(),
             home.path(),
+            None,
             &base,
         );
         let cancel: Value = serde_json::from_str(&cancel).expect("cancel --json");
