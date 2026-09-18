@@ -75,7 +75,8 @@ The market has consolidated into recognizable camps:
 |---|---|---|
 | Temporal knowledge graphs | **Zep/Graphiti** (20K+ stars, 25K weekly PyPI installs), Cognee | Facts as bi-temporal graph edges: *when true in the world* vs *when observed*, superseded rather than deleted |
 | Memory OS / self-editing | **Letta**, MemOS, EverMemOS, MIRIX | The agent edits its own tiered memory via tools; "sleep-time compute" does consolidation off the hot path |
-| Fact extractors | **Mem0**, LangMem, Supermemory | LLM extracts atomic facts per turn; lightweight personalization |
+| Fact extractors | **Mem0**, LangMem | LLM extracts atomic facts per turn; lightweight personalization |
+| Hosted memory API (hybrid) | **Supermemory** | Chunk-RAG + LLM temporal fact-graph + per-user profiles, answered in one query; managed connectors + multimodal; cloud-first (see below) |
 | **File-first wiki memory** | **us**, basic-memory, OKF, Letta's filesystem result, mempalace (nominally) | Markdown source of truth, derived indexes, human-editable |
 | Code intelligence | **DeusData/codebase-memory-mcp** (~42K stars) | Index the *codebase* (162 languages, tree-sitter → SQLite graph, static C binary) rather than the *session* - adjacent, not competing: it remembers what the code is, not what you did (see `research-codebase-memory-mcp.md`) |
 | Agent-harness OS | **ECC** (~247K stars), plus the skills/agents-pack ecosystem | Install a whole plan→test→implement→review→**remember**→improve loop into the agent; memory is one thin pillar ("optimize the context window, persist everything else"), deliberately kept as *context, not policy* - adjacent, not competing (see `research-ecc.md`) |
@@ -168,6 +169,43 @@ capture, an opaque swappable-storage story, AGPLv3 on the core, and the
 SaaS/enterprise-licensing weight that pulls against a single self-contained
 binary. Per the research-doc convention, OpenViking has no standalone
 deep-dive; this section is its record.
+
+**Well-funded generalist: `supermemoryai/supermemory`** (~30K stars, MIT
+repo, ~$2.6-3M seed from Susa/Browder/SF1.vc plus angels incl. Jeff Dean,
+Cloudflare's CTO, and Logan Kilpatrick; founder Dhravya Shah). Positioned as
+"context infrastructure for AI agents": a **hosted memory API** (the paid
+`api.supermemory.ai`) with an MIT self-hostable local binary as the on-ramp.
+This is the entrant our own docs most **mislabeled** - it is *not* a Mem0-style
+atomic fact extractor. It is a **hybrid**: every ingested item is
+chunked+embedded for RAG **and** run through an LLM "dreaming" pass that
+extracts atomic facts into a **temporal vector-graph** (Updates / Extends /
+Derives edges, `isLatest` supersession, decay + forgetting) **and** rolled into
+a standing per-user **profile**, with RAG and memory answered in one query. Its
+default "Dynamic" mode batches *related* documents rather than extracting per
+turn, so even the "LLM-per-turn" half of the old label is wrong (that mode is
+opt-in). Like the others it validates our bets from the opposite corner: the
+batch "dream" pass is our consolidation ("compile, not retrieve") under another
+name, and supersede-don't-delete is our page-supersession chain. Where it
+genuinely leads is **ingestion breadth** - managed connectors (Drive, Gmail,
+Notion, OneDrive, S3, GitHub, web crawler), multimodal PDF/image/audio, and
+metadata + `containerTag` query filters, plus a first-class user profile - but
+every one of those is **cloud-only and LLM-required**; the self-hosted binary
+(embedded graph store, local `bge-base` embeddings, offline) explicitly "lacks
+connectors and the proprietary extraction models." It sits opposite us on every
+axis we chose: an **opaque graph is the source of truth** (no git, no markdown,
+nothing to `grep` or diff), the quality path is **LLM-required** (no zero-LLM
+default), and the best features **pull toward the paid Cloudflare cloud**. It is
+also not really in our lane: it is a general **memory-API for apps and user
+personalization** whose coding-agent plugins (Claude Code, Cursor, Codex,
+OpenCode) capture by **turn-batch polling**, not OS lifecycle hooks, with no
+cross-harness handoff, multi-user page-sharing, or per-project 3-tuple isolation
+model - the coding-agent-continuity primitives are exactly what we build and it
+does not. Read the numbers with the standard skepticism: "95% LongMemEval_s at
+Recall@15 with aggregation, ~720 tokens, sub-300ms p50, first on LoCoMo" are all
+**vendor self-reported** - though their **MemoryBench** harness and the
+accuracy / latency / context-tokens "MemScore" triple are open and worth
+borrowing (see R8). Per the research-doc convention, Supermemory has no
+standalone deep-dive; this section is its record.
 
 ## 4. Research developments worth knowing
 
@@ -293,6 +331,29 @@ L1 summaries) rather than competing with it. Directory-scoped retrieval
 on `memory_query` within a project — worth noting but not scheduling
 until R7's tiering lands.
 
+**R8 - Queryable metadata/tag filters + a published eval triple (small-
+medium; from Supermemory).** Two borrowable ideas from the entrant that leads
+on ergonomics. First, **structured metadata/tag filtering on `memory_query`**:
+we already key every row by the `(workspace, project, path)` 3-tuple, but
+Supermemory's `containerTags` + arbitrary metadata filters let a caller narrow
+recall by attributes (kind, tier, author, tag) *before* ranking. A bounded,
+optional filter argument on `memory_query` - composing with FTS5/RRF, not
+replacing it - closes a real query-ergonomics gap at low cost; most of the
+plumbing (page frontmatter, kinds/tiers, `_slots`) already exists. Second,
+**publish an accuracy / latency / context-tokens triple** from the in-repo
+`recall_eval.rs`, mirroring Supermemory's open **MemScore / MemoryBench**
+philosophy: honest engineering discipline and the right answer to a field now
+competing on self-reported single numbers - it composes with R2 (the
+reproducible-harness recommendation) rather than competing. A per-project or
+per-user **"profile" page** auto-surfaced on start (Supermemory's standing
+profile) is a lighter third idea that maps onto our durable pages + the session
+brief - worth noting, below the two above. Deliberately *not* borrowed from this
+camp: managed cloud connectors and LLM-required extraction in the **core** - if
+connectors ever land they belong in the companion importer as opt-in, outside
+the trusted boundary, so the file-first / zero-LLM model is preserved (the same
+line drawn for multimodal/PDF import: OCR/transcribe to markdown pages, never an
+opaque store).
+
 **Deliberately not recommended:** joining the memory-OS camp (agent
 self-editing its memory - token-expensive, and Letta itself is hedging);
 adopting a graph database (bi-temporal-lite on SQLite covers the useful
@@ -326,6 +387,15 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
   in-house); arXiv:2605.29640 (VikingMem, VLDB 2026) plus Directory-Aware
   Query and VikingRAG papers (submitted/unreviewed). Analyzed inline in §3
   per the no-standalone-doc convention.
+- Supermemory: github.com/supermemoryai/supermemory (README, MIT, ~30K
+  stars); supermemory.ai/docs (how-it-works, graph-memory, self-hosting,
+  connectors, filtering); github.com/supermemoryai/{memorybench,
+  opencode-supermemory, supermemory-mcp}; supermemory.ai/blog (memory-engine,
+  supermemory-vs-mem0 - vendor self-reported benchmarks); DeepWiki
+  code-derived architecture; TechCrunch/Dataconomy 2025-10 (seed funding,
+  founder). Hosted backend is closed-source, so its storage internals,
+  latency, and benchmark numbers are vendor claims, not primary-verifiable.
+  Analyzed inline in §3 per the no-standalone-doc convention.
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).
