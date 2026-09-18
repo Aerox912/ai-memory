@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streams, each hit labelled `superseded: true` so callers can tell historical
   versions from the current one; the current version is never marked. Default-off
   behaviour is byte-identical to the previous latest-only retrieval, and
-  `global=true` and `as_of` time-travel are unaffected (#NNN).
+  `global=true` and `as_of` time-travel are unaffected (#773).
 
 ### Fixed
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
