@@ -248,6 +248,12 @@ standalone deep-dive; this section is its record.
 
 ## 5. What this means for ai-memory - analysis and recommendations
 
+> Companion audit: [`competitive-parity.md`](competitive-parity.md) turns this
+> "what to borrow" lens around and asks the harder one - in the goals where we
+> *overlap* a competitor, are we actually better or did we copy without
+> improving, and is ai-memory worth migrating *to*? It is the self-critical
+> record behind this section's recommendations.
+
 The May research led us to build: versioned supersession, retention
 formulas, hybrid RRF retrieval, opt-in LLM consolidation, handoffs as a
 protocol, single self-contained binary, typed scope isolation. Every one
