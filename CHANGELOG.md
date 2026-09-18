@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- GitHub Copilot completion requests now select the model-advertised API
+  endpoint from `/models`: existing Chat Completions remains preferred when
+  available, while Responses-only models use `/responses`. Responses requests
+  preserve strict JSON Schema structured-output constraints and report empty,
+  refused, or rejected output without silently downgrading the contract. (#761)
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted
