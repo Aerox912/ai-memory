@@ -33,12 +33,15 @@
 /// lives in the slow tier (`cargo tf` / CI), not the everyday loop.
 mod slow {
     use std::fs;
-    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
+
+    use crate::e2e_support::{
+        ServerGuard, free_port, hermetic, run_cli, session_count, write_jsonl,
+    };
 
     const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
     const WORKSPACE: &str = "backfill-e2e-ws";
@@ -53,50 +56,6 @@ mod slow {
     /// OpenAI/Anthropic `sk-…` shape (16+ trailing key chars) → `[REDACTED:api_key]`.
     fn canary() -> String {
         format!("sk-canary{CANARY_MARKER}0123456789abcdef")
-    }
-
-    /// Start from a clean, hermetic environment: drop every ambient
-    /// `AI_MEMORY_*` var (a developer box or this project's own MCP config may
-    /// export `AI_MEMORY_AUTH_TOKEN`, `AI_MEMORY_SERVER_URL`, scope names, …)
-    /// so the child sees only what this test sets. Without this the spawned
-    /// server would inherit an auth token and reject the test's own requests.
-    fn hermetic(program: &str) -> Command {
-        let mut cmd = Command::new(program);
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("AI_MEMORY_") {
-                cmd.env_remove(key);
-            }
-        }
-        cmd
-    }
-
-    /// Kill the spawned server when the test ends, pass or fail.
-    struct ServerGuard(Child);
-    impl Drop for ServerGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-
-    /// A free loopback port. The brief unbind→rebind race is acceptable for a
-    /// slow-tier test and is the same approach the shell smoke test uses.
-    fn free_port() -> u16 {
-        TcpListener::bind("127.0.0.1:0")
-            .expect("bind ephemeral port")
-            .local_addr()
-            .expect("local addr")
-            .port()
-    }
-
-    /// Write the JSONL lines (each already a `Value`) as one transcript file.
-    fn write_jsonl(path: &Path, lines: &[Value]) {
-        let mut body = String::new();
-        for line in lines {
-            body.push_str(&line.to_string());
-            body.push('\n');
-        }
-        fs::write(path, body).expect("write transcript");
     }
 
     /// Recursively test whether any file under `root` contains `needle` (bytes,
@@ -121,31 +80,6 @@ mod slow {
             }
         }
         None
-    }
-
-    /// Sum the server's per-agent session counts for the scope. A 404 (the
-    /// no-create scope lookup for a project that has never been written to)
-    /// counts as zero — the pre-import state.
-    async fn session_count(client: &reqwest::Client, base: &str) -> u64 {
-        let resp = client
-            .get(format!("{base}/admin/sessions/by-agent"))
-            .query(&[("workspace", WORKSPACE), ("project", PROJECT)])
-            .send()
-            .await
-            .expect("by-agent request");
-        if !resp.status().is_success() {
-            return 0;
-        }
-        let body: Value = resp.json().await.expect("by-agent json");
-        body["by_agent"]
-            .as_array()
-            .map(|agents| {
-                agents
-                    .iter()
-                    .filter_map(|a| a["sessions"].as_u64())
-                    .sum::<u64>()
-            })
-            .unwrap_or(0)
     }
 
     /// Call a memory tool over the stateless Streamable-HTTP `/mcp` transport
@@ -184,31 +118,6 @@ mod slow {
             .filter_map(|item| item.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// Run a subcommand of the built binary to completion, returning its stdout.
-    /// The scope/server/home environment is shared with the spawned server so
-    /// the client talks to the same store the way a real install does.
-    fn run_cli(args: &[&str], data_dir: &Path, home: &Path, cwd: &Path, base: &str) -> String {
-        let out = hermetic(BIN)
-            .args(args)
-            .current_dir(cwd)
-            .env("AI_MEMORY_DATA_DIR", data_dir)
-            .env("AI_MEMORY_HOME", home)
-            .env("AI_MEMORY_SERVER_URL", base)
-            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
-            .env("RUST_LOG", "off")
-            .output()
-            .unwrap_or_else(|e| panic!("spawn `{}`: {e}", args.join(" ")));
-        assert!(
-            out.status.success(),
-            "`{}` failed: {}\nstdout: {}\nstderr: {}",
-            args.join(" "),
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        String::from_utf8(out.stdout).expect("stdout utf8")
     }
 
     #[tokio::test]
@@ -301,7 +210,7 @@ mod slow {
 
         // Phase 1 — the store is empty before backfill.
         assert_eq!(
-            session_count(&client, &base).await,
+            session_count(&client, &base, WORKSPACE, PROJECT).await,
             0,
             "a brand-new project store must start with no sessions",
         );
@@ -318,7 +227,7 @@ mod slow {
             ],
             data_dir.path(),
             home.path(),
-            &cwd,
+            Some(&cwd),
             &base,
         ))
         .expect("backfill --json report");
@@ -339,14 +248,14 @@ mod slow {
         // it acks, but poll briefly to stay robust against any lag.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if session_count(&client, &base).await >= 1 {
+            if session_count(&client, &base, WORKSPACE, PROJECT).await >= 1 {
                 break;
             }
             assert!(Instant::now() < deadline, "imported session never appeared");
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         assert_eq!(
-            session_count(&client, &base).await,
+            session_count(&client, &base, WORKSPACE, PROJECT).await,
             1,
             "exactly one session must exist after import",
         );
@@ -395,7 +304,7 @@ mod slow {
             ],
             data_dir.path(),
             home.path(),
-            &cwd,
+            Some(&cwd),
             &base,
         ))
         .expect("second backfill --json report");
@@ -408,7 +317,7 @@ mod slow {
             "the second run must import nothing: {report2}"
         );
         assert_eq!(
-            session_count(&client, &base).await,
+            session_count(&client, &base, WORKSPACE, PROJECT).await,
             1,
             "the re-run must not duplicate the imported session",
         );
