@@ -12,7 +12,7 @@ Use this skill for read-only ai-memory lookups, catch-up, and evaluating remembe
 
 - `memory_query` searches the current project's wiki for prior decisions, gotchas, procedures, rules, and session notes.
 - `memory_recent` lists the most recently updated pages when the user wants a light activity check.
-- `memory_read_page` fetches a full page body after a search hit or direct path lookup.
+- `memory_read_page` fetches a full page body after a search hit or direct path lookup. Pass `include_related: true` (optional `related_depth`, default 1, hard cap 3) to also walk the link graph outward and return a `related` array of reachable pages, each with its hop `depth` and edge `direction` (`link`/`backlink`); default off omits it.
 - `memory_read_session_observations` reads one session's raw hook observations (prompts, tool calls, stops) in capture order, paged and body-capped, when the user asks what actually happened in a session or wants to check a compiled page against its evidence.
 - `memory_status` reports whether ai-memory is healthy and how large the knowledge base is.
 - `memory_briefing` returns a structured read-only snapshot for agent consumption.
