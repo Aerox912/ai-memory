@@ -51,6 +51,7 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 |---|---|---|---|
 | Fact extractors | Mem0, LangMem | Cheap per-turn personalization | Atomic facts lose relational/causal context (see [TriMem](research-2026-landscape.md#4-research-developments-worth-knowing)); LLM-per-turn; not file-first |
 | Hosted memory API (hybrid) | **Supermemory** | Chunk-RAG + LLM temporal fact-graph + per-user profiles in one query; managed connectors (Drive/Notion/GitHub), multimodal, metadata/tag query filters | Cloud-first (best features + extraction are paid/Cloudflare-hosted); LLM-required quality path; an opaque graph is the source of truth (not file-first, nothing to `grep`/diff); the MIT self-host binary drops the connectors and extraction models |
+| User-modeling / theory-of-mind | **Honcho** (Plastic Labs) | Reasoning-derived model of what each "peer" knows/believes over time — personalizes around the *human* the agent serves | Different problem: it remembers the *user*, ai-memory remembers the *project*. Opaque Postgres, LLM-required (Deriver/Dreamer), multi-service stack; adjacent (shares MCP/plugin delivery) but not a coding-memory migration target |
 | Temporal knowledge graph | Zep/Graphiti, Cognee | Bi-temporal "what was true vs believed when" | Needs a graph DB; heavier to self-host. ai-memory ships **bi-temporal-lite** on SQLite ([`temporal.md`](temporal.md)) + typed edges ([`typed-edges.md`](typed-edges.md)) for the useful part |
 | Memory OS / self-editing | Letta, MemOS, MIRIX | Agent curates its own tiered memory | Token-expensive self-editing; Letta itself now concedes file-first ("Is a Filesystem All You Need?") |
 | Hosted context database | **OpenViking** (ByteDance) | Progressive L0/L1/L2 loading; directory-scoped retrieval; broad integrations | LLM-**required** (VLM + embeddings); opaque swappable storage; AGPLv3 core + SaaS/enterprise weight |
@@ -58,6 +59,33 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 | Closest sibling (fact-row twin) | doobidoo/mcp-memory-service | SQLite(+vec), local ONNX, hook capture, typed edges, honest numbers | What ai-memory would be if it chose fact-rows over wiki **pages** |
 | Platform-native | Claude Code auto-memory | Zero setup, on by default | Machine-local, **no sync**, single-agent, repo-scoped, no tool-lifecycle capture, no team |
 | **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | Below the reranking leaders on raw R@5; LLM-optional means no VLM fact-extraction sophistication |
+
+## Maturity and maintenance
+
+This is a crowded, fast-moving field, and it is only fair to say so: **every tool
+compared here is actively maintained** (as of 2026-09-18, all had commits within
+the last ~10 days — none stale, none archived). Raw GitHub popularity, though,
+tracks funding and app-developer reach more than coding-agent fitness — the
+star leaders are the app-personalization and hosted-context players (a different
+buyer), while the tools closest to ai-memory's file-first, self-hosted,
+coding-continuity niche are smaller by design.
+
+| Project | Stars (~) | Latest release | Maintenance |
+|---|---|---|---|
+| Mem0 | 65.6k | 2026-09-18 | active |
+| OpenViking | 38.0k | 2026-09-14 | active |
+| Zep/Graphiti | 31.0k | 2026-09-08 | active |
+| Cognee | 30.8k | 2026-09-15 | active |
+| Supermemory | 30.1k | 2026-08-17 | active |
+| agentmemory | 28.6k | 2026-08-16 | active |
+| Letta | 24.8k | 2026-05-14 | active (releases lag code) |
+| Hindsight | 23.9k | 2026-09-14 | active |
+| Honcho | 7.2k | tag v3.2.0 | active |
+| basic-memory | 4.0k | 2026-08-25 | active |
+| mcp-memory-service | 2.0k | 2026-09-14 | active |
+| LangMem | 1.7k | PyPI-only | active |
+
+Full figures, sources, and per-tool caveats: [`research-2026-landscape.md`](research-2026-landscape.md#popularity-and-maintenance-signal-as-of-2026-09-18).
 
 ## How the field validates the approach
 
