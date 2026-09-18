@@ -287,22 +287,6 @@ lead, not the whole chart. Two mild flags: Letta ships commits actively but its
 last *tagged* release is from May 2026 (formal releases lag the code), and
 LangMem/Honcho publish no GitHub *releases* (PyPI/tag-only versioning).
 
-**Disambiguation — Liquid AI / LFM is not a memory tool.** A quick note to
-preempt a recurring confusion: **"LiquidLM"** does not exist as an agent-memory
-product under any spelling. Every search resolves to **Liquid AI's LFM (Liquid
-Foundation Models / LFM2 / LFM2.5)** — a family of *device-native foundation
-models* (hybrid non-transformer, on-device/edge, e.g. LFM2.5-1.2B-Thinking
-fitting in <1 GB; LFM Open License v1.0, arXiv:2511.23404, actively developed by
-Liquid AI under `github.com/Liquid4All`). The name collision is that LFM's
-headline is *memory efficiency* (small KV-cache/RAM footprint) — memory in the
-**inference/hardware** sense, not the **agent-persistence/recall** sense this
-report covers. So LFM is **not** in any camp here and is **not** a competitor or
-migration target. It is, if anything, **complementary**: a small local model like
-LFM2.5 is exactly the kind of provider that could run ai-memory's *opt-in*
-consolidation/lint/embedding fully on-device — a candidate backend for the
-`ai-memory-llm` provider traits, not a rival to the memory store. No comparison
-row is warranted; this note is its record.
-
 ## 4. Research developments worth knowing
 
 - **"Rethinking How to Remember: Beyond Atomic Facts in Lifelong LLM
