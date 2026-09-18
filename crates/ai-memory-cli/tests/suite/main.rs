@@ -12,6 +12,7 @@ mod doctor_e2e;
 mod hook_drain;
 mod hook_payload;
 mod marker_scope;
+mod message_e2e;
 mod packaging;
 mod removal;
 mod repo_layout;
