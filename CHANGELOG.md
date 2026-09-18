@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `memory_status` now reports which project answered: a `scope` object with
+  `workspace`, `project`, and `resolved_by` (`explicit`, `session`,
+  `shared_slot`, `startup_seed`, `default`, or `default_after_mismatch`). An
+  unscoped call from a static MCP client, whose transport session id is not a
+  lifecycle-hook session id, returned plausible counts for a project it never
+  named, with nothing in the response to question them; `resolved_by` now makes
+  that visible. The server also logs a warning whenever an unscoped MCP read is
+  resolved by the startup seed or by the default after a session mismatch,
+  rather than by the caller's own hook session (#757).
+
 ### Fixed
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
