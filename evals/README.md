@@ -201,10 +201,56 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch   # full 500
 cargo run -p ai-memory-eval -- retrieval --sample 10         # smoke
 ```
 
-Output: a per-category table on stdout plus
+Output: a per-slice table on stdout plus
 `evals/runs/<timestamp>-retrieval/report.{json,md}` with full
 provenance (commit, dataset sha, hardware, per-question scores).
 When publishing a baseline, copy the markdown into `docs/benchmarks/`.
+
+### The triple: accuracy + latency + context-tokens
+
+Every run — single-config or A/B — reports three things per slice, not
+just accuracy:
+
+- **accuracy** — `hit@k` / `recall@k` (unchanged);
+- **latency** — `memory_query` MCP round-trip **p50 / p95** in ms;
+- **context tokens** — the context an agent would ingest from the result,
+  estimated as **chars / 4** over each returned hit's `title` + `snippet`
+  (a documented heuristic, not a real tokenizer), reported **mean / median**.
+
+### `retrieval` A/B mode (R2)
+
+Pass a **candidate** config and the same question set runs through two
+fresh servers (baseline + candidate) and gains a baseline→candidate delta
+table (markdown + JSON). A/B mode turns on with `--candidate` or any
+`--candidate-*` knob; without one, the single-config path is unchanged.
+
+Baseline knobs: `--embeddings none|local` (also = vectors off/on),
+`--reranker` (sets `AI_MEMORY_RERANKER=llm`; needs a provider via
+`--server-env`), `--server-env KEY=VALUE` (any server env, repeatable),
+`--query-arg KEY=JSON` (extra `memory_query` args, repeatable — so future
+knobs like `pin_first` / `include_superseded` can be A/B'd;
+`query`/`workspace`/`project`/`limit` are reserved). Each has a
+`--candidate-*` twin (`--candidate-embeddings`, `--candidate-reranker`,
+`--candidate-server-env`, `--candidate-query-arg`); a candidate knob left
+unset mirrors the baseline.
+
+```bash
+# Determinism check — baseline == candidate ⇒ accuracy/context delta = 0:
+cargo run --release -p ai-memory-eval -- retrieval --candidate --sample 2
+
+# Vectors off vs on, full run:
+cargo run --release -p ai-memory-eval -- retrieval --fetch \
+    --candidate-embeddings local
+
+# A future memory_query knob, baseline off vs candidate on:
+cargo run --release -p ai-memory-eval -- retrieval --fetch \
+    --candidate-query-arg include_expired=true
+```
+
+Output: `evals/runs/<timestamp>-retrieval/report.{json,md}` — the JSON is
+`{ baseline, candidate, delta }`; the markdown carries both per-slice
+triples and an `overall` delta table. Publish full-dataset A/B numbers in
+`docs/benchmarks/retrieval-ab-r2.md`.
 
 Honest-numbers notes:
 

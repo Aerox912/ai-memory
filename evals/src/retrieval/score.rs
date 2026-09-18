@@ -28,6 +28,11 @@ pub struct QuestionScore {
     pub recall_at: BTreeMap<usize, f64>,
     /// Deduped session attributions actually retrieved (for forensics).
     pub retrieved_sessions: usize,
+    /// `memory_query` round-trip latency for this question, milliseconds.
+    pub latency_ms: u128,
+    /// Estimated context tokens the result would cost the agent (chars/4
+    /// over returned hit titles + snippets).
+    pub context_tokens: usize,
 }
 
 /// Score one question's retrieval run.
@@ -42,6 +47,8 @@ pub fn score_question(
     evidence: &HashSet<uuid::Uuid>,
     retrieved: &[Retrieved],
     ks: &[usize],
+    latency_ms: u128,
+    context_tokens: usize,
 ) -> QuestionScore {
     let mut seen = HashSet::new();
     let mut ranked_sessions = Vec::new();
@@ -73,15 +80,55 @@ pub fn score_question(
         hit_at,
         recall_at,
         retrieved_sessions: ranked_sessions.len(),
+        latency_ms,
+        context_tokens,
     }
 }
 
-/// Aggregated metrics for one slice (a category, or overall).
+/// Aggregated metrics for one slice (a category, or overall): the R2
+/// accuracy + latency + context-tokens triple.
 #[derive(Debug, Clone, Serialize)]
 pub struct SliceMetrics {
     pub questions: usize,
     pub hit_at: BTreeMap<usize, f64>,
     pub recall_at: BTreeMap<usize, f64>,
+    /// Latency percentiles over the slice's per-question `memory_query`
+    /// round trips, milliseconds.
+    pub latency_p50_ms: u128,
+    pub latency_p95_ms: u128,
+    /// Context-token estimate central tendency over the slice.
+    pub context_tokens_mean: f64,
+    pub context_tokens_median: f64,
+}
+
+/// Nearest-rank percentile (`p` in 0.0..=1.0) over a copy-sorted slice.
+/// Empty input yields 0.
+fn percentile_u128(values: &[u128], p: f64) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    // Nearest-rank: rank = ceil(p * n), clamped to [1, n], 1-based.
+    let n = sorted.len();
+    let rank = (p * n as f64).ceil().max(1.0) as usize;
+    sorted[rank.min(n) - 1]
+}
+
+/// Median of an already-collected list of counts (mean of the two middle
+/// elements for an even count). Empty input yields 0.
+fn median_f64(values: &[usize]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2] as f64
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
+    }
 }
 
 /// Macro-average scores per category plus an `overall` slice.
@@ -101,12 +148,19 @@ pub fn aggregate(scores: &[QuestionScore], ks: &[usize]) -> BTreeMap<String, Sli
                 hit_at.insert(k, group.iter().map(|s| s.hit_at[&k]).sum::<f64>() / n);
                 recall_at.insert(k, group.iter().map(|s| s.recall_at[&k]).sum::<f64>() / n);
             }
+            let latencies: Vec<u128> = group.iter().map(|s| s.latency_ms).collect();
+            let tokens: Vec<usize> = group.iter().map(|s| s.context_tokens).collect();
+            let tokens_sum: usize = tokens.iter().sum();
             (
                 name,
                 SliceMetrics {
                     questions: group.len(),
                     hit_at,
                     recall_at,
+                    latency_p50_ms: percentile_u128(&latencies, 0.50),
+                    latency_p95_ms: percentile_u128(&latencies, 0.95),
+                    context_tokens_mean: tokens_sum as f64 / n,
+                    context_tokens_median: median_f64(&tokens),
                 },
             )
         })
@@ -134,6 +188,8 @@ mod tests {
             &HashSet::from([e]),
             &retrieved(&[Some(e)]),
             &[1, 5],
+            0,
+            0,
         );
         assert_eq!(s.hit_at[&1], 1.0);
         assert_eq!(s.hit_at[&5], 1.0);
@@ -152,6 +208,8 @@ mod tests {
             &HashSet::from([e]),
             &retrieved(&all),
             &[1, 3, 5],
+            0,
+            0,
         );
         assert_eq!(s.hit_at[&1], 0.0);
         assert_eq!(s.hit_at[&3], 0.0);
@@ -169,6 +227,8 @@ mod tests {
             &HashSet::from([e]),
             &retrieved(&[Some(noise), Some(noise), Some(noise), Some(e)]),
             &[2],
+            0,
+            0,
         );
         // dedup: noise occupies rank 0, evidence rank 1 → hit@2
         assert_eq!(s.hit_at[&2], 1.0);
@@ -184,6 +244,8 @@ mod tests {
             &HashSet::from([e1, e2]),
             &retrieved(&[Some(e1)]),
             &[5],
+            0,
+            0,
         );
         assert_eq!(s.recall_at[&5], 0.5);
         assert_eq!(s.hit_at[&5], 1.0);
@@ -198,6 +260,8 @@ mod tests {
             &HashSet::from([e]),
             &retrieved(&[None, None]),
             &[5],
+            0,
+            0,
         );
         assert_eq!(s.hit_at[&5], 0.0);
         assert_eq!(s.retrieved_sessions, 0);
@@ -215,6 +279,8 @@ mod tests {
             &HashSet::from([e]),
             &retrieved(&random),
             &[1, 3, 5, 10],
+            0,
+            0,
         );
         for k in [1, 3, 5, 10] {
             assert_eq!(s.hit_at[&k], 0.0, "hit@{k}");
@@ -231,6 +297,8 @@ mod tests {
             &HashSet::from([e]),
             &retrieved(&[Some(e)]),
             &[1],
+            10,
+            100,
         );
         let miss = score_question(
             "q2",
@@ -238,9 +306,35 @@ mod tests {
             &HashSet::from([uuid::Uuid::now_v7()]),
             &retrieved(&[]),
             &[1],
+            30,
+            200,
         );
         let agg = aggregate(&[hit, miss], &[1]);
         assert_eq!(agg["multi-session"].hit_at[&1], 0.5);
         assert_eq!(agg["overall"].questions, 2);
+        // Latency + context-tokens triple is aggregated alongside accuracy.
+        assert_eq!(agg["overall"].context_tokens_mean, 150.0);
+        assert_eq!(agg["overall"].context_tokens_median, 150.0);
+        // Nearest-rank p50 over [10, 30] → rank ceil(0.5*2)=1 → 10.
+        assert_eq!(agg["overall"].latency_p50_ms, 10);
+        assert_eq!(agg["overall"].latency_p95_ms, 30);
+    }
+
+    #[test]
+    fn percentile_nearest_rank_and_empty() {
+        assert_eq!(percentile_u128(&[], 0.5), 0);
+        assert_eq!(percentile_u128(&[42], 0.95), 42);
+        let v: Vec<u128> = (1..=100).collect();
+        assert_eq!(percentile_u128(&v, 0.50), 50);
+        assert_eq!(percentile_u128(&v, 0.95), 95);
+        assert_eq!(percentile_u128(&v, 1.0), 100);
+    }
+
+    #[test]
+    fn median_even_and_odd() {
+        assert_eq!(median_f64(&[]), 0.0);
+        assert_eq!(median_f64(&[7]), 7.0);
+        assert_eq!(median_f64(&[1, 2, 3]), 2.0);
+        assert_eq!(median_f64(&[1, 2, 3, 10]), 2.5);
     }
 }
