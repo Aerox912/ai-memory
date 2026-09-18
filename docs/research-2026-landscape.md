@@ -77,6 +77,7 @@ The market has consolidated into recognizable camps:
 | Memory OS / self-editing | **Letta**, MemOS, EverMemOS, MIRIX | The agent edits its own tiered memory via tools; "sleep-time compute" does consolidation off the hot path |
 | Fact extractors | **Mem0**, LangMem | LLM extracts atomic facts per turn; lightweight personalization |
 | Hosted memory API (hybrid) | **Supermemory** | Chunk-RAG + LLM temporal fact-graph + per-user profiles, answered in one query; managed connectors + multimodal; cloud-first (see below) |
+| User-modeling / theory-of-mind | **Honcho** (Plastic Labs) | Memory as a *reasoning* problem: derive what each "peer" knows/believes about another over time; model the human, not the project (see below) |
 | **File-first wiki memory** | **us**, basic-memory, OKF, Letta's filesystem result, mempalace (nominally) | Markdown source of truth, derived indexes, human-editable |
 | Code intelligence | **DeusData/codebase-memory-mcp** (~42K stars) | Index the *codebase* (162 languages, tree-sitter → SQLite graph, static C binary) rather than the *session* - adjacent, not competing: it remembers what the code is, not what you did (see `research-codebase-memory-mcp.md`) |
 | Agent-harness OS | **ECC** (~247K stars), plus the skills/agents-pack ecosystem | Install a whole plan→test→implement→review→**remember**→improve loop into the agent; memory is one thin pillar ("optimize the context window, persist everything else"), deliberately kept as *context, not policy* - adjacent, not competing (see `research-ecc.md`) |
@@ -206,6 +207,50 @@ Recall@15 with aggregation, ~720 tokens, sub-300ms p50, first on LoCoMo" are all
 accuracy / latency / context-tokens "MemScore" triple are open and worth
 borrowing (see R8). Per the research-doc convention, Supermemory has no
 standalone deep-dive; this section is its record.
+
+**Adjacent, not head-to-head: `plastic-labs/honcho`** (~7K stars, AGPL-3.0
+core + managed cloud, **$5.35M pre-seed** led by Variant/White Star/Betaworks).
+Honcho is the archetype of a **new camp** this report had no bucket for:
+**user-modeling / theory-of-mind memory**. Its unit of memory is a **"peer"**
+(any entity that "persists but changes over time — users, agents, objects") and
+its differentiator is treating memory as **"a reasoning problem, not a retrieval
+problem"** — it models *what one peer knows and believes about another* over
+time. The substrate is the opposite of ours on every axis we chose:
+**PostgreSQL is the source of truth** (Postgres FTS/GIN + HNSW vectors, Redis
+cache, pluggable LanceDB/Turbopuffer — **no git, no markdown, nothing to `grep`
+or diff**), it is **LLM-required** (a **Deriver** does one structured-output LLM
+call per message batch; a scheduled **Dreamer** runs surprisal-prioritized
+"dream-time" consolidation into premise→conclusion reasoning trees — no zero-LLM
+path), and it runs as a **multi-service stack** (FastAPI API + async worker +
+Postgres + Redis), cloud-leaning with a self-hostable core. Its flagship is the
+**Dialectic endpoint** (`peer.chat()`): a natural-language *oracle* — you ask a
+question about a peer and a synchronous tool-using agent (`search_memory`,
+`grep_messages`, `get_reasoning_chain`, temporal search, five reasoning tiers)
+synthesizes an answer rather than returning raw hits. Benchmarks are strong but
+**vendor self-reported** (blog dated Dec 19 2025): LongMemEval-S 90.4% (Haiku
+4.5) / 92.6% (Gemini 3 Pro), LoCoMo 89.9%, "median 5% of context tokens used."
+It now ships coding-agent front-ends too (Claude Code/Codex/Cursor/OpenCode
+plugins + an **MCP server** with exactly three tools: `honcho_search`,
+`honcho_chat`, `honcho_remember`), so it **collides with us on the shelf** — but
+the thing remembered is fundamentally different: **Honcho remembers the *user*;
+ai-memory remembers the *project*.** A coding team wanting cross-harness project
+continuity would not switch to it (opaque DB, LLM-mandatory, user-centric,
+multi-service), and an app builder wanting end-user personalization would not use
+us — **adjacent, not a migration target either way**. Two ideas are worth
+carrying forward as *optional LLM layers over* our zero-LLM core, never
+requirements: the **dialectic/oracle query** (ask-a-question → synthesized
+answer, which maps onto our retrieval as an opt-in LLM step) and the
+**reasoning-tier ladder** (minimal→max reasoning per query as a clean
+cost/quality knob). Deliberately **reject** the rest as off-mission: LLM-mandatory
+ingestion, opaque-Postgres-as-truth, the Postgres+Redis+worker operational
+weight, and the heavy theory-of-mind engine itself — a coding agent needs project
+facts, decisions, and conventions, not a psychological model of the developer
+(the lightweight "standing user preferences" slice we already have via global
+scope is enough). Positioning note: preempt the inevitable "but Honcho scores 90%
+on LongMemEval" by clarifying those are *user-recall* benchmarks on chat
+transcripts, not *coding-project* recall — a different task we are not competing
+on. Per the research-doc convention, Honcho has no standalone deep-dive; this
+section is its record.
 
 ## 4. Research developments worth knowing
 
@@ -413,6 +458,18 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
   founder). Hosted backend is closed-source, so its storage internals,
   latency, and benchmark numbers are vendor claims, not primary-verifiable.
   Analyzed inline in §3 per the no-standalone-doc convention.
+- Honcho: github.com/plastic-labs/honcho (README, AGPL-3.0, ~7K stars,
+  coding-agent integrations + MCP tools) and its in-repo CLAUDE.md
+  (authoritative architecture: Postgres+pgvector/FTS, Redis, Deriver/
+  Dreamer/Dialectic, peer `(observer, observed)` collections, LanceDB/
+  Turbopuffer); honcho.dev/docs + docs.honcho.dev (peers, representations,
+  dialectic endpoint); plasticlabs.ai/blog/research/Benchmarking-Honcho +
+  evals.honcho.dev (vendor self-reported LongMemEval/LoCoMo/BEAM numbers,
+  2025-12-19); panews.io $5.35M pre-seed coverage (+ decentralized-identity
+  roadmap, absent from the repo); andrew.ooo independent review;
+  hermes-agent.nousresearch.com Honcho integration. Benchmarks are
+  vendor-reported and not independently reproduced. Analyzed inline in §3
+  per the no-standalone-doc convention.
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).

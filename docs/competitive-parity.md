@@ -56,14 +56,16 @@ None of the competitors below has more than one or two of these; none has all.
 | **Zep/Graphiti** (temporal KG) | **Yes** for self-hosting coders avoiding Neo4j+LLM (Community Edition is discontinued); **no** for enterprise graph-query/world-time | One binary on SQLite, zero-LLM, files, coding-harness native, a supported self-host | True bi-temporal (world vs observed time), Cypher/BFS graph queries, custom entity/edge types, `minRating` |
 | **Mem0** | **Mostly no — different buyer** (app end-user personalization). Yes only if you (mis)used it as coding-session memory | Zero-LLM, per-repo, cross-harness, editable pages, no API spend | Mem0's SDK/integration ecosystem + managed cloud personalization |
 | **Letta / MemOS** | **No** if you're building your agent *on* Letta; **yes** if you only wanted your existing coding agent to remember | Additive memory under your existing harness, zero-LLM, no runtime adoption | The ADE + agent-framework machinery (which you don't need unless building on Letta) |
-| **Mem0/Zep for apps; OpenViking, Supermemory** | different buyer (app/user personalization, hosted context DB) — **not migration targets** | — | — |
+| **Honcho** (Plastic Labs) | **No — different problem.** It models the *human* (theory-of-mind peer representations); we remember the *project* | If you (mis)used it for coding continuity: file-first git truth, zero-LLM, single-binary self-host, per-project scoping, no mandatory LLM egress | Its user-psychology reasoning engine (Deriver/Dreamer/Dialectic), published user-recall benchmarks, managed cloud — none of which a coding-memory user needs |
+| **Mem0/Zep for apps; OpenViking, Supermemory, Honcho** | different buyer (app/user personalization, hosted context DB, user-modeling) — **not migration targets** | — | — |
 
 Net: the premise holds where it should. For a **self-hosted, multi-harness,
 team, zero-LLM, data-ownership** coding-memory use case, ai-memory does the basics
 and adds a moat none of them fully have — migration is justified. It does *not*
-hold for app/user personalization (Mem0/Supermemory), enterprise graph queries
-(Zep Cloud), agent-building runtimes (Letta), or a solo dev happy with Claude's
-built-in — those are different buyers, and we should say so rather than overclaim.
+hold for app/user personalization (Mem0/Supermemory), user-modeling /
+theory-of-mind (Honcho), enterprise graph queries (Zep Cloud), agent-building
+runtimes (Letta), or a solo dev happy with Claude's built-in — those are
+different buyers, and we should say so rather than overclaim.
 
 ## Did we copy without improving? — the borrowed-ideas audit
 
@@ -124,7 +126,12 @@ implemented without a separate decision.** Ordered by leverage.
    (basic-memory's `build_context`/`memory://`, borrowed-but-unshipped); MCP tool
    behavior hints (readOnly/destructive/idempotent) on the 23-tool surface; a
    clustering/dedup consolidation pass (mcp-memory-service's DBSCAN); a read-only
-   graph visualization in `/web`; a first-class TS SDK story for ecosystem parity.
+   graph visualization in `/web`; a first-class TS SDK story for ecosystem parity;
+   an optional **dialectic/oracle query** (ask-a-question → synthesized answer)
+   and a **reasoning-tier knob** (Honcho) — but strictly as opt-in LLM layers
+   *over* the zero-LLM FTS/RRF core, never a requirement. Deliberately out of
+   scope: Honcho's theory-of-mind user-modeling engine (off-mission for coding
+   memory; the global-scope preferences page already covers the useful slice).
 7. **Fix doc staleness the audit surfaced** (accuracy, not features):
    `research-basic-memory.md` understates basic-memory's shipped cross-encoder
    reranking + Teams tier; `research-agentmemory.md` says 53 tools / 124 endpoints
