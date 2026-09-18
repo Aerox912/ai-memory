@@ -543,6 +543,10 @@ Additional boundary rules:
   against other memory tools (camps, migration notes, how the field validates
   the file-first/pages-over-facts approach). Analysis behind it:
   `research-2026-landscape.md`.
+- [`docs/competitive-parity.md`](docs/competitive-parity.md) — self-critical
+  internal audit: per-competitor migration-worthiness (do we do the basics +
+  add enough to justify switching?), the "did we copy without improving?"
+  borrowed-ideas verdicts, and documented gap-fill recommendations.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —
