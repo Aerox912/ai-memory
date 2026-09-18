@@ -352,7 +352,18 @@ camp: managed cloud connectors and LLM-required extraction in the **core** - if
 connectors ever land they belong in the companion importer as opt-in, outside
 the trusted boundary, so the file-first / zero-LLM model is preserved (the same
 line drawn for multimodal/PDF import: OCR/transcribe to markdown pages, never an
-opaque store).
+opaque store). On the other two axes the verdict is blunt: **security - nothing
+to borrow** (Supermemory is weaker on every axis we chose - opaque store,
+cloud-first, LLM-required, `containerTag` isolation vs our 3-tuple + invariant
+#16 - so this pass is confirmation of our posture, not a source of borrowings;
+the only security-relevant note is defensive: any future importer connector must
+cross the existing sanitizer boundary), and **performance - only f16/
+half-precision embedding storage is worth *evaluating*** (a stored-format change
+with a real recall-vs-size tradeoff, gated on `recall_eval.rs`), while their
+"sub-300ms p50" is a publish-a-number contract, not a change we need. Ranked, the
+only thing worth actually building is the metadata/tag filter; the eval triple is
+worth doing because it de-risks measuring anything else; f16 is evaluate-only;
+the rest is hold-or-reject. No implementation is scheduled here.
 
 **Deliberately not recommended:** joining the memory-OS camp (agent
 self-editing its memory - token-expensive, and Letta itself is hedging);
