@@ -29,8 +29,26 @@ pub struct Report {
     pub questions_scored: usize,
     pub abstention_excluded: usize,
     pub ks: Vec<usize>,
+    /// QA-accuracy provenance (R2b): which provider/model answered and which
+    /// graded. Names only — never keys. `None` on the default zero-LLM path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qa: Option<QaReportMeta>,
     pub slices: BTreeMap<String, SliceMetrics>,
     pub per_question: Vec<QuestionScore>,
+}
+
+/// QA-accuracy provenance for a run (R2b). Provider + model names only, so a
+/// published report never carries a key.
+#[derive(Debug, Clone, Serialize)]
+pub struct QaReportMeta {
+    /// Provider that synthesized/answered (e.g. `gemini`).
+    pub answer_provider: String,
+    /// Model that answered (e.g. `gemini-2.5-flash`).
+    pub answer_model: String,
+    /// Provider that graded (LLM-as-judge).
+    pub grader_provider: String,
+    /// Model that graded.
+    pub grader_model: String,
 }
 
 pub fn commit_sha() -> String {
@@ -104,6 +122,45 @@ fn slices_table_md(r: &Report) -> String {
     md
 }
 
+/// The per-slice QA-accuracy table (R2b). Only slices with graded questions
+/// contribute rows; returns an empty string when the run had no QA at all.
+fn qa_table_md(r: &Report) -> String {
+    let Some(meta) = &r.qa else {
+        return String::new();
+    };
+    let mut md = String::new();
+    md.push_str(&format!(
+        "\n### QA accuracy (live LLM)\n\n- answered by: {} `{}`\n- graded by: {} `{}`\n\n",
+        meta.answer_provider, meta.answer_model, meta.grader_provider, meta.grader_model,
+    ));
+    md.push_str(
+        "| slice | graded | correct | accuracy | ans p50 ms | ans p95 ms | ans tok mean |\n",
+    );
+    md.push_str("|---|---|---|---|---|---|---|\n");
+    for (name, m) in &r.slices {
+        if let Some(qa) = &m.qa {
+            md.push_str(&format!(
+                "| {name} | {} | {} | {:.3} | {} | {} | {:.1} |\n",
+                qa.graded,
+                qa.correct,
+                qa.accuracy,
+                qa.answer_latency_p50_ms,
+                qa.answer_latency_p95_ms,
+                qa.answer_tokens_mean,
+            ));
+        }
+    }
+    md
+}
+
+/// `overall`-slice QA accuracy, when the run graded any question.
+fn overall_qa_accuracy(r: &Report) -> Option<f64> {
+    r.slices
+        .get("overall")
+        .and_then(|m| m.qa.as_ref())
+        .map(|q| q.accuracy)
+}
+
 const METRIC_NOTES: &str = "\nNotes: hit@k = any evidence session in top k (the \"Recall@k\" most \
      systems publish); recall@k = fraction of evidence sessions found. \
      Latency is the `memory_query` MCP round trip (send→parse); ctx tok is \
@@ -121,6 +178,7 @@ pub fn to_markdown(r: &Report) -> String {
     md.push_str(&provenance_md(r));
     md.push_str(&format!("- mode: {}\n- config: {}\n\n", r.mode, r.config));
     md.push_str(&slices_table_md(r));
+    md.push_str(&qa_table_md(r));
     md.push_str(METRIC_NOTES);
     md
 }
@@ -144,6 +202,10 @@ pub struct AbDelta {
     pub latency_p95_ms: i128,
     pub context_tokens_mean: f64,
     pub context_tokens_median: f64,
+    /// candidate − baseline QA accuracy over the `overall` slice (R2b).
+    /// `None` unless both runs graded the overall slice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qa_accuracy: Option<f64>,
 }
 
 impl AbReport {
@@ -180,6 +242,13 @@ fn compute_delta(baseline: &Report, candidate: &Report) -> AbDelta {
         latency_p95_ms: c.latency_p95_ms as i128 - b.latency_p95_ms as i128,
         context_tokens_mean: c.context_tokens_mean - b.context_tokens_mean,
         context_tokens_median: c.context_tokens_median - b.context_tokens_median,
+        qa_accuracy: match (
+            overall_qa_accuracy(baseline),
+            overall_qa_accuracy(candidate),
+        ) {
+            (Some(b), Some(c)) => Some(c - b),
+            _ => None,
+        },
     }
 }
 
@@ -198,8 +267,10 @@ pub fn ab_to_markdown(r: &AbReport) -> String {
 
     md.push_str("## Baseline\n\n");
     md.push_str(&slices_table_md(&r.baseline));
+    md.push_str(&qa_table_md(&r.baseline));
     md.push_str("\n## Candidate\n\n");
     md.push_str(&slices_table_md(&r.candidate));
+    md.push_str(&qa_table_md(&r.candidate));
 
     // Delta table over the `overall` slice.
     let b = overall(&r.baseline);
@@ -234,6 +305,12 @@ pub fn ab_to_markdown(r: &AbReport) -> String {
         "| ctx tok median | {:.1} | {:.1} | {:+.1} |\n",
         b.context_tokens_median, c.context_tokens_median, r.delta.context_tokens_median
     ));
+    if let (Some(bq), Some(cq), Some(dq)) = (b.qa.as_ref(), c.qa.as_ref(), r.delta.qa_accuracy) {
+        md.push_str(&format!(
+            "| qa accuracy | {:.3} | {:.3} | {:+.3} |\n",
+            bq.accuracy, cq.accuracy, dq
+        ));
+    }
     md.push_str(METRIC_NOTES);
     md
 }
@@ -251,6 +328,7 @@ mod tests {
             latency_p95_ms: 34,
             context_tokens_mean: 100.0,
             context_tokens_median: 90.0,
+            qa: None,
         }
     }
 
@@ -268,6 +346,7 @@ mod tests {
             questions_scored: 2,
             abstention_excluded: 1,
             ks: vec![5],
+            qa: None,
             slices,
             per_question: vec![],
         }
@@ -300,6 +379,39 @@ mod tests {
         let md = ab_to_markdown(&ab);
         assert!(md.contains("A/B"));
         assert!(md.contains("| hit@5 | 0.500 | 0.500 | +0.000 |"), "{md}");
+    }
+
+    #[test]
+    fn qa_table_renders_only_when_qa_ran_and_carries_no_key() {
+        use super::super::score::QaSliceMetrics;
+        let mut r = report("embeddings=none reranker=off", 0.5, 0.25);
+        // No QA → no QA section.
+        assert!(!to_markdown(&r).contains("QA accuracy"));
+        // Attach QA.
+        r.qa = Some(QaReportMeta {
+            answer_provider: "gemini".into(),
+            answer_model: "gemini-2.5-flash".into(),
+            grader_provider: "gemini".into(),
+            grader_model: "gemini-2.5-flash".into(),
+        });
+        r.slices.get_mut("overall").unwrap().qa = Some(QaSliceMetrics {
+            graded: 2,
+            correct: 1,
+            accuracy: 0.5,
+            answer_latency_p50_ms: 800,
+            answer_latency_p95_ms: 1200,
+            answer_tokens_mean: 42.0,
+        });
+        let md = to_markdown(&r);
+        assert!(md.contains("QA accuracy (live LLM)"), "{md}");
+        assert!(
+            md.contains("answered by: gemini `gemini-2.5-flash`"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| overall | 2 | 1 | 0.500 | 800 | 1200 | 42.0 |"),
+            "{md}"
+        );
     }
 
     #[test]

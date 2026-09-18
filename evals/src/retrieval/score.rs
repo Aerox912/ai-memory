@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::Serialize;
 
+use super::qa::QaOutcome;
 use super::query::Retrieved;
 
 /// Per-question outcome, ready for aggregation.
@@ -33,6 +34,11 @@ pub struct QuestionScore {
     /// Estimated context tokens the result would cost the agent (chars/4
     /// over returned hit titles + snippets).
     pub context_tokens: usize,
+    /// End-to-end QA outcome (R2b, opt-in): a candidate answer graded
+    /// against the gold answer. `None` on the default zero-LLM path and for
+    /// any question whose QA step failed (logged, left ungraded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qa: Option<QaOutcome>,
 }
 
 /// Score one question's retrieval run.
@@ -82,6 +88,9 @@ pub fn score_question(
         retrieved_sessions: ranked_sessions.len(),
         latency_ms,
         context_tokens,
+        // R2a scoring is answer-agnostic; the QA path attaches its outcome
+        // afterward, keeping this function pure and deterministic.
+        qa: None,
     }
 }
 
@@ -99,6 +108,51 @@ pub struct SliceMetrics {
     /// Context-token estimate central tendency over the slice.
     pub context_tokens_mean: f64,
     pub context_tokens_median: f64,
+    /// End-to-end QA metrics over the slice (R2b). `None` unless QA mode ran
+    /// and at least one question in the slice was graded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qa: Option<QaSliceMetrics>,
+}
+
+/// Aggregated QA-accuracy metrics for one slice (R2b): fraction of graded
+/// answers the LLM judge marked correct, plus the answer-path latency and
+/// token estimates so the accuracy/latency/context triple stays meaningful
+/// for the synthesized-answer path, not only for retrieval.
+#[derive(Debug, Clone, Serialize)]
+pub struct QaSliceMetrics {
+    /// Questions in the slice that produced a graded answer.
+    pub graded: usize,
+    /// Of the graded, how many the judge marked correct.
+    pub correct: usize,
+    /// `correct / graded` (0.0 when nothing was graded).
+    pub accuracy: f64,
+    /// Answer-step latency percentiles over graded questions, milliseconds.
+    pub answer_latency_p50_ms: u128,
+    pub answer_latency_p95_ms: u128,
+    /// Mean answer-token estimate (chars/4 over synthesis prompt + answer).
+    pub answer_tokens_mean: f64,
+}
+
+impl QaSliceMetrics {
+    /// Aggregate the graded QA outcomes in one slice, or `None` when the
+    /// slice has no graded questions.
+    fn from_group(group: &[&QuestionScore]) -> Option<Self> {
+        let graded: Vec<&QaOutcome> = group.iter().filter_map(|s| s.qa.as_ref()).collect();
+        if graded.is_empty() {
+            return None;
+        }
+        let correct = graded.iter().filter(|o| o.correct).count();
+        let latencies: Vec<u128> = graded.iter().map(|o| o.answer_latency_ms).collect();
+        let tokens_sum: usize = graded.iter().map(|o| o.answer_tokens).sum();
+        Some(Self {
+            graded: graded.len(),
+            correct,
+            accuracy: correct as f64 / graded.len() as f64,
+            answer_latency_p50_ms: percentile_u128(&latencies, 0.50),
+            answer_latency_p95_ms: percentile_u128(&latencies, 0.95),
+            answer_tokens_mean: tokens_sum as f64 / graded.len() as f64,
+        })
+    }
 }
 
 /// Nearest-rank percentile (`p` in 0.0..=1.0) over a copy-sorted slice.
@@ -161,6 +215,7 @@ pub fn aggregate(scores: &[QuestionScore], ks: &[usize]) -> BTreeMap<String, Sli
                     latency_p95_ms: percentile_u128(&latencies, 0.95),
                     context_tokens_mean: tokens_sum as f64 / n,
                     context_tokens_median: median_f64(&tokens),
+                    qa: QaSliceMetrics::from_group(&group),
                 },
             )
         })
@@ -318,6 +373,77 @@ mod tests {
         // Nearest-rank p50 over [10, 30] → rank ceil(0.5*2)=1 → 10.
         assert_eq!(agg["overall"].latency_p50_ms, 10);
         assert_eq!(agg["overall"].latency_p95_ms, 30);
+    }
+
+    fn qa(correct: bool, latency_ms: u128, tokens: usize) -> QaOutcome {
+        QaOutcome {
+            correct,
+            answer_source: "synthesized",
+            answer: "a".into(),
+            grade_reason: "r".into(),
+            answer_latency_ms: latency_ms,
+            answer_tokens: tokens,
+        }
+    }
+
+    #[test]
+    fn qa_aggregates_only_over_graded_questions() {
+        let e = uuid::Uuid::now_v7();
+        let mut graded = score_question(
+            "q1",
+            "single-session-user",
+            &HashSet::from([e]),
+            &retrieved(&[Some(e)]),
+            &[1],
+            10,
+            100,
+        );
+        graded.qa = Some(qa(true, 800, 40));
+        let mut also_graded = score_question(
+            "q2",
+            "single-session-user",
+            &HashSet::from([uuid::Uuid::now_v7()]),
+            &retrieved(&[]),
+            &[1],
+            20,
+            50,
+        );
+        also_graded.qa = Some(qa(false, 1200, 60));
+        // A third question with QA off (None) must not count toward graded.
+        let ungraded = score_question(
+            "q3",
+            "single-session-user",
+            &HashSet::from([uuid::Uuid::now_v7()]),
+            &retrieved(&[]),
+            &[1],
+            30,
+            10,
+        );
+
+        let agg = aggregate(&[graded, also_graded, ungraded], &[1]);
+        let qa = agg["overall"].qa.as_ref().expect("overall has QA");
+        assert_eq!(qa.graded, 2);
+        assert_eq!(qa.correct, 1);
+        assert_eq!(qa.accuracy, 0.5);
+        assert_eq!(qa.answer_tokens_mean, 50.0);
+        assert_eq!(qa.answer_latency_p50_ms, 800);
+        assert_eq!(qa.answer_latency_p95_ms, 1200);
+    }
+
+    #[test]
+    fn qa_metrics_absent_when_no_question_was_graded() {
+        let e = uuid::Uuid::now_v7();
+        let s = score_question(
+            "q",
+            "single-session-user",
+            &HashSet::from([e]),
+            &retrieved(&[Some(e)]),
+            &[1],
+            0,
+            0,
+        );
+        let agg = aggregate(&[s], &[1]);
+        assert!(agg["overall"].qa.is_none());
     }
 
     #[test]

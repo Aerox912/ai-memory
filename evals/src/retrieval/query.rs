@@ -20,6 +20,17 @@ pub struct Retrieved {
     pub session_uuid: Option<uuid::Uuid>,
 }
 
+/// The title + snippet text of one retrieval hit, in rank order. This is
+/// exactly what `memory_query` puts in front of the agent, and the context
+/// the R2b QA answer-synthesizer reads to produce a candidate answer.
+#[derive(Debug, Clone)]
+pub struct HitContext {
+    /// Hit title (page title or raw observation title).
+    pub title: String,
+    /// Hit snippet (the bounded excerpt the agent would read).
+    pub snippet: String,
+}
+
 /// Outcome of one `memory_query` call: the ranked hits plus the two
 /// R2 observability signals — how long the round trip took and how much
 /// context the agent would have to read to consume the result.
@@ -27,6 +38,16 @@ pub struct Retrieved {
 pub struct QueryOutcome {
     /// Flattened ranked session attributions (index 0 = best).
     pub retrieved: Vec<Retrieved>,
+    /// Ranked hit contexts (title + snippet), same order as `retrieved`.
+    /// The QA answer-synthesizer (R2b) reads these; the R2a scoring path
+    /// ignores them, so the default zero-LLM run is unaffected.
+    pub contexts: Vec<HitContext>,
+    /// A server-provided answer, when a (future) `answer=true` feature
+    /// populates a top-level `answer` field on the `memory_query` result.
+    /// `None` today; the QA path falls back to harness synthesis when it is
+    /// absent or blank. Detecting it now future-proofs R2b for the B4
+    /// `answer`/`reasoning` MCP features without a harness change.
+    pub answer: Option<String>,
     /// Wall-clock of the `memory_query` MCP round trip (request send →
     /// response parsed).
     pub latency: Duration,
@@ -45,6 +66,11 @@ struct QueryResponse {
     hits: Vec<PageHitLite>,
     #[serde(default)]
     raw_hits: Vec<RawHitLite>,
+    /// Optional server-synthesized answer (future `answer=true` feature).
+    /// Unknown fields are ignored by serde, so this is forward-compatible:
+    /// today's server simply never sets it.
+    #[serde(default)]
+    answer: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,23 +189,39 @@ pub async fn memory_query(
         .ok_or_else(|| anyhow::anyhow!("memory_query returned no text content: {result}"))?;
     let parsed: QueryResponse =
         serde_json::from_str(text).with_context(|| format!("parsing memory_query JSON: {text}"))?;
-    let (retrieved, context_tokens) = flatten(parsed);
+    // A blank/whitespace `answer` is treated as absent so the QA path falls
+    // back to harness synthesis rather than grading an empty string.
+    let answer = parsed
+        .answer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let (retrieved, contexts, context_tokens) = flatten(parsed);
     Ok(QueryOutcome {
         retrieved,
+        contexts,
+        answer,
         latency: started.elapsed(),
         context_tokens,
     })
 }
 
-/// Flatten pages + raw hits into ranked session attributions, and sum the
-/// context-token estimate over every hit's `title` + `snippet`.
-fn flatten(resp: QueryResponse) -> (Vec<Retrieved>, usize) {
+/// Flatten pages + raw hits into ranked session attributions and their
+/// title+snippet contexts, and sum the context-token estimate over every
+/// hit's `title` + `snippet`.
+fn flatten(resp: QueryResponse) -> (Vec<Retrieved>, Vec<HitContext>, usize) {
     let mut out = Vec::new();
+    let mut contexts = Vec::new();
     let mut chars = 0usize;
     for hit in resp.hits {
         chars += hit.title.chars().count() + hit.snippet.chars().count();
         out.push(Retrieved {
             session_uuid: session_uuid_from_path(&hit.path),
+        });
+        contexts.push(HitContext {
+            title: hit.title,
+            snippet: hit.snippet,
         });
     }
     for hit in resp.raw_hits {
@@ -187,8 +229,12 @@ fn flatten(resp: QueryResponse) -> (Vec<Retrieved>, usize) {
         out.push(Retrieved {
             session_uuid: Some(hit.session_id),
         });
+        contexts.push(HitContext {
+            title: hit.title,
+            snippet: hit.snippet,
+        });
     }
-    (out, estimate_tokens(chars))
+    (out, contexts, estimate_tokens(chars))
 }
 
 /// `sessions/<uuid>.md` → the owning session; anything else → None.
@@ -227,11 +273,14 @@ mod tests {
                 title: String::new(),
                 snippet: String::new(),
             }],
+            answer: None,
         };
-        let (flat, _) = flatten(resp);
+        let (flat, contexts, _) = flatten(resp);
         assert_eq!(flat.len(), 2);
         assert_eq!(flat[0].session_uuid, Some(a));
         assert_eq!(flat[1].session_uuid, Some(b));
+        // Contexts track the flattened hits one-for-one, in the same order.
+        assert_eq!(contexts.len(), 2);
     }
 
     #[test]
@@ -251,9 +300,14 @@ mod tests {
                 title: "ijkl".into(),
                 snippet: "mnop".into(),
             }],
+            answer: None,
         };
-        let (_, tokens) = flatten(resp);
+        let (_, contexts, tokens) = flatten(resp);
         assert_eq!(tokens, 4);
+        // Snippets are preserved verbatim for the QA synthesizer.
+        assert_eq!(contexts[0].title, "abcd");
+        assert_eq!(contexts[0].snippet, "efgh");
+        assert_eq!(contexts[1].snippet, "mnop");
     }
 
     #[test]

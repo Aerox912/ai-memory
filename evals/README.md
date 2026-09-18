@@ -252,6 +252,42 @@ Output: `evals/runs/<timestamp>-retrieval/report.{json,md}` — the JSON is
 triples and an `overall` delta table. Publish full-dataset A/B numbers in
 `docs/benchmarks/retrieval-ab-r2.md`.
 
+### `retrieval` QA-accuracy mode (R2b, opt-in, live LLM)
+
+R2a scores *retrieval*. `--qa` adds an opt-in **end-to-end answer-quality**
+metric so the `answer`/`reasoning` MCP features can be proven later. It is
+**OFF by default and makes REAL LLM API calls**, gated behind a key. Per
+scored question, with QA on, the harness:
+
+1. gets a candidate answer — the server's own `answer` field when a future
+   `answer=true` feature populates it, otherwise a **synthesis** LLM call
+   over the retrieved snippets (the exact context an agent would receive);
+2. **grades** that candidate against the dataset's gold answer with an
+   LLM-as-judge (`{correct, reason}`), LongMemEval-style;
+3. reports **QA accuracy** (fraction correct) per slice — plus the
+   answer-step latency (p50/p95) and answer-token estimate — alongside the
+   R2a triple, in both the single-config and A/B reports. Provider+model
+   names are recorded; **keys never are**.
+
+Flags: `--qa`, `--qa-provider <name>`, `--qa-model <model>` (required to
+enable), `--qa-base-url`, `--qa-api-key`/`--qa-api-key-env` (defaults to the
+provider's canonical env var, e.g. `GEMINI_API_KEY`), `--qa-token-file`
+(oauth/codex/copilot). The grader defaults to the answerer and is overridable
+per field: `--qa-grader-provider`/`-model`/`-base-url`/`-api-key`/
+`-api-key-env`/`-token-file`.
+
+**Gating:** if `--qa` is set but the provider/key cannot be resolved, the run
+prints a SKIP line and continues with QA off (retrieval metrics unaffected),
+exiting success — so a keyless CI stays green. The default non-QA path stays
+zero-LLM and deterministic.
+
+```bash
+# Keep keys in the process env only for the run; never echo a key.
+set -a; source ~/.config/zsh/secrets; set +a   # or export GEMINI_API_KEY=...
+cargo run -p ai-memory-eval -- retrieval --sample 3 \
+    --qa --qa-provider gemini --qa-model gemini-2.5-flash
+```
+
 Honest-numbers notes:
 
 - capture is production-shaped: excerpts are bounded at the 2 KB

@@ -18,6 +18,7 @@
 
 mod dataset;
 mod ingest;
+mod qa;
 mod query;
 mod report;
 mod score;
@@ -122,6 +123,68 @@ pub struct RetrievalArgs {
     /// repeatable.
     #[arg(long = "candidate-query-arg", value_name = "KEY=JSON")]
     candidate_query_arg: Vec<String>,
+
+    // ---- QA-accuracy mode (R2b, opt-in, live LLM) ----
+    /// Enable end-to-end QA-accuracy grading (real LLM API calls). OFF by
+    /// default. Per scored question the harness synthesizes an answer from
+    /// the retrieved snippets (or uses a server-provided `answer` field when
+    /// present) and grades it against the gold answer with an LLM judge.
+    /// Requires `--qa-provider` + `--qa-model` and a resolvable key; if the
+    /// key/provider cannot be resolved the run SKIPS QA (retrieval metrics
+    /// are unaffected) instead of failing.
+    #[arg(long)]
+    qa: bool,
+
+    /// QA answerer/judge provider
+    /// (`anthropic|openai|openai-compat|openai-oauth|codex|copilot|gemini`).
+    #[arg(long)]
+    qa_provider: Option<String>,
+
+    /// QA answerer model id.
+    #[arg(long)]
+    qa_model: Option<String>,
+
+    /// QA answerer base URL (omit for native vendors).
+    #[arg(long)]
+    qa_base_url: Option<String>,
+
+    /// QA answerer API key (raw value). Prefer `--qa-api-key-env` or the
+    /// provider's default env var.
+    #[arg(long)]
+    qa_api_key: Option<String>,
+
+    /// Env var to read the QA answerer API key from (defaults to the
+    /// provider's canonical env var, e.g. `GEMINI_API_KEY`).
+    #[arg(long)]
+    qa_api_key_env: Option<String>,
+
+    /// Auth file for a QA answerer using `openai-oauth`/`codex`/`copilot`.
+    #[arg(long)]
+    qa_token_file: Option<PathBuf>,
+
+    /// QA grader provider; defaults to `--qa-provider`.
+    #[arg(long)]
+    qa_grader_provider: Option<String>,
+
+    /// QA grader model; defaults to `--qa-model`.
+    #[arg(long)]
+    qa_grader_model: Option<String>,
+
+    /// QA grader base URL; defaults to `--qa-base-url`.
+    #[arg(long)]
+    qa_grader_base_url: Option<String>,
+
+    /// QA grader API key (raw); defaults to `--qa-api-key`.
+    #[arg(long)]
+    qa_grader_api_key: Option<String>,
+
+    /// Env var for the QA grader API key; defaults to `--qa-api-key-env`.
+    #[arg(long)]
+    qa_grader_api_key_env: Option<String>,
+
+    /// Auth file for the QA grader; defaults to `--qa-token-file`.
+    #[arg(long)]
+    qa_grader_token_file: Option<PathBuf>,
 }
 
 impl RetrievalArgs {
@@ -312,8 +375,37 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
         }
     }
 
+    // QA-accuracy mode (R2b): opt-in, live LLM. Resolve the answerer +
+    // grader once and share them across both configs. If QA is requested but
+    // a provider/key can't be resolved, SKIP cleanly (retrieval metrics are
+    // unaffected) rather than failing the run — mirroring live-LLM tests.
+    let qa_engine = if args.qa {
+        match qa::QaEngine::resolve(&args) {
+            Ok(engine) => {
+                println!("QA-accuracy mode ON (live LLM): {}", engine.summary());
+                tracing::info!(qa = engine.summary(), "QA-accuracy mode enabled");
+                Some(Arc::new(engine))
+            }
+            Err(e) => {
+                println!("QA-accuracy mode requested but SKIPPED: {e:#}");
+                tracing::warn!(error = %format!("{e:#}"), "QA-accuracy mode skipped");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let abstention_n = abstention.len();
-    let baseline_report = run_config(&args, &baseline, &questions, abstention_n, &commit).await?;
+    let baseline_report = run_config(
+        &args,
+        &baseline,
+        &questions,
+        abstention_n,
+        &commit,
+        qa_engine.clone(),
+    )
+    .await?;
 
     // Timestamped run dir shared by single-config and A/B outputs.
     let stamp: String = Timestamp::now()
@@ -335,8 +427,15 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
             println!("{md}");
         }
         Some(candidate) => {
-            let candidate_report =
-                run_config(&args, &candidate, &questions, abstention_n, &commit).await?;
+            let candidate_report = run_config(
+                &args,
+                &candidate,
+                &questions,
+                abstention_n,
+                &commit,
+                qa_engine.clone(),
+            )
+            .await?;
             let ab = report::AbReport::new(baseline_report, candidate_report);
             std::fs::write(run_dir.join("report.json"), serde_json::to_vec_pretty(&ab)?)?;
             let md = report::ab_to_markdown(&ab);
@@ -358,6 +457,7 @@ async fn run_config(
     questions: &[Question],
     abstention_n: usize,
     commit: &str,
+    qa: Option<Arc<qa::QaEngine>>,
 ) -> Result<report::Report> {
     let server = EvalServer::launch(&args.server_bin, args.keep_data_dir, &knobs.launch_config())
         .await
@@ -383,11 +483,12 @@ async fn run_config(
     let mut tasks = tokio::task::JoinSet::new();
     for q in questions.iter().cloned() {
         let permit = semaphore.clone().acquire_owned().await?;
-        let (client, base_url, ks, query_args) = (
+        let (client, base_url, ks, query_args, qa) = (
             client.clone(),
             base_url.clone(),
             ks.clone(),
             query_args.clone(),
+            qa.clone(),
         );
         tasks.spawn(async move {
             let _permit = permit;
@@ -410,7 +511,7 @@ async fn run_config(
                 .iter()
                 .map(|s| stored_session_uuid(s))
                 .collect();
-            let score = score::score_question(
+            let mut score = score::score_question(
                 &q.question_id,
                 &q.question_type,
                 &evidence,
@@ -419,6 +520,22 @@ async fn run_config(
                 outcome.latency.as_millis(),
                 outcome.context_tokens,
             );
+            // QA-accuracy (R2b): answer + grade. A QA failure for one
+            // question is logged and left ungraded — it must not waste the
+            // whole retrieval run (retrieval numbers are already collected).
+            if let Some(engine) = qa.as_ref() {
+                match engine
+                    .evaluate(&q.question, &q.gold_answer_text(), &outcome)
+                    .await
+                {
+                    Ok(qa_outcome) => score.qa = Some(qa_outcome),
+                    Err(e) => tracing::warn!(
+                        question = q.question_id,
+                        error = %format!("{e:#}"),
+                        "QA grading failed; question left ungraded"
+                    ),
+                }
+            }
             tracing::info!(
                 question = q.question_id,
                 events,
@@ -426,6 +543,7 @@ async fn run_config(
                 latency_ms = outcome.latency.as_millis() as u64,
                 context_tokens = outcome.context_tokens,
                 hit_at_max = score.hit_at.values().next_back().copied().unwrap_or(0.0),
+                qa_correct = score.qa.as_ref().map(|o| o.correct),
                 "scored"
             );
             anyhow::Ok(score)
@@ -468,6 +586,7 @@ async fn run_config(
         questions_scored: scores.len(),
         abstention_excluded: abstention_n,
         ks: args.ks.clone(),
+        qa: qa.as_ref().map(|e| e.report_meta()),
         slices,
         per_question: scores,
     })
