@@ -426,7 +426,7 @@ for mistaken handoff creation. `memory_feedback` implements the
 without conflating read and write semantics, and the access counter it
 supplements cannot tell "this page answered the question" from "this page
 wasted a read". The narrow-surface discipline still holds —
-every new tool has to earn its slot — but the count is 17, not 10.
+every new tool has to earn its slot — but the count is now 23, not 10.
 
 The managed Agent Skills are a narrow prompt-packaging exception to the
 otherwise wiki-centered architecture. They are static `SKILL.md` files that
