@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scopes` search; `global` and `as_of` queries ignore it. Honest caveat: the
   feature is new and its answer quality is not yet eval-validated — treat the
   synthesized answer as a convenience over the same hits and still open the
-  cited pages before acting (#NNN).
+  cited pages before acting (#782).
 - "Pin before search": `memory_query` gained an opt-in `pin_first` argument and
   `memory_briefing` now carries a bounded `pinned` list (default off/absent;
   targets the 2.4 line). Pinned pages previously earned only a small post-RRF
