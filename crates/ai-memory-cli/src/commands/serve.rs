@@ -1396,6 +1396,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
             )?;
             let router = machine
+                .merge(healthz_router())
                 .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
@@ -2336,6 +2337,22 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     }
     command.push_str(" --prompt ping");
     command
+}
+
+/// Liveness probe for process supervisors.
+///
+/// Unauthenticated on purpose: launchd, systemd and `HEALTHCHECK` have no
+/// bearer token, and the answer ("this process is listening") is already
+/// observable by connecting to the port. It reads nothing and reports no
+/// store, provider or auth state.
+///
+/// Without it the only live signal is `GET /mcp` answering 405, which is an
+/// accident of method routing rather than a contract a supervisor can rely on.
+fn healthz_router() -> axum::Router {
+    axum::Router::new().route(
+        "/healthz",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({ "status": "ok" })) }),
+    )
 }
 
 fn apply_host_layer(router: axum::Router, allowed_hosts: Vec<String>) -> axum::Router {
@@ -4028,7 +4045,8 @@ mod tests {
                 require_dual_auth,
             )))
             .merge(web.public)
-            .merge(ai_memory_web::favicon_router());
+            .merge(ai_memory_web::favicon_router())
+            .merge(healthz_router());
 
         // Mutation captured: dropping any host-owned route merge lets the root SPA
         // wildcard return its HTML shell instead of the reserved route response.
@@ -4056,6 +4074,21 @@ mod tests {
                 "{path} must reach its authenticated host route"
             );
         }
+
+        // A supervisor probing liveness sends no bearer token, so /healthz has to
+        // answer 200 with auth configured — and it is a host-owned route like the
+        // ones above, so the SPA wildcard must not serve its shell here either.
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
 
         let api = router
             .clone()
