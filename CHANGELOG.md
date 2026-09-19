@@ -71,13 +71,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour is byte-identical to the previous latest-only retrieval, and
   `global=true` and `as_of` time-travel are unaffected (#773).
 
+### Changed
+- `memory_consolidate` accepts an omitted `session_id`. Omitting the field (or
+  sending `null`) no longer fails deserialization with `missing field
+  session_id`; the tool consolidates the latest completed session in the
+  resolved project — the same default `memory_auto_improve` and
+  `memory_read_session_observations` already use. Pass an explicit UUID to
+  target a specific session, and `dry_run=true` for the cheap admission
+  preflight. A project with no completed session now fails as
+  `no completed session in <scope>` instead of a deserialization error.
+- A consolidation LLM call that fails on a transient provider error (`429`, any
+  `5xx`, a transport timeout or connect failure) is retried twice, two seconds
+  apart, before the failure is reported — the same bounded policy `bootstrap`
+  already applies to its chunks. Deterministic failures (auth, schema, a
+  malformed-request `4xx`, unparseable or truncated output) are still reported
+  on the first attempt, since retrying them only burns another call.
+
 ### Fixed
+- `ai-memory serve` no longer hard-fails to take its single-instance lock on a
+  transient error under load. Acquiring the serve lock now retries `open` and
+  `try_lock_exclusive` a few times with a short (~25ms) backoff when they hit a
+  transient failure (EMFILE/ENFILE fd exhaustion, EINTR), mirroring
+  `acquire_drain_lock`. A genuinely contended lock (`WouldBlock`, another server
+  holds it) is never retried and still refuses startup immediately. The
+  serve-lock tests also assert with the concrete errno so any remaining
+  environmental flake is diagnosable rather than silent (#745).
+- GitHub Copilot completion requests now select the model-advertised API
+  endpoint from `/models`: existing Chat Completions remains preferred when
+  available, while Responses-only models use `/responses`. Responses requests
+  preserve strict JSON Schema structured-output constraints and report empty,
+  refused, or rejected output without silently downgrading the contract. A model
+  the `/models` catalogue does not enumerate (enterprise/custom deployments,
+  aliases, a model newer than the list) falls back to Chat Completions with a
+  warning instead of erroring, matching the graceful fallback already used when
+  `/models` is unavailable. As a related behavior change, a Copilot chat
+  completion that returns empty content now reports `UnexpectedShape` rather
+  than yielding an empty string. (#761)
+- The V62 page-ingestion-window migration no longer runs its backfill inside a
+  single migration transaction, which on a large store ran for hours and grew
+  the WAL to roughly the size of the database with no progress. V62 is now
+  DDL-only (the two columns plus their index); the window backfill moved to a
+  chunked, resumable, WAL-bounded boot-path step that processes pages in bounded
+  batches, checkpoints the WAL (`TRUNCATE`) between each, and logs progress. The
+  end state is byte-identical to the original V62, the step resumes rather than
+  restarts if interrupted, and it is a fast no-op on a store that already applied
+  the original V62. Because that reshape changes the migration's checksum, the
+  runner now intentionally tolerates a divergent checksum on an already-applied
+  migration (`abort_divergent = false`) so correctly-migrated stores still open;
+  the schema-ahead guard (`abort_missing`) is unchanged (#776).
+- Page writes now refuse git-reserved and non-portable page paths (a `.git`
+  component or an 8.3 `git~1`..`git~4` alias, Windows-reserved names and
+  characters) on every write funnel, including MCP `memory_write_page` and
+  consolidation `apply_batch`; reads of already-stored pages stay tolerant so
+  a bad row never breaks a listing. The git-reserved check is byte-safe and no
+  longer panics on a 5-byte multibyte path component (#781).
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted
   only `title`/`projectID` on `session.created`, so the marker never reached the
   server and the opt-in was a silent no-op for OpenCode. Root sessions (no
   `parentID`) stay unmarked (#755).
+- Scope-resolution failures over MCP now answer with `invalid params`
+  (`-32602`) instead of an opaque internal error (`-32603`), the same split the
+  web route applies with its 400/404: a malformed scope argument, or a
+  workspace/project name that does not resolve, is caller input, while a
+  missing writer handle or an underlying store failure stays internal. The
+  messages are unchanged.
+- `memory_consolidate` treats a blank `session_id` (`""` or whitespace) exactly
+  like an omitted one — the resolved project's latest completed session — and a
+  malformed id now fails as `invalid params`, the code `memory_auto_improve`
+  already uses for the same argument.
 
 ## [2.3.1] - 2026-09-17
 

@@ -1080,8 +1080,11 @@ struct LintArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ConsolidateArgs {
-    /// UUID of the session to consolidate.
-    session_id: String,
+    /// UUID of the session to consolidate. Omit to consolidate the latest
+    /// completed session in the resolved project; pass it to target a
+    /// specific session.
+    #[serde(default)]
+    session_id: Option<String>,
     /// If true, preview without writing. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
@@ -1570,8 +1573,21 @@ impl AiMemoryServer {
             .with_active_project(&self.active_project)
     }
 
+    /// Map a scope-resolution failure to the error the caller can act on.
+    ///
+    /// A malformed scope argument, or a name that does not resolve to an
+    /// existing workspace/project, is caller input rather than a server fault:
+    /// it maps to `invalid_params` (`-32602`), the same split the web route
+    /// applies with its 400/404 (`ai-memory-web/src/routes/api.rs::
+    /// scope_error_response`). Only the remaining classes — a missing writer
+    /// handle for a create-on-write resolution, or an underlying store failure
+    /// — stay `internal_error` (`-32603`).
     fn scope_error(err: ai_memory_store::ScopeResolutionError) -> McpError {
-        McpError::internal_error(err.to_string(), None)
+        if err.is_bad_request() || err.is_not_found() {
+            McpError::invalid_params(err.to_string(), None)
+        } else {
+            McpError::internal_error(err.to_string(), None)
+        }
     }
 
     /// Construct a server backed by the given reader/writer + 3-tuple
@@ -2991,7 +3007,9 @@ impl AiMemoryServer {
         (single-page) rewrites sessions/<id>.md from the observation \
         log. multi_page=true fans out into a batch of concept/decision/\
         gotcha pages plus the session page, all written in one atomic \
-        SQL transaction. Off by default; requires AI_MEMORY_LLM_PROVIDER \
+        SQL transaction. Omit `session_id` to consolidate the latest \
+        completed session in the resolved project; pass it to target a \
+        specific session. Off by default; requires AI_MEMORY_LLM_PROVIDER \
         plus that provider's credentials. AI_MEMORY_LLM_MODEL is optional \
         for providers with a built-in default. \
         The target project's `_prompts/consolidation.md` page supplies \
@@ -3018,8 +3036,43 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = SessionId::from_str(&args.session_id)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // A blank id (`""` or whitespace) means the same thing as an omitted
+        // one — the resolved project's latest completed session — exactly as
+        // `memory_read_session_observations` already reads it. Anything else
+        // that is not a UUID is caller input, so it fails as `invalid_params`,
+        // the code `memory_auto_improve` uses for the same argument.
+        let session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            Some(raw) => SessionId::from_str(raw)
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
+            _ => {
+                let aps_actor = Self::actor_key_from_parts(Some(&parts));
+                let (ws, proj) = self
+                    .effective_ids_for_read_args_with_actor(None, None, &aps_actor)
+                    .await?;
+                let latest = self
+                    .reader
+                    .latest_completed_session_for_project(ws, proj)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                match latest {
+                    Some(session_id) => session_id,
+                    None => {
+                        let scope = self.scope_label(ws, proj).await;
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "no completed session in {scope}; pass session_id to consolidate a specific session"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+        };
         let dry = args.dry_run.unwrap_or(false);
         // Carry the request's authenticated identity into the write so the
         // consolidated page is attributed to the real operator and any
@@ -3355,6 +3408,8 @@ impl AiMemoryServer {
             .parse()
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
+            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        path.ensure_portable()
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
@@ -10020,6 +10075,59 @@ mod tests {
         assert!(text.contains("\"pages_latest\": 1"));
     }
 
+    /// A scope that does not resolve is caller input, not a server fault: the
+    /// tool must answer with `invalid params` (`-32602`) instead of an opaque
+    /// internal error (`-32603`), and keep the message callers already match on.
+    #[tokio::test]
+    async fn memory_status_reports_an_unknown_project_as_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let err = server
+            .memory_status(
+                Parameters(StatusArgs {
+                    project: Some("caminhar".into()),
+                    workspace: Some("default".into()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("an unknown project must be rejected");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            err.message, "project 'caminhar' not found in workspace 'default'",
+            "the scope message must not change"
+        );
+    }
+
+    /// The classification is by error class, not by tool: a malformed scope
+    /// argument is `invalid params` (the not-found half is covered by the tool
+    /// test above), while a missing writer handle or an underlying store
+    /// failure stay internal errors — the caller cannot fix those by changing
+    /// the request.
+    #[test]
+    fn scope_error_keeps_internal_failures_internal() {
+        use ai_memory_store::ScopeResolutionError;
+
+        for err in [
+            ScopeResolutionError::WorkspaceProjectPairRequired,
+            ScopeResolutionError::ScopeProjectEmpty,
+        ] {
+            assert_eq!(
+                AiMemoryServer::scope_error(err).code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+            );
+        }
+
+        for err in [
+            ScopeResolutionError::WriterRequired,
+            ScopeResolutionError::Store("disk on fire".into()),
+        ] {
+            assert_eq!(
+                AiMemoryServer::scope_error(err).code,
+                rmcp::model::ErrorCode::INTERNAL_ERROR,
+            );
+        }
+    }
+
     #[tokio::test]
     async fn memory_briefing_returns_structured_snapshot() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -10379,8 +10487,64 @@ mod tests {
             .unwrap();
         assert!(
             recent_text.contains("notes/santander-2025.md"),
-            "write-page result must be visible to read tools; got {recent_text}"
+            "got {recent_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_write_page_refuses_git_reserved_and_non_portable_paths() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        for bad in [
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+            "CON.md",
+            "notes/aux.md",
+            "notes/a|b.md",
+        ] {
+            let err = server
+                .memory_write_page(
+                    Parameters(WritePageArgs {
+                        path: bad.into(),
+                        body: "# Bad\n\nShould be refused.".into(),
+                        title: None,
+                        tier: None,
+                        tags: vec![],
+                        pinned: false,
+                        project: None,
+                        workspace: None,
+                        scope: None,
+                        expires_at: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid path"),
+                "expected invalid path error for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -12161,7 +12325,7 @@ mod tests {
         let err = server
             .memory_consolidate(
                 Parameters(ConsolidateArgs {
-                    session_id: "00000000-0000-0000-0000-000000000000".into(),
+                    session_id: Some("00000000-0000-0000-0000-000000000000".into()),
                     dry_run: Some(true),
                     multi_page: Some(false),
                     instructions: None,
@@ -12182,6 +12346,199 @@ mod tests {
         assert!(
             msg.contains("without a built-in model"),
             "error should not imply every provider needs an explicit model: {msg}",
+        );
+    }
+
+    /// An omitted `session_id` must not fail at the tool boundary: the call
+    /// reaches the consolidator and resolves the latest COMPLETED session of
+    /// the resolved project, skipping an open one — the same default the
+    /// read-only tools use.
+    #[tokio::test]
+    async fn memory_consolidate_defaults_to_latest_completed_session() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let completed = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            true,
+            &[(ObservationKind::UserPrompt, "done", "completed work")],
+        )
+        .await;
+        let _open = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            false,
+            &[(ObservationKind::UserPrompt, "live", "still running")],
+        )
+        .await;
+
+        let outcome = call_tool_json(
+            server
+                .memory_consolidate(
+                    Parameters(ConsolidateArgs {
+                        session_id: None,
+                        dry_run: Some(true),
+                        multi_page: Some(false),
+                        instructions: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            outcome["path"],
+            format!("sessions/{completed}.md"),
+            "the omitted session_id must resolve the latest completed session",
+        );
+    }
+
+    /// A project with no completed session has no implicit default: the
+    /// omission must fail with the same actionable error the read tools use.
+    #[tokio::test]
+    async fn memory_consolidate_without_completed_session_errors_cleanly() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let err = server
+            .memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: None,
+                    dry_run: Some(true),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("an empty project has no completed session");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.to_string()
+                .contains("no completed session in default/scratch"),
+            "got {err}"
+        );
+    }
+
+    /// A blank `session_id` (`""`, or whitespace only) is the same request as
+    /// an omitted one: it must resolve the latest completed session of the
+    /// resolved project instead of failing as a malformed UUID.
+    #[tokio::test]
+    async fn memory_consolidate_treats_a_blank_session_id_as_omitted() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let completed = seed_session_observations(
+            &store,
+            ws,
+            proj,
+            true,
+            &[(ObservationKind::UserPrompt, "done", "completed work")],
+        )
+        .await;
+
+        for session_id in [None, Some(String::new()), Some("   ".to_owned())] {
+            let outcome = call_tool_json(
+                server
+                    .memory_consolidate(
+                        Parameters(ConsolidateArgs {
+                            session_id,
+                            dry_run: Some(true),
+                            multi_page: Some(false),
+                            instructions: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(
+                outcome["path"],
+                format!("sessions/{completed}.md"),
+                "a blank session_id must behave exactly like an omitted one",
+            );
+        }
+    }
+
+    /// A malformed id is caller input rather than a server fault: it must fail
+    /// as `invalid params`, the code the sibling tools already answer with for
+    /// the same argument.
+    #[tokio::test]
+    async fn memory_consolidate_rejects_a_malformed_session_id_as_invalid_params() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        let err = server
+            .memory_consolidate(
+                Parameters(ConsolidateArgs {
+                    session_id: Some("not-a-uuid".into()),
+                    dry_run: Some(true),
+                    multi_page: Some(false),
+                    instructions: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a malformed session id must be rejected");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.to_string().contains("invalid uuid"),
+            "the malformed-id message must stay as callers already read it; got {err}"
         );
     }
 
