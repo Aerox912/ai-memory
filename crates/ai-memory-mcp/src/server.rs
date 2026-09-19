@@ -805,6 +805,20 @@ struct MemoryRecentResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     counts: ai_memory_store::StatusCounts,
+    /// Which project the counts belong to, and how it was chosen (#757).
+    scope: AnsweredScope,
+}
+
+/// The scope a response was answered from. Without it an unscoped call that
+/// fell back to another project returns plausible numbers the caller has no
+/// way to question.
+#[derive(Debug, Serialize)]
+struct AnsweredScope {
+    workspace: String,
+    project: String,
+    /// `explicit`, `session`, `shared_slot`, `startup_seed`, `default`, or
+    /// `default_after_mismatch`.
+    resolved_by: &'static str,
 }
 
 /// How many extra candidates to fetch for the reranker to reorder. The
@@ -1793,11 +1807,37 @@ impl AiMemoryServer {
         explicit_project: Option<&str>,
         actor: &ai_memory_core::ActorKey,
     ) -> Result<(WorkspaceId, ProjectId), McpError> {
-        self.scope_resolver()
-            .resolve_read_args(explicit_workspace, explicit_project, actor)
+        self.traced_ids_for_read_args(explicit_workspace, explicit_project, actor)
             .await
-            .map(ai_memory_store::ResolvedScope::as_tuple)
-            .map_err(Self::scope_error)
+            .map(|(ids, _)| ids)
+    }
+
+    /// [`Self::effective_ids_for_read_args_with_actor`], plus where the scope
+    /// came from. Every unscoped read passes through here, so this is where a
+    /// fallback gets logged: a static MCP client answered from a project it
+    /// never named is otherwise indistinguishable from a correct answer (#757).
+    async fn traced_ids_for_read_args(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+        actor: &ai_memory_core::ActorKey,
+    ) -> Result<((WorkspaceId, ProjectId), ai_memory_store::ScopeSource), McpError> {
+        let (scope, source) = self
+            .scope_resolver()
+            .resolve_read_args_traced(explicit_workspace, explicit_project, actor)
+            .await
+            .map_err(Self::scope_error)?;
+        if source.is_fallback() {
+            tracing::warn!(
+                resolved_by = %source,
+                has_session_id = actor.session_id.is_some(),
+                workspace_id = %scope.workspace_id,
+                project_id = %scope.project_id,
+                "unscoped MCP read resolved by fallback, not by the caller's hook session; \
+                 static MCP clients should pass workspace + project explicitly"
+            );
+        }
+        Ok((scope.as_tuple(), source))
     }
 
     /// Resolve the target for a WRITE, **creating** the workspace/project when
@@ -1877,6 +1917,17 @@ impl AiMemoryServer {
         ws: ai_memory_core::WorkspaceId,
         proj: ai_memory_core::ProjectId,
     ) -> String {
+        let (ws_name, proj_name) = self.scope_names(ws, proj).await;
+        format!("{ws_name}/{proj_name}")
+    }
+
+    /// Workspace and project names for a resolved scope, with the same
+    /// placeholders as [`Self::scope_label`] when a lookup fails.
+    async fn scope_names(
+        &self,
+        ws: ai_memory_core::WorkspaceId,
+        proj: ai_memory_core::ProjectId,
+    ) -> (String, String) {
         let ws_name = self.reader.workspace_name_by_id(ws).await.ok().flatten();
         let proj_name = self
             .reader
@@ -1884,10 +1935,9 @@ impl AiMemoryServer {
             .await
             .ok()
             .flatten();
-        format!(
-            "{}/{}",
-            ws_name.as_deref().unwrap_or("<unknown-workspace>"),
-            proj_name.as_deref().unwrap_or("<unknown-project>")
+        (
+            ws_name.unwrap_or_else(|| "<unknown-workspace>".to_owned()),
+            proj_name.unwrap_or_else(|| "<unknown-project>".to_owned()),
         )
     }
 
@@ -4556,15 +4606,18 @@ impl AiMemoryServer {
     #[tool(description = "Report aggregate memory counts and runtime status \
         (pages latest, pages all versions, sessions, observations). \
         Use this at session start to see how much context the agent has \
-        accumulated for this workspace.")]
+        accumulated for this workspace. `scope` names the workspace and \
+        project the counts belong to and `resolved_by` how it was chosen; \
+        `default_after_mismatch` or `startup_seed` means the call was not \
+        matched to this session, so pass `workspace` + `project`.")]
     async fn memory_status(
         &self,
         Parameters(args): Parameters<StatusArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let (ws, proj) = self
-            .effective_ids_for_read_args_with_actor(
+        let ((ws, proj), source) = self
+            .traced_ids_for_read_args(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
@@ -4575,7 +4628,15 @@ impl AiMemoryServer {
             .status_counts_for_project(ws, proj)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let response = StatusResponse { counts };
+        let (workspace, project) = self.scope_names(ws, proj).await;
+        let response = StatusResponse {
+            counts,
+            scope: AnsweredScope {
+                workspace,
+                project,
+                resolved_by: source.as_str(),
+            },
+        };
         ok_json(&response)
     }
 
@@ -10126,6 +10187,77 @@ mod tests {
                 rmcp::model::ErrorCode::INTERNAL_ERROR,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn memory_status_names_the_project_that_answered() {
+        // #757: a static MCP client's transport session id is not a hook
+        // session id, so its unscoped read cannot follow the caller's cwd. The
+        // counts must say whose they are, or they read as plausible and wrong.
+        let (_tmp, store, server, ws, _pj) = setup_server().await;
+        let neighbour = store
+            .writer
+            .get_or_create_project(ws, "neighbour", None)
+            .await
+            .unwrap();
+        let hook_session = ai_memory_core::ActorKey {
+            user: None,
+            session_id: Some("hook-session".into()),
+        };
+        let pointer = ActiveProject::new();
+        pointer.set_for(&hook_session, ws, neighbour, false);
+        let server = server.with_active_project(pointer);
+
+        let status = |session: &'static str, workspace: Option<&str>, project: Option<&str>| {
+            let mut parts = test_parts_default();
+            parts
+                .headers
+                .insert("mcp-session-id", session.parse().unwrap());
+            let args = StatusArgs {
+                workspace: workspace.map(str::to_owned),
+                project: project.map(str::to_owned),
+            };
+            let server = &server;
+            async move {
+                let result = server
+                    .memory_status(Parameters(args), OptionalParts(parts))
+                    .await
+                    .unwrap();
+                let text = result
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()["scope"].clone()
+            }
+        };
+
+        assert_eq!(
+            status("hook-session", None, None).await,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "neighbour",
+                "resolved_by": "session",
+            })
+        );
+        assert_eq!(
+            status("transport-session", None, None).await,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "scratch",
+                "resolved_by": "default_after_mismatch",
+            }),
+            "a static client falls back to the server default and says so"
+        );
+        assert_eq!(
+            status("transport-session", Some("default"), Some("neighbour")).await,
+            serde_json::json!({
+                "workspace": "default",
+                "project": "neighbour",
+                "resolved_by": "explicit",
+            })
+        );
     }
 
     #[tokio::test]
