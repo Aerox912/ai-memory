@@ -108,33 +108,6 @@ impl PagePath {
     ///
     /// # Errors
     /// Returns [`MemoryError::InvalidPagePath`] when the input is empty or
-    /// Reject a path that cannot be materialised and checkpointed on every
-    /// supported platform.
-    ///
-    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
-    /// reconstructed through that constructor on every read
-    /// (`reader.rs` does so in the recency, search, vector and graph
-    /// queries), so tightening it would make any already-stored
-    /// non-portable page unreadable — and because those are list queries,
-    /// one such page would break a whole listing rather than just itself.
-    /// The rule therefore applies where a *new* path enters the system.
-    ///
-    /// The rule is the same on every platform on purpose. A wiki authored
-    /// on Linux is expected to be usable on Windows by the same release;
-    /// making the check platform-conditional would let a Linux session
-    /// create pages a Windows session cannot read, which is the defect
-    /// being fixed rather than a fix for it (#462).
-    ///
-    /// # Errors
-    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
-    /// component and the reason.
-    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
-        for component in self.as_str().split('/') {
-            ensure_portable_component(component, self.as_str())?;
-        }
-        Ok(())
-    }
-
     /// contains a path component that would escape or alias the wiki root.
     pub fn new(raw: impl Into<String>) -> Result<Self, MemoryError> {
         let raw = raw.into();
@@ -182,6 +155,33 @@ impl PagePath {
             }
         }
         Ok(Self(raw))
+    }
+
+    /// Reject a path that cannot be materialised and checkpointed on every
+    /// supported platform.
+    ///
+    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
+    /// reconstructed through that constructor on every read
+    /// (`reader.rs` does so in the recency, search, vector and graph
+    /// queries), so tightening it would make any already-stored
+    /// non-portable page unreadable — and because those are list queries,
+    /// one such page would break a whole listing rather than just itself.
+    /// The rule therefore applies where a *new* path enters the system.
+    ///
+    /// The rule is the same on every platform on purpose. A wiki authored
+    /// on Linux is expected to be usable on Windows by the same release;
+    /// making the check platform-conditional would let a Linux session
+    /// create pages a Windows session cannot read, which is the defect
+    /// being fixed rather than a fix for it (#462).
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
+    /// component and the reason.
+    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
+        for component in self.as_str().split('/') {
+            ensure_portable_component(component, self.as_str())?;
+        }
+        Ok(())
     }
 
     /// Borrow the inner string.
@@ -704,6 +704,16 @@ const DOS_DEVICE_NAMES: &[&str] = &[
 /// [`PagePath::new`].
 const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
 
+/// Returns true if a path component is reserved by Git (`.git` case-insensitively,
+/// or an 8.3 short-name alias like `git~1`..`git~4`).
+#[must_use]
+pub fn is_git_reserved_component(component: &str) -> bool {
+    component.eq_ignore_ascii_case(".git")
+        || (component.len() == 5
+            && component[..4].eq_ignore_ascii_case("git~")
+            && (b'1'..=b'4').contains(&component.as_bytes()[4]))
+}
+
 fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
     let invalid = |reason: &str| {
         Err(MemoryError::InvalidPagePath(format!(
@@ -737,6 +747,12 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
         return invalid(&format!(
             "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
         ));
+    }
+    // Git reserves `.git` for repository metadata. Any tree entry named `.git`
+    // or an 8.3 alias is refused by libgit2 with `GIT_EINVALIDPATH` and cannot
+    // be checkpointed.
+    if is_git_reserved_component(component) {
+        return invalid("is reserved by Git for repository metadata and refused in tree entries");
     }
     Ok(())
 }
@@ -778,6 +794,30 @@ mod portable_page_path_tests {
         }
     }
 
+    #[test]
+    fn git_reserved_paths_are_rejected() {
+        for raw in [
+            ".git",
+            ".git/config",
+            ".git/HEAD",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/.Git/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+            "notes/git~4/config",
+            "a/b/c/.git/deep.md",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} contains a git-reserved component and must be refused at write time"
+            );
+        }
+    }
+
     /// The rule must not reject ordinary pages. `con` is only reserved as a
     /// whole component, so `concepts/` and `icon.md` are fine.
     #[test]
@@ -792,6 +832,11 @@ mod portable_page_path_tests {
             "a/b/c/deep.md",
             "notes/dot.in.middle.md",
             "notes/UPPER.MD",
+            "notes/.git.md",
+            "notes/.gitignore",
+            "notes/.gitattributes",
+            "notes/github.md",
+            "git-notes/index.md",
         ] {
             let path = PagePath::new(raw).expect("valid path");
             assert!(
@@ -806,7 +851,14 @@ mod portable_page_path_tests {
     /// not break on one bad row.
     #[test]
     fn existing_non_portable_pages_remain_constructible() {
-        for raw in ["CON.md", "notes/a|b.md", "notes/trailing./x.md"] {
+        for raw in [
+            "CON.md",
+            "notes/a|b.md",
+            "notes/trailing./x.md",
+            ".git/config",
+            "notes/.git/sub.md",
+            "notes/git~1/foo.md",
+        ] {
             assert!(
                 PagePath::new(raw).is_ok(),
                 "{raw:?} must still construct so persisted rows stay readable"
