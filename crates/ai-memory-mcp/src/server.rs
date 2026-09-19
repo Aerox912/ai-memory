@@ -214,7 +214,10 @@ developer, user, and canonical project instructions.\n\
   a cited natural-language answer over the top hits, attached as \
   `answer: { text, citations }`; with no provider it returns the hits plus \
   an `answer_unavailable` note (never an error), and the default path makes \
-  no LLM call. Use `explain=true` only when diagnosing \
+  no LLM call. Pair `answer=true` with `reasoning` \
+  (`minimal` (default) / `low` / `medium` / `high` / `max`) to give the \
+  synthesis a larger token budget for a harder question; `minimal` and \
+  omitting it are unchanged. Use `explain=true` only when diagnosing \
   project/scopes ranking; it adds score provenance, while global search \
   reports only its distinct FTS stream.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
@@ -229,8 +232,11 @@ developer, user, and canonical project instructions.\n\
 - `memory_explore` — when the user wants a PROSE digest. \
   Calibrates verbosity to time since last activity: 'fresh' → one \
   line, 'stale' (>30d) → full catchup. Accepts an optional `focus` \
-  arg. Use over memory_briefing when the user asks open-ended \
-  questions like 'catch me up' or 'what's important right now'.\n\
+  arg, and a `reasoning` tier (`minimal` (default) / `low` / `medium` / \
+  `high` / `max`) that widens the digest's token budget when a provider \
+  is configured (inert on the briefing-only path). Use over \
+  memory_briefing when the user asks open-ended questions like 'catch me \
+  up' or 'what's important right now'.\n\
 - `memory_handoff_list` — READ-ONLY list of OPEN handoffs in the \
   resolved project. It does not claim or expire anything. Use it when \
   no SessionStart handoff block is in context (Grok, Zero, and other \
@@ -611,6 +617,58 @@ struct QueryArgs {
     /// `as_of` queries.
     #[serde(default)]
     answer: Option<bool>,
+    /// Reasoning effort for the `answer` synthesis path: one of `minimal`
+    /// (default), `low`, `medium`, `high`, `max`. Higher tiers give the model a
+    /// larger token budget to reason within. Only meaningful together with
+    /// `answer=true`; inert on the default (no-LLM) path. Omitting it, or
+    /// `minimal`, is byte-identical to today. An unknown value is rejected.
+    #[serde(default)]
+    reasoning: Option<ReasoningTier>,
+}
+
+/// Operator-facing reasoning-effort tier for the opt-in LLM synthesis paths
+/// (`memory_query(answer=true)` and `memory_explore`). Borrowed from Honcho's
+/// reasoning-effort ladder.
+///
+/// `ChatRequest` carries no per-request reasoning/effort field today (the
+/// provider-level `reasoning_effort` is fixed at construction from config), so
+/// the honest per-request mapping is a per-tier **max-token budget**: a higher
+/// tier gives the model more room to reason before its answer is truncated.
+/// [`Self::Minimal`] (the default) leaves each path's base budget unchanged, so
+/// omitting `reasoning` is byte-identical to the pre-tier behavior. Serde
+/// rejects an unknown value (invariant #7: typed, schema-checked inputs).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+enum ReasoningTier {
+    /// Current behavior: the path's base token budget, unchanged.
+    #[default]
+    Minimal,
+    /// A modestly wider budget.
+    Low,
+    /// Twice the base budget.
+    Medium,
+    /// Three times the base budget.
+    High,
+    /// Four times the base budget.
+    Max,
+}
+
+impl ReasoningTier {
+    /// Scale a path's base max-token budget for this tier. `Minimal` returns the
+    /// base unchanged (byte-identical to pre-tier behavior); higher tiers widen
+    /// it so synthesis can reason longer before truncation. Saturating so a
+    /// large base never overflows.
+    const fn scale_max_tokens(self, base: u32) -> u32 {
+        match self {
+            Self::Minimal => base,
+            Self::Low => base.saturating_add(base / 2),
+            Self::Medium => base.saturating_mul(2),
+            Self::High => base.saturating_mul(3),
+            Self::Max => base.saturating_mul(4),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1321,6 +1379,13 @@ struct ExploreArgs {
     /// omit both for the current project; static MCP clients must pass both.
     #[serde(default)]
     workspace: Option<String>,
+    /// Reasoning effort for the LLM digest: one of `minimal` (default), `low`,
+    /// `medium`, `high`, `max`. Higher tiers give the model a larger token
+    /// budget. Inert when no provider is configured (the briefing-only path).
+    /// Omitting it, or `minimal`, is byte-identical to today. Unknown value
+    /// rejected.
+    #[serde(default)]
+    reasoning: Option<ReasoningTier>,
 }
 #[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
 struct InstallSelfRoutingArgs {
@@ -2486,7 +2551,12 @@ impl AiMemoryServer {
         let (answer, answer_unavailable) = if args.answer.unwrap_or(false) {
             match self.llm.as_ref() {
                 Some(llm) => {
-                    let request = build_answer_request(&args.query, &hits, &global_scope_hits);
+                    let request = build_answer_request(
+                        &args.query,
+                        &hits,
+                        &global_scope_hits,
+                        args.reasoning.unwrap_or_default(),
+                    );
                     match ai_memory_llm::complete_structured::<AnswerSynthesis>(
                         llm.as_ref(),
                         request,
@@ -4552,7 +4622,12 @@ impl AiMemoryServer {
         };
 
         let gap = explore_gap_from_snapshot(&snapshot);
-        let request = build_explore_request(&snapshot, &gap, args.focus.as_deref());
+        let request = build_explore_request(
+            &snapshot,
+            &gap,
+            args.focus.as_deref(),
+            args.reasoning.unwrap_or_default(),
+        );
         let provider = llm.llm();
         let text = match provider.complete(request).await {
             Ok(resp) => resp.text,
@@ -5179,6 +5254,7 @@ fn build_explore_request(
     snapshot: &ai_memory_store::BriefingSnapshot,
     gap: &ExploreGap,
     focus: Option<&str>,
+    reasoning: ReasoningTier,
 ) -> ai_memory_llm::ChatRequest {
     let snapshot_json = serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".into());
     let mut user = String::new();
@@ -5204,7 +5280,8 @@ fn build_explore_request(
         // memory_explore returns prose, not JSON, so a truncated
         // response is degraded but not unparseable. Still generous
         // so the long `dormant`/`stale` digests don't get cut off.
-        max_tokens: 16_000,
+        // Base budget scaled by the reasoning tier; `Minimal` keeps 16_000.
+        max_tokens: reasoning.scale_max_tokens(16_000),
         temperature: Some(0.2),
     }
 }
@@ -5234,6 +5311,7 @@ fn build_answer_request(
     query: &str,
     hits: &[QueryHit],
     global_scope_hits: &[QueryHit],
+    reasoning: ReasoningTier,
 ) -> ai_memory_llm::ChatRequest {
     fn clean(snippet: &str) -> String {
         snippet.replace("<mark>", "").replace("</mark>", "")
@@ -5262,7 +5340,9 @@ fn build_answer_request(
             role: ai_memory_llm::Role::User,
             content: user,
         }],
-        max_tokens: 2_000,
+        // Base budget scaled by the reasoning tier; `Minimal` keeps 2_000
+        // (byte-identical to the pre-tier answer path).
+        max_tokens: reasoning.scale_max_tokens(2_000),
         temperature: Some(0.1),
     }
 }
@@ -5768,6 +5848,7 @@ mod tests {
                         explain: Some(true),
                         as_of: None,
                         answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -5802,6 +5883,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -7532,6 +7614,7 @@ mod tests {
             explain: Some(true),
             as_of,
             answer: None,
+            reasoning: None,
         };
 
         // Historical instant → the superseded version answers.
@@ -7573,6 +7656,7 @@ mod tests {
                     explain: Some(true),
                     as_of: Some(jiff::Timestamp::now().to_string()),
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7645,6 +7729,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7673,6 +7758,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7769,6 +7855,7 @@ mod tests {
                         explain: Some(true),
                         as_of: None,
                         answer: None,
+                        reasoning: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -7859,6 +7946,7 @@ mod tests {
             explain: None,
             as_of: None,
             answer: None,
+            reasoning: None,
         };
 
         let result = server
@@ -7939,6 +8027,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8070,6 +8159,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8152,6 +8242,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 test_optional_parts(),
             )
@@ -8250,6 +8341,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8319,6 +8411,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8364,6 +8457,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 test_optional_parts(),
             )
@@ -8442,6 +8536,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        reasoning: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8511,6 +8606,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9567,6 +9663,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9679,6 +9776,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9729,6 +9827,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9812,6 +9911,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9847,6 +9947,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9886,6 +9987,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10037,6 +10139,7 @@ mod tests {
                     recent_pages_limit: Some(5),
                     project: None,
                     workspace: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -12766,6 +12869,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -12803,6 +12907,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

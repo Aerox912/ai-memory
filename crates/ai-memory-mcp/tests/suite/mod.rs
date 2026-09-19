@@ -24,6 +24,7 @@ mod handoff_identity;
 mod mcp_stateless_http;
 mod query_answer;
 mod query_pin_first;
+mod query_reasoning;
 mod query_superseded;
 mod read_page_related;
 mod retrieval_via_tools;
