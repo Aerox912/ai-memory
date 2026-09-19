@@ -8,6 +8,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Reasoning tier on the LLM synthesis paths: an opt-in `reasoning` argument on
+  `memory_query` (its `answer` path) and `memory_explore` (borrowed from
+  Honcho's reasoning-effort ladder; targets the 2.4 line). The knob is a schema
+  enum `minimal` (default) / `low` / `medium` / `high` / `max`; an unknown value
+  is rejected. Because the provider-neutral `ChatRequest` carries no per-request
+  reasoning/effort field (the provider-level `reasoning_effort` is fixed at
+  construction from config), the tier maps honestly to a per-tier max-token
+  budget scaled off each path's base budget (answer 2 000, explore 16 000):
+  `minimal` = 1x, `low` = 1.5x, `medium` = 2x, `high` = 3x, `max` = 4x — a
+  higher tier gives the model more room to reason before its output is
+  truncated. It only tunes the answer path: `reasoning` is inert unless the LLM
+  path actually runs (`answer: true` with a provider, or `memory_explore` with a
+  provider), so the zero-LLM default path is untouched. Omitting `reasoning`, or
+  passing `minimal`, is byte-identical to before. No new MCP tool (still 23)
+  (#783).
+- Dialectic answer on `memory_query`: an opt-in, off-by-default `answer`
+  argument (borrowed from Honcho's dialectic endpoint; targets the 2.4 line).
+  When `answer: true` AND the server has an LLM provider configured, the query
+  synthesizes a concise, cited natural-language answer over the top retrieved
+  hits and attaches it as `answer: { text, citations }`, where `citations` are
+  the page paths the answer drew from (JSON-schema structured output, grounded
+  strictly in the retrieved snippets). When `answer: true` but no provider is
+  configured, the normal hits are returned plus a short `answer_unavailable`
+  note rather than an error. With `answer` omitted/`false` (the default), no LLM
+  provider is accessed and the response is byte-identical to before, so the
+  zero-LLM default path is untouched. Applies to the normal single-project /
+  `scopes` search; `global` and `as_of` queries ignore it. Honest caveat: the
+  feature is new and its answer quality is not yet eval-validated — treat the
+  synthesized answer as a convenience over the same hits and still open the
+  cited pages before acting (#782).
+- "Pin before search": `memory_query` gained an opt-in `pin_first` argument and
+  `memory_briefing` now carries a bounded `pinned` list (default off/absent;
+  targets the 2.4 line). Pinned pages previously earned only a small post-RRF
+  authority bump; they were never surfaced *ahead of* the search, and the
+  briefing never listed them by the `pinned` column. With `pin_first: true`, a
+  single-project `memory_query` prepends the project's bounded pinned latest
+  pages (newest first, cap 10) ahead of the fused hits, deduped by page id so a
+  pinned page that also matches the query appears once (marked `pinned: true`),
+  and re-truncates to the requested limit; `scopes`, `global`, and `as_of`
+  queries ignore it. A project-scoped `memory_briefing` snapshot now includes a
+  bounded `pinned` list of pinned latest pages (distinct from the `_slots/`
+  path-prefixed `slots`) so SessionStart hot-context can show standing context.
+  Both are backed by the new `ReaderPool::list_pinned_pages`; default off/empty
+  is byte-identical to the previous query ordering and briefing shape (#780).
+- `memory_read_page` gained an opt-in related-pages graph walk (default false;
+  targets the 2.4 line). Passing `include_related: true` adds a `related` array
+  of the pages reachable from the read page through the link graph — a bounded
+  breadth-first walk that reuses the single-hop link primitive per node,
+  following both outgoing links and incoming back-links out to `related_depth`
+  hops (default 1, hard-capped at 3). Each entry carries its
+  path/title/kind/workspace/project plus the hop `depth` and edge `direction`
+  (`link`/`backlink`) it was reached by; the walk is cross-project aware,
+  dedup- and cycle-safe via a global visited set, and bounded by a total-node
+  cap. Default-off behaviour is byte-identical to the previous single-page
+  response (no `related` field) (#775).
+- `memory_query` gained an opt-in `include_superseded` argument (default false;
+  targets the 2.4 line). When set, project and explicit-scope searches also
+  return superseded (older) page versions across the FTS/entity/vector/graph
+  streams, each hit labelled `superseded: true` so callers can tell historical
+  versions from the current one; the current version is never marked. Default-off
+  behaviour is byte-identical to the previous latest-only retrieval, and
+  `global=true` and `as_of` time-travel are unaffected (#773).
 - `memory_status` now reports which project answered: a `scope` object with
   `workspace`, `project`, and `resolved_by` (`explicit`, `session`,
   `shared_slot`, `startup_seed`, `default`, or `default_after_mismatch`). An
@@ -16,15 +78,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named, with nothing in the response to question them; `resolved_by` now makes
   that visible. The server also logs a warning whenever an unscoped MCP read is
   resolved by the startup seed or by the default after a session mismatch,
-  rather than by the caller's own hook session (#757).
+  rather than by the caller's own hook session (#757, #774).
+
+### Changed
+- `memory_consolidate` accepts an omitted `session_id`. Omitting the field (or
+  sending `null`) no longer fails deserialization with `missing field
+  session_id`; the tool consolidates the latest completed session in the
+  resolved project — the same default `memory_auto_improve` and
+  `memory_read_session_observations` already use. Pass an explicit UUID to
+  target a specific session, and `dry_run=true` for the cheap admission
+  preflight. A project with no completed session now fails as
+  `no completed session in <scope>` instead of a deserialization error.
+- A consolidation LLM call that fails on a transient provider error (`429`, any
+  `5xx`, a transport timeout or connect failure) is retried twice, two seconds
+  apart, before the failure is reported — the same bounded policy `bootstrap`
+  already applies to its chunks. Deterministic failures (auth, schema, a
+  malformed-request `4xx`, unparseable or truncated output) are still reported
+  on the first attempt, since retrying them only burns another call.
 
 ### Fixed
+- `ai-memory serve` no longer hard-fails to take its single-instance lock on a
+  transient error under load. Acquiring the serve lock now retries `open` and
+  `try_lock_exclusive` a few times with a short (~25ms) backoff when they hit a
+  transient failure (EMFILE/ENFILE fd exhaustion, EINTR), mirroring
+  `acquire_drain_lock`. A genuinely contended lock (`WouldBlock`, another server
+  holds it) is never retried and still refuses startup immediately. The
+  serve-lock tests also assert with the concrete errno so any remaining
+  environmental flake is diagnosable rather than silent (#745).
+- GitHub Copilot completion requests now select the model-advertised API
+  endpoint from `/models`: existing Chat Completions remains preferred when
+  available, while Responses-only models use `/responses`. Responses requests
+  preserve strict JSON Schema structured-output constraints and report empty,
+  refused, or rejected output without silently downgrading the contract. A model
+  the `/models` catalogue does not enumerate (enterprise/custom deployments,
+  aliases, a model newer than the list) falls back to Chat Completions with a
+  warning instead of erroring, matching the graceful fallback already used when
+  `/models` is unavailable. As a related behavior change, a Copilot chat
+  completion that returns empty content now reports `UnexpectedShape` rather
+  than yielding an empty string. (#761)
+- The V62 page-ingestion-window migration no longer runs its backfill inside a
+  single migration transaction, which on a large store ran for hours and grew
+  the WAL to roughly the size of the database with no progress. V62 is now
+  DDL-only (the two columns plus their index); the window backfill moved to a
+  chunked, resumable, WAL-bounded boot-path step that processes pages in bounded
+  batches, checkpoints the WAL (`TRUNCATE`) between each, and logs progress. The
+  end state is byte-identical to the original V62, the step resumes rather than
+  restarts if interrupted, and it is a fast no-op on a store that already applied
+  the original V62. Because that reshape changes the migration's checksum, the
+  runner now intentionally tolerates a divergent checksum on an already-applied
+  migration (`abort_divergent = false`) so correctly-migrated stores still open;
+  the schema-ahead guard (`abort_missing`) is unchanged (#776).
+- Page writes now refuse git-reserved and non-portable page paths (a `.git`
+  component or an 8.3 `git~1`..`git~4` alias, Windows-reserved names and
+  characters) on every write funnel, including MCP `memory_write_page` and
+  consolidation `apply_batch`; reads of already-stored pages stay tolerant so
+  a bad row never breaks a listing. The git-reserved check is byte-safe and no
+  longer panics on a 5-byte multibyte path component (#781).
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted
   only `title`/`projectID` on `session.created`, so the marker never reached the
   server and the opt-in was a silent no-op for OpenCode. Root sessions (no
   `parentID`) stay unmarked (#755).
+- Scope-resolution failures over MCP now answer with `invalid params`
+  (`-32602`) instead of an opaque internal error (`-32603`), the same split the
+  web route applies with its 400/404: a malformed scope argument, or a
+  workspace/project name that does not resolve, is caller input, while a
+  missing writer handle or an underlying store failure stays internal. The
+  messages are unchanged.
+- `memory_consolidate` treats a blank `session_id` (`""` or whitespace) exactly
+  like an omitted one — the resolved project's latest completed session — and a
+  malformed id now fails as `invalid params`, the code `memory_auto_improve`
+  already uses for the same argument.
 
 ## [2.3.1] - 2026-09-17
 

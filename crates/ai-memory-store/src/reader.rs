@@ -52,6 +52,23 @@ fn not_expired(table: &str, now_param: &str) -> String {
     format!(" AND ({table}.expires_at IS NULL OR {table}.expires_at > {now_param})")
 }
 
+/// Latest-version guard for retrieval candidate queries (FTS / vector /
+/// entity / graph). When `include_superseded` is false — the default — this
+/// restricts a candidate query to the current version with
+/// `AND {table}.is_latest = 1`; when true it returns an empty fragment so
+/// superseded versions enter the candidate pool too. `table` is the pages
+/// alias in that query. One definition so the opt-in never drifts between
+/// streams, and the default fragment is byte-identical to the literal it
+/// replaces. The fragment carries no bound placeholder, so dropping it never
+/// disturbs positional parameter ordering.
+fn latest_only(table: &str, include_superseded: bool) -> String {
+    if include_superseded {
+        String::new()
+    } else {
+        format!(" AND {table}.is_latest = 1")
+    }
+}
+
 /// Current wall-clock in microseconds, for binding against
 /// [`not_expired`] fragments.
 fn now_us() -> i64 {
@@ -84,6 +101,11 @@ const DESCRIPTOR_SCAN_CHARS: usize = 600;
 
 /// Maximum length of a synthesised page descriptor, in characters.
 const DESCRIPTOR_MAX_CHARS: usize = 240;
+
+/// Upper bound on the pinned standing-context list carried by a project
+/// [`BriefingSnapshot`] (`memory_briefing`), so SessionStart hot-context stays
+/// bounded no matter how many pages a project has pinned.
+const BRIEFING_PINNED_LIMIT: usize = 10;
 
 /// SQL expression yielding the raw material for [`page_descriptor`]: the
 /// page's own frontmatter `summary` when it has a non-blank one, otherwise a
@@ -639,6 +661,20 @@ pub struct PageHit {
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
+    /// True when this hit is a superseded (non-latest) page version, surfaced
+    /// only because the caller opted into `include_superseded`. False for the
+    /// current version — the default. Skipped in JSON when false so default
+    /// retrieval output is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
+    /// True only when this hit is standing pinned context prepended by the
+    /// opt-in `memory_query(pin_first=true)` path (via
+    /// [`ReaderPool::list_pinned_pages`]). Ordinary search hits leave it
+    /// `false` — the store's FTS/entity/vector/graph retrieval does not read
+    /// the `pinned` column into the hit — so it is skipped in JSON when false
+    /// and default retrieval output is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// Completed session selected for scheduled auto-improvement.
@@ -1185,6 +1221,15 @@ pub struct BriefingSnapshot {
     /// JSON otherwise so the default briefing shape is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settled: Vec<SettledPage>,
+    /// The project's pinned latest pages (`pinned = 1`), newest first and
+    /// bounded — standing operator-curated context so SessionStart hot-context
+    /// can show it before any search ("pin before search", 2.4 line). Distinct
+    /// from `slots`, which is keyed by the `_slots/` path prefix rather than
+    /// the `pinned` column. Empty and omitted from JSON when the project has no
+    /// pinned pages, so a project without pins keeps the previous briefing
+    /// shape byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<BriefingPage>,
 }
 
 /// Trimmed page view for the briefing — path, title, kind, updated_at
@@ -1459,6 +1504,36 @@ pub struct PageLinks {
     pub backlinks: Vec<RelatedPage>,
 }
 
+/// Hard ceiling on how far [`ReaderPool::related_walk`] traverses the link
+/// graph. A caller's requested depth is clamped into `1..=RELATED_WALK_MAX_DEPTH`
+/// — a deeper walk is refused, not honoured, so one read cannot fan out across
+/// an unbounded slice of the graph.
+pub const RELATED_WALK_MAX_DEPTH: u8 = 3;
+
+/// Hard ceiling on the total number of distinct related nodes a single
+/// [`ReaderPool::related_walk`] returns. Bounds the response regardless of
+/// depth so a dense hub page cannot blow up a read; the walk stops as soon as
+/// this many nodes are collected.
+pub const RELATED_WALK_MAX_NODES: usize = 50;
+
+/// One node discovered by [`ReaderPool::related_walk`]: a [`RelatedPage`]
+/// (flattened into the same fields as a single-hop link) plus how it was
+/// reached — its hop distance from the seed and the direction of the edge that
+/// first reached it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedNode {
+    /// Identity of the related page (path/title/kind/workspace/project),
+    /// flattened so a node serializes exactly like a `page_links` entry with
+    /// two extra fields.
+    #[serde(flatten)]
+    pub page: RelatedPage,
+    /// Hop distance from the seed page (1 = a direct neighbour).
+    pub depth: u8,
+    /// Direction of the edge that first reached this node: `"link"` (the seed
+    /// side links out to it) or `"backlink"` (it links back toward the seed).
+    pub direction: &'static str,
+}
+
 /// One page flagged by a workspace health check, with enough identity to
 /// render a clickable drill-down row across projects.
 #[derive(Debug, Clone, Serialize)]
@@ -1678,6 +1753,8 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        superseded: false,
+                        pinned: false,
                     },
                     authority,
                 ));
@@ -1811,6 +1888,7 @@ impl ReaderPool {
                 query,
                 authority_candidate_limit(limit),
                 expiry_cutoff_us,
+                false,
             )
             .await?;
         Ok(rerank_page_hits(candidates, limit))
@@ -1823,6 +1901,7 @@ impl ReaderPool {
         query: String,
         candidate_limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || candidate_limit == 0 {
@@ -1840,10 +1919,10 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  WHERE pages_fts MATCH ?1 \
                    AND pages.workspace_id = ?2 \
-                   AND pages.project_id = ?3 \
-                   AND pages.is_latest = 1{not_expired} \
+                   AND pages.project_id = ?3{latest}{not_expired} \
                  ORDER BY pages_fts.rank \
                  LIMIT ?4",
+                latest = latest_only("pages", include_superseded),
                 not_expired = not_expired("pages", "?5"),
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -1893,6 +1972,8 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        superseded: false,
+                        pinned: false,
                     },
                     authority,
                 ));
@@ -1989,6 +2070,8 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        superseded: false,
+                        pinned: false,
                     },
                     authority,
                 ));
@@ -2035,6 +2118,9 @@ impl ReaderPool {
                 candidate_limit,
                 None,
                 Some(as_of_us),
+                // The as_of branch resolves versions by ingestion window, so
+                // this flag is inert; false keeps the audit path unchanged.
+                false,
             )
             .await?;
         let fts_candidates = self
@@ -2120,6 +2206,8 @@ impl ReaderPool {
                         title: entry.title,
                         snippet: entry.snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
+                        superseded: false,
+                        pinned: false,
                     },
                     entry.explain,
                 )
@@ -2257,6 +2345,82 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    superseded: false,
+                    pinned: false,
+                });
+            }
+            Ok(hits)
+        })
+        .await
+    }
+
+    /// List the project's pinned latest pages, most-recently-updated first.
+    ///
+    /// This is the "list pinned pages" primitive behind the opt-in
+    /// `memory_query(pin_first=true)` prepend and the briefing's `pinned`
+    /// standing-context list (2.4 line): pages an operator explicitly pinned
+    /// are standing context an agent should see *before* it searches. It
+    /// returns only current pinned versions (`pinned = 1 AND is_latest = 1`),
+    /// so an unpinned page and a superseded (older) pinned version are both
+    /// excluded, and `limit` bounds the result.
+    ///
+    /// Recency has no FTS relevance score, so the reused [`PageHit::rank`]
+    /// field carries `updated_at` (µs, cast to REAL) exactly as
+    /// [`Self::recent_pages_for_project`] does — larger means "more recent";
+    /// callers must not read it as an FTS rank. Each hit is marked
+    /// `pinned: true`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_pinned_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<PageHit>> {
+        let limit = limit.clamp(1, 100);
+        self.with_conn(move |conn| {
+            let sql = format!(
+                "SELECT id, path, title, \
+                        {descriptor} AS snip, \
+                        CAST(updated_at AS REAL) AS rank \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND is_latest = 1 AND pinned = 1{not_expired} \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?3",
+                descriptor = page_descriptor_expr("body", "frontmatter_json"),
+                not_expired = not_expired("pages", "?4"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            #[allow(clippy::cast_possible_wrap)]
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    limit as i64,
+                    now_us()
+                ],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let path: String = row.get(1)?;
+                    let title: String = row.get(2)?;
+                    let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                    let rank: f64 = row.get(4)?;
+                    Ok((id_bytes, path, title, snippet, rank))
+                },
+            )?;
+            let mut hits = Vec::new();
+            for row in rows {
+                let (id_bytes, path, title, snippet, rank) = row?;
+                hits.push(PageHit {
+                    id: PageId::from_slice(&id_bytes)?,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank,
+                    superseded: false,
+                    pinned: true,
                 });
             }
             Ok(hits)
@@ -2313,6 +2477,8 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    superseded: false,
+                    pinned: false,
                 });
             }
             Ok(hits)
@@ -3658,6 +3824,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: i64,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         self.top_embedding_hits_in_table(
             EmbeddingTable::Body,
@@ -3669,6 +3836,7 @@ impl ReaderPool {
             dim,
             limit,
             expiry_cutoff_us,
+            include_superseded,
         )
         .await
     }
@@ -3688,6 +3856,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: i64,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -3699,11 +3868,11 @@ impl ReaderPool {
                  FROM {table} \
                  JOIN pages ON pages.id = {table}.page_id \
                  WHERE pages.workspace_id = ?1 \
-                   AND pages.project_id = ?2 \
-                   AND pages.is_latest = 1{not_expired} \
+                   AND pages.project_id = ?2{latest}{not_expired} \
                    AND {table}.provider = ?3 \
                    AND {table}.model = ?4 \
                    AND {table}.dim = ?5",
+                latest = latest_only("pages", include_superseded),
                 not_expired = not_expired("pages", "?6"),
             );
             let mut stmt = conn.prepare_cached(&sql)?;
@@ -4016,6 +4185,7 @@ impl ReaderPool {
             limit,
             expiry_cutoff_us,
             None,
+            false,
         )
         .await
     }
@@ -4026,6 +4196,7 @@ impl ReaderPool {
     /// entity-link windows contain `T` — expiry is deliberately ignored
     /// there: a page valid at `T` that has since expired was still what
     /// we knew at `T`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn entity_hits_for_project_at(
         &self,
         workspace_id: WorkspaceId,
@@ -4034,6 +4205,7 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         as_of_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<EntityHit>> {
         let tokens = entity_query_tokens(query);
         if tokens.is_empty() || limit == 0 {
@@ -4123,14 +4295,22 @@ impl ReaderPool {
                       AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
                         .to_string()
                 } else {
-                    format!(" AND pg.is_latest = 1{}", not_expired("pg", "?"))
+                    format!(
+                        "{}{}",
+                        latest_only("pg", include_superseded),
+                        not_expired("pg", "?")
+                    )
                 },
                 freq_version_filter = if as_of_us.is_some() {
                     " AND l.valid_from <= ? \
                       AND (l.superseded_at IS NULL OR l.superseded_at > ?)"
                         .to_string()
                 } else {
-                    format!(" AND p.is_latest = 1{}", not_expired("p", "?"))
+                    format!(
+                        "{}{}",
+                        latest_only("p", include_superseded),
+                        not_expired("p", "?")
+                    )
                 },
             )
             .expect("writing SQL into String cannot fail");
@@ -4158,6 +4338,8 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank: 0.0,
+                        superseded: false,
+                        pinned: false,
                     },
                     weight,
                     matched,
@@ -4247,6 +4429,7 @@ impl ReaderPool {
                 seed_ids,
                 limit,
                 expiry_cutoff_us,
+                false,
             )
             .await?
             .into_iter()
@@ -4265,6 +4448,7 @@ impl ReaderPool {
         seed_ids: Vec<PageId>,
         limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<GraphNeighbor>> {
         if seed_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -4294,6 +4478,8 @@ impl ReaderPool {
 
             let out_descriptor = page_descriptor_expr("tp.body", "tp.frontmatter_json");
             let in_descriptor = page_descriptor_expr("fp.body", "fp.frontmatter_json");
+            let out_latest = latest_only("tp", include_superseded);
+            let in_latest = latest_only("fp", include_superseded);
             let out_not_expired = not_expired("tp", "?");
             let in_not_expired = not_expired("fp", "?");
             let mut sql = String::with_capacity(values_clause.len() + 1_500);
@@ -4308,7 +4494,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
                    JOIN pages tp ON tp.id = l.to_page_id \
-                   WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1{out_not_expired} \
+                   WHERE tp.workspace_id = ? AND tp.project_id = ?{out_latest}{out_not_expired} \
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
                           {in_descriptor} AS snippet, \
@@ -4317,7 +4503,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
                    JOIN pages fp ON fp.id = l.from_page_id \
-                   WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1{in_not_expired} \
+                   WHERE fp.workspace_id = ? AND fp.project_id = ?{in_latest}{in_not_expired} \
                  ) \
                  SELECT id, path, title, snippet, stream_ord, link_type \
                  FROM neighbors \
@@ -4352,6 +4538,8 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank: 0.0,
+                        superseded: false,
+                        pinned: false,
                     },
                     seed_ord,
                     incoming: stream_ord % 2 == 1,
@@ -4443,6 +4631,7 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         page_ids: Vec<PageId>,
+        include_superseded: bool,
     ) -> StoreResult<std::collections::HashMap<PageId, (String, String)>> {
         if page_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -4466,9 +4655,9 @@ impl ReaderPool {
                  FROM requested \
                  JOIN pages ON pages.id = requested.id \
                  WHERE pages.workspace_id = ? \
-                   AND pages.project_id = ? \
-                   AND pages.is_latest = 1",
+                   AND pages.project_id = ?{latest}",
                 descriptor = page_descriptor_expr("pages.body", "pages.frontmatter_json"),
+                latest = latest_only("pages", include_superseded),
             );
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
@@ -4590,6 +4779,13 @@ impl ReaderPool {
     /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`]. The
     /// cutoff resolves once here so all streams agree on it.
     ///
+    /// `include_superseded`: `false` — the default — restricts every stream
+    /// to the current page version (`is_latest = 1`), the exact hot-path
+    /// behaviour. `true` drops that predicate so superseded versions enter
+    /// the candidate pool too; each returned [`PageHit`] carries
+    /// `superseded` so the caller can tell historical versions from the
+    /// current one (invariant #16: the superseded loser stays reachable).
+    ///
     /// k=60 is the canonical RRF constant.
     ///
     /// # Errors
@@ -4606,6 +4802,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<PageHit>> {
         Ok(self
             .hybrid_search_inner(
@@ -4619,6 +4816,7 @@ impl ReaderPool {
                 limit,
                 expiry_cutoff_us,
                 false,
+                include_superseded,
             )
             .await?
             .into_iter()
@@ -4645,6 +4843,7 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
         expiry_cutoff_us: Option<i64>,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, SearchExplain)>> {
         let hits = self
             .hybrid_search_inner(
@@ -4658,6 +4857,7 @@ impl ReaderPool {
                 limit,
                 expiry_cutoff_us,
                 true,
+                include_superseded,
             )
             .await?;
         // Evidence counts (P2, docs/design-hindsight-borrowings.md §3) are
@@ -4688,6 +4888,7 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
         explain: bool,
+        include_superseded: bool,
     ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // The routing decision is read off the query before the FTS call
@@ -4701,15 +4902,29 @@ impl ReaderPool {
         let candidate_limit = authority_candidate_limit(limit);
         // Tokenize the borrowed query before the FTS candidate call consumes
         // it. This avoids cloning a caller-controlled query on the hot path.
-        let entity_hits = self
-            .entity_hits_for_project(
+        // The default path uses the latest-only entry; the opt-in path reaches
+        // superseded versions through the `_at` entry with no `as_of` instant.
+        let entity_hits = if include_superseded {
+            self.entity_hits_for_project_at(
+                workspace_id,
+                project_id,
+                &query,
+                candidate_limit,
+                Some(cutoff),
+                None,
+                true,
+            )
+            .await?
+        } else {
+            self.entity_hits_for_project(
                 workspace_id,
                 project_id,
                 &query,
                 candidate_limit,
                 Some(cutoff),
             )
-            .await?;
+            .await?
+        };
         let fts_candidates = self
             .search_page_candidates_for_project(
                 workspace_id,
@@ -4717,6 +4932,7 @@ impl ReaderPool {
                 query,
                 candidate_limit,
                 Some(cutoff),
+                include_superseded,
             )
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
@@ -4742,6 +4958,7 @@ impl ReaderPool {
                         dim,
                         candidate_limit,
                         cutoff,
+                        include_superseded,
                     )
                     .await?;
             }
@@ -4755,6 +4972,7 @@ impl ReaderPool {
                     dim,
                     candidate_limit,
                     cutoff,
+                    include_superseded,
                 )
                 .await?;
         }
@@ -4793,6 +5011,7 @@ impl ReaderPool {
                 seed_ids,
                 candidate_limit,
                 Some(cutoff),
+                include_superseded,
             )
             .await?;
 
@@ -4912,6 +5131,8 @@ impl ReaderPool {
                         title: entry.title,
                         snippet: entry.snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
+                        superseded: false,
+                        pinned: false,
                     },
                     entry.explain,
                 )
@@ -4927,7 +5148,7 @@ impl ReaderPool {
             .collect();
         if !undescribed.is_empty() {
             let descriptors = self
-                .page_descriptors_for_ids(workspace_id, project_id, undescribed)
+                .page_descriptors_for_ids(workspace_id, project_id, undescribed, include_superseded)
                 .await?;
             for (hit, _) in &mut out {
                 if let Some((title, descriptor)) = descriptors.get(&hit.id) {
@@ -4941,10 +5162,18 @@ impl ReaderPool {
             .iter()
             .filter_map(|(hit, _)| (!authorities.contains_key(&hit.id)).then_some(hit.id))
             .collect();
-        authorities.extend(
+        // With `include_superseded`, some fused ids are non-latest versions
+        // reached by the vector/graph streams; their authority inputs must be
+        // read without the latest-only filter or they'd get the neutral
+        // default and misrank.
+        let extra_authorities = if include_superseded {
+            self.page_authorities_for_versions(workspace_id, project_id, missing_authorities)
+                .await?
+        } else {
             self.page_authorities_for_project(workspace_id, project_id, missing_authorities)
-                .await?,
-        );
+                .await?
+        };
+        authorities.extend(extra_authorities);
         for (hit, explain) in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
                 let factor = authority.factor_for(session_recall, tuning.session_recall_bonus);
@@ -4971,7 +5200,67 @@ impl ReaderPool {
                 .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
         });
         out.truncate(limit);
+        // Label the superseded versions among the final hits so the caller can
+        // tell historical versions from the current one. Only the opt-in path
+        // can surface a non-latest id, so the default path skips this lookup
+        // entirely and every hit keeps `superseded = false`.
+        if include_superseded {
+            let result_ids: Vec<PageId> = out.iter().map(|(hit, _)| hit.id).collect();
+            let superseded = self
+                .superseded_page_ids(workspace_id, project_id, result_ids)
+                .await?;
+            for (hit, _) in &mut out {
+                hit.superseded = superseded.contains(&hit.id);
+            }
+        }
         Ok(out)
+    }
+
+    /// The subset of `page_ids` that are superseded (non-latest) versions in
+    /// the given project. Used by [`Self::hybrid_search`] to label opt-in
+    /// `include_superseded` hits; the default path never calls it.
+    async fn superseded_page_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_ids: Vec<PageId>,
+    ) -> StoreResult<std::collections::HashSet<PageId>> {
+        if page_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        self.with_conn(move |conn| {
+            let mut values_clause = String::with_capacity(page_ids.len() * 5);
+            let mut sql_params = Vec::with_capacity(page_ids.len() + 2);
+            for (idx, page_id) in page_ids.iter().enumerate() {
+                if idx > 0 {
+                    values_clause.push_str(", ");
+                }
+                values_clause.push_str("(?)");
+                sql_params.push(Value::Blob(page_id.as_bytes().to_vec()));
+            }
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+
+            let sql = format!(
+                "WITH requested(id) AS (VALUES {values_clause}) \
+                 SELECT pages.id \
+                 FROM requested \
+                 JOIN pages ON pages.id = requested.id \
+                 WHERE pages.workspace_id = ? \
+                   AND pages.project_id = ? \
+                   AND pages.is_latest = 0"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
+            let mut out = std::collections::HashSet::new();
+            for row in rows {
+                out.insert(PageId::from_slice(&row?)?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     /// Return the open handoff the next session should pick up.
@@ -5366,6 +5655,9 @@ impl ReaderPool {
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
                 settled: Vec::new(),
+                // The pinned standing-context list is a project-scoped signal;
+                // an aggregate current/workspace briefing leaves it empty.
+                pinned: Vec::new(),
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -5580,6 +5872,25 @@ impl ReaderPool {
                 Vec::new()
             };
 
+            // Pinned latest pages (`pinned = 1`), newest first and bounded —
+            // standing operator-curated context for SessionStart hot-context
+            // ("pin before search"). Empty result → the field is skipped in
+            // JSON, so a project with no pins keeps the prior briefing shape.
+            let mut pinned_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
+                        updated_at \
+                 FROM pages \
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND pinned = 1{not_expired} \
+                  ORDER BY updated_at DESC \
+                  LIMIT {BRIEFING_PINNED_LIMIT}",
+                not_expired = not_expired("pages", "?3"),
+            ))?;
+            let pinned: Vec<BriefingPage> = pinned_stmt
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
             let mut snapshot = BriefingSnapshot {
                 counts,
                 activity_7d,
@@ -5593,6 +5904,7 @@ impl ReaderPool {
                 cross_project_dependents,
                 cross_project_dependencies,
                 settled,
+                pinned,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -6008,6 +6320,9 @@ impl ReaderPool {
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
                 settled: Vec::new(),
+                // The pinned standing-context list is a project-scoped signal;
+                // an aggregate current/workspace briefing leaves it empty.
+                pinned: Vec::new(),
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -6393,6 +6708,127 @@ impl ReaderPool {
                 links: collect(&outgoing)?,
                 backlinks: collect(&incoming)?,
             })
+        })
+        .await
+    }
+
+    /// Bounded breadth-first walk of the link graph outward from one seed
+    /// page, following both outgoing links and incoming back-links.
+    ///
+    /// This is the multi-hop generalisation of [`Self::page_links`]: depth 1
+    /// returns exactly the seed's direct neighbours (the union of `links` and
+    /// `backlinks`), and each further hop expands the frontier by one edge.
+    /// Like `page_links`, both ends are constrained to `is_latest = 1`, and
+    /// neighbours in sibling projects/workspaces resolve and carry their real
+    /// coordinate — the walk is cross-project aware.
+    ///
+    /// Bounds (all enforced regardless of the caller):
+    /// - `depth` is clamped into `1..=`[`RELATED_WALK_MAX_DEPTH`].
+    /// - A global visited set makes the walk dedup- and cycle-safe: no page is
+    ///   returned twice, cycles terminate, and the seed itself is never
+    ///   returned.
+    /// - At most [`RELATED_WALK_MAX_NODES`] nodes are returned; the walk stops
+    ///   as soon as the cap is reached.
+    ///
+    /// Returns an empty vec when the seed is missing or has no neighbours.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn related_walk(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+        depth: u8,
+    ) -> StoreResult<Vec<RelatedNode>> {
+        let depth = depth.clamp(1, RELATED_WALK_MAX_DEPTH);
+        self.with_conn(move |conn| {
+            let seed: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(seed) = seed else {
+                return Ok(Vec::new());
+            };
+
+            // Per-node expansion reuses the exact `page_links` resolution
+            // (latest-only, cross-project) but also selects `pg.id` so the walk
+            // can continue from each neighbour.
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let outgoing = format!(
+                "SELECT DISTINCT pg.id, pg.path, pg.title, {kind_expr}, ws.name, pr.name \
+                     FROM links l \
+                     JOIN pages pg ON pg.id = l.to_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
+                     ORDER BY ws.name, pr.name, pg.path"
+            );
+            let incoming = format!(
+                "SELECT DISTINCT pg.id, pg.path, pg.title, {kind_expr}, ws.name, pr.name \
+                     FROM links l \
+                     JOIN pages pg ON pg.id = l.from_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
+                     ORDER BY ws.name, pr.name, pg.path"
+            );
+            let mut out_stmt = conn.prepare(&outgoing)?;
+            let mut in_stmt = conn.prepare(&incoming)?;
+
+            let mut visited: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            visited.insert(seed.clone());
+            let mut results: Vec<RelatedNode> = Vec::new();
+            let mut frontier: Vec<Vec<u8>> = vec![seed];
+
+            'walk: for hop in 1..=depth {
+                let mut next: Vec<Vec<u8>> = Vec::new();
+                for node in &frontier {
+                    // Outgoing edges are labelled "link", incoming "backlink";
+                    // a node reachable both ways keeps its first-reached label.
+                    for (direction, stmt) in [("link", &mut out_stmt), ("backlink", &mut in_stmt)] {
+                        let rows = stmt.query_map(params![node], |row| {
+                            let id: Vec<u8> = row.get(0)?;
+                            Ok((
+                                id,
+                                RelatedPage {
+                                    path: row.get(1)?,
+                                    title: row.get(2)?,
+                                    kind: row.get(3)?,
+                                    workspace: row.get(4)?,
+                                    project: row.get(5)?,
+                                },
+                            ))
+                        })?;
+                        for row in rows {
+                            let (id, page) = row?;
+                            if !visited.insert(id.clone()) {
+                                continue;
+                            }
+                            results.push(RelatedNode {
+                                page,
+                                depth: hop,
+                                direction,
+                            });
+                            next.push(id);
+                            if results.len() >= RELATED_WALK_MAX_NODES {
+                                break 'walk;
+                            }
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+
+            Ok(results)
         })
         .await
     }

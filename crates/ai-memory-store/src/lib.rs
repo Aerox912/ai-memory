@@ -53,9 +53,10 @@ pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DeleteWorkspaceSummary,
     EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission,
     IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage, PagesMode,
-    PurgeSessionSummary, PurgeSummary, ReorgSummary, backfill_entity_index, purge_session,
-    record_embed_failure,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode, PurgeSessionSummary,
+    PurgeSummary, ReorgSummary, backfill_entity_index, backfill_page_windows,
+    backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
@@ -64,10 +65,11 @@ pub use reader::{
     DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
     ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
     OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
-    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
+    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
+    SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage, StatusCounts,
+    StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -153,6 +155,16 @@ impl Store {
                 "entity index backfilled from existing frontmatter"
             );
         }
+
+        // Chunked, resumable, WAL-bounded backfill of page ingestion windows
+        // (reshaped V62, #776). V62 now adds `valid_from`/`valid_to` and their
+        // index as cheap DDL; this reconstructs the same windows the original
+        // in-migration backfill produced, but in bounded batches with a WAL
+        // checkpoint between each instead of one multi-hour transaction. Runs
+        // single-threaded here, before the writer actor spawns, so it completes
+        // before the server accepts traffic. A store already backfilled (every
+        // page has a non-NULL `valid_from`) is a fast no-op.
+        ops::backfill_page_windows(&mut conn)?;
 
         let writer = WriterHandle::spawn(conn);
         let reader = ReaderPool::new(&db_path, READER_POOL_SOFT_CAP)?;
@@ -2350,6 +2362,7 @@ mod tests {
                 0,
                 1,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2548,6 +2561,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2837,6 +2851,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2859,6 +2874,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2926,6 +2942,7 @@ mod tests {
                 2,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3004,6 +3021,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3062,6 +3080,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3101,6 +3120,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3127,6 +3147,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -6706,7 +6727,7 @@ mod tests {
         // as_of between v1 and v2: the superseded version answers.
         let then_hits = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between), false)
             .await
             .unwrap();
         assert_eq!(then_hits.len(), 1, "{then_hits:?}");
@@ -6722,6 +6743,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -6731,7 +6753,7 @@ mod tests {
         // And before v1 existed: nothing was known.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1), false)
             .await
             .unwrap();
         assert!(before.is_empty(), "{before:?}");
@@ -6841,7 +6863,8 @@ mod tests {
                 .unwrap()
         );
 
-        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let mut db =
+            rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
         let live: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
             .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
             .unwrap()
@@ -6855,7 +6878,10 @@ mod tests {
         assert!(live[2].2.is_none(), "latest stays open");
         assert!(live[3].2.is_some(), "tombstone is closed");
 
-        // Replay the actual migration against the pre-V62 schema.
+        // Golden equivalence: strip the windows, replay the reshaped V62 DDL
+        // and the chunked boot backfill, and assert it reconstructs exactly
+        // the windows the live write path produced. A tiny batch forces the
+        // multi-batch resume path over this fixture.
         db.execute_batch(
             "DROP INDEX idx_pages_validity; \
              ALTER TABLE pages DROP COLUMN valid_from; \
@@ -6866,6 +6892,7 @@ mod tests {
             "../migrations/V62__page_ingestion_windows.sql"
         ))
         .unwrap();
+        ops::backfill_page_windows_in_batches(&mut db, 2).unwrap();
         let backfilled: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db
             .prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY created_at")
             .unwrap()
@@ -6884,7 +6911,7 @@ mod tests {
     /// Pre-V62 reorg/move retirements kept their instant only at link grain.
     #[test]
     fn v62_backfill_preserves_retired_link_windows() {
-        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE pages (
                 id INTEGER PRIMARY KEY, workspace_id INTEGER, project_id INTEGER,
@@ -6905,6 +6932,7 @@ mod tests {
             "../migrations/V62__page_ingestion_windows.sql"
         ))
         .unwrap();
+        ops::backfill_page_windows(&mut db).unwrap();
         // Reorg and move keep [100,300); missing evidence falls back;
         // a sibling scope's live page stays open; the decay marker wins.
         for (id, expected) in [
@@ -7202,7 +7230,7 @@ mod tests {
         // window opened at the version's creation.
         let later = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1))
+            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1), false)
             .await
             .unwrap();
         assert_eq!(later.len(), 1, "{later:?}");
@@ -7245,7 +7273,15 @@ mod tests {
         // Before retirement: visible.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(retired_at - 1000))
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "postgres",
+                10,
+                None,
+                Some(retired_at - 1000),
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(before.len(), 1, "{before:?}");
@@ -7259,6 +7295,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -7596,6 +7633,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();

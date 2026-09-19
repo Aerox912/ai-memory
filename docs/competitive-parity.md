@@ -85,7 +85,7 @@ until the eval harness (R2) that would justify activating them gets built.
 | Git-as-snapshot | agentmemory | **BETTER** | The wiki files *are* the truth (diffable), not a `state.json` dump |
 | Pages-over-facts / living pages | Hindsight | **PARITY** (native) | Same architecture, file-first vs their Postgres-first; `settled_first` briefing shipped |
 | Cross-session experience/abstraction pass | Letta/Hindsight/surveys | **REAL, ~parity** | ≥2-session evidence guard is the genuine article — but LLM-required and **off by default** |
-| Typed relation edges | graph camp | **SHALLOW on retrieval** | Data model + `contradicts`→lint is real, but retrieval **does not weight edge type** (explain-only) |
+| Typed relation edges | graph camp | **PARTLY SHIPPED** | Link-neighbours are now a first-class retrieval surface — `memory_read_page include_related` walks the `page_links` graph outward (bounded BFS, #775) — but retrieval **RANK weighting by edge type is still not done** (edge kind stays explain-only in `memory_query`) |
 | Belief-strength consolidation | Hindsight / mcp-memory-service | **BEHIND** | `page_evidence` substrate shipped but **ranking-inert**; we still correct via binary supersession, not evidence-weighted belief |
 | bi-temporal-lite | Zep/Graphiti | **BEHIND by design** | Ingestion-time only; world-time validity deferred (honestly, because dating facts needs an LLM and breaks the zero-LLM path) |
 
@@ -94,11 +94,15 @@ until the eval harness (R2) that would justify activating them gets built.
 Documented recommendations only — **nothing here is scheduled or to be
 implemented without a separate decision.** Ordered by leverage.
 
-1. **Build the R2 reproducible eval harness (highest leverage).** It is the
+1. **R2 reproducible eval harness — now built (#771/#772).** It was the
    meta-blocker: belief-strength ranking, typed-edge rank weighting, and a
-   published accuracy/latency/context-tokens *triple* are all gated on "prove it
-   with a number." Every quality gap below is dammed behind this one missing
-   piece. Nothing else in this list should ship before it exists.
+   published accuracy/latency/context-tokens *triple* were all gated on "prove it
+   with a number." The harness now measures that triple **and** end-to-end
+   QA-accuracy (LLM-as-judge), so the gate is open; what remains is running the
+   full-500 matrix and then activating the dormant substrate below against it.
+   Illustrative sample-20 numbers are in
+   [`benchmarks/retrieval-ab-r2.md`](benchmarks/retrieval-ab-r2.md); the
+   published full-500 triple is still pending.
 2. **A zero-LLM / local reranker (candle cross-encoder).** The single most-cited
    weakness: our only reranker is LLM-as-judge, so the zero-LLM default path —
    our headline — has *no* reranking, while basic-memory ships a local one and
@@ -123,21 +127,29 @@ implemented without a separate decision.** Ordered by leverage.
    README hero, add a one-line `ai-memory run claude` quickstart, and ship a
    "coming from Claude built-in?" importer (the `~/.claude/.../memory/` format is
    nearly identical markdown + `type` frontmatter — a cheap, strong on-ramp).
-6. **Smaller, competitor-specific closes:** a graph-walk retrieval tool
-   (basic-memory's `build_context`/`memory://`, borrowed-but-unshipped); MCP tool
-   behavior hints (readOnly/destructive/idempotent) on the 23-tool surface; a
-   clustering/dedup consolidation pass (mcp-memory-service's DBSCAN); a read-only
-   graph visualization in `/web`; a first-class TS SDK story for ecosystem parity;
-   an optional **dialectic/oracle query** (ask-a-question → synthesized answer)
-   and a **reasoning-tier knob** (Honcho) — but strictly as opt-in LLM layers
-   *over* the zero-LLM FTS/RRF core, never a requirement; a **pin-before-search
-   contract** and a first-class **`follow_references`/`get_related` graph-walk
-   MCP tool** (LiquidLM) exposing the link-neighbor RRF we already compute, plus
-   a **"hide superseded unless asked" retrieval knob** over our supersession
-   chains. Deliberately out of scope: Honcho's theory-of-mind user-modeling
-   engine and LiquidLM's opaque-cloud / LLM-mandatory / multimodal-second-brain
-   substrate (all off-mission for file-first, zero-LLM coding memory; the
-   global-scope preferences page already covers the useful user-prefs slice).
+6. **Smaller, competitor-specific closes — five now shipped on 2.4 (opt-in,
+   defaults byte-identical):** the graph-walk retrieval tool (basic-memory's
+   `build_context`/`memory://`, LiquidLM's `follow_references`/`get_related`)
+   shipped as `memory_read_page include_related`/`related_depth` (#775), a bounded
+   BFS exposing the link-neighbour walk over `page_links` we already compute; the
+   **dialectic/oracle query** (Honcho) shipped as `memory_query answer=true`
+   (#782) — a synthesized+cited answer over the hits, LLM-required and off by
+   default (graceful `answer_unavailable` with no provider); the **reasoning-tier
+   knob** (Honcho) shipped as `memory_query`/`memory_explore
+   reasoning: {minimal..max}` (#783), mapping to a per-tier token budget; the
+   **pin-before-search contract** (LiquidLM) shipped as `memory_query pin_first`
+   + `memory_briefing.pinned` (#780); and the **"hide superseded unless asked"
+   retrieval knob** shipped as `memory_query include_superseded=true` (#773) over
+   our supersession chains. All five are strictly opt-in LLM/retrieval layers
+   *over* the zero-LLM FTS/RRF core, never a requirement (invariant #13).
+   **Still unshipped:** MCP tool behavior hints
+   (readOnly/destructive/idempotent) on the 23-tool surface; a clustering/dedup
+   consolidation pass (mcp-memory-service's DBSCAN); a read-only graph
+   visualization in `/web`; a first-class TS SDK story for ecosystem parity.
+   Deliberately out of scope: Honcho's theory-of-mind user-modeling engine and
+   LiquidLM's opaque-cloud / LLM-mandatory / multimodal-second-brain substrate
+   (all off-mission for file-first, zero-LLM coding memory; the global-scope
+   preferences page already covers the useful user-prefs slice).
 7. **Fix doc staleness the audit surfaced** (accuracy, not features):
    `research-basic-memory.md` understates basic-memory's shipped cross-encoder
    reranking + Teams tier; `research-agentmemory.md` says 53 tools / 124 endpoints
@@ -151,11 +163,18 @@ implemented without a separate decision.** Ordered by leverage.
   cross-harness capture, claim-once handoffs + messaging, and multi-user
   shared-within-project. On operability, data ownership, and cross-agent/team
   continuity, ai-memory is genuinely ahead of every overlapping competitor.
-- **The honest weakness is retrieval quality**, and it is *self-inflicted by
-  discipline, not by copying*: belief-strength and typed-edge ranking are built
-  but switched off, no local reranker exists, and there is no published
-  comparable number — all because the R2 eval harness that would justify turning
-  them on has not been built. **Build R2, then activate what's already there.**
+- **The borrowed conveniences now ship (opt-in).** The 2.4 line landed the five
+  competitor-specific closes above — related-walk, dialectic answer, reasoning
+  tier, pin-before-search, and the show-superseded knob — each opt-in with
+  defaults byte-identical, and the R2 harness that gates the quality work now
+  exists and measures the accuracy+latency+context-tokens triple plus end-to-end
+  QA-accuracy (illustrative sample-20 only so far).
+- **The honest weakness is still retrieval quality**, and it remains
+  *self-inflicted by discipline, not by copying*: no local zero-LLM reranker
+  exists, belief-strength (`page_evidence`) and typed-edge **RANK** weighting are
+  built but still switched off, and the published *full-dataset* triple is still
+  pending (only illustrative sample-20 numbers so far). The gate (R2) is now
+  open — **activate what's already there against a full-500 run.**
 - **Migration answer:** for the self-hosted, multi-harness, team, zero-LLM,
   own-your-data coding-memory user, yes — we do the basics and add what they
   can't get elsewhere. For app personalization, enterprise graph queries, agent
