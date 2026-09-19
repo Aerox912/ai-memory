@@ -206,7 +206,10 @@ developer, user, and canonical project instructions.\n\
   expired historical memory. Superseded (older) page versions are hidden \
   by default; pass `include_superseded=true` when the user wants a page's \
   history or an answer a later edit removed — each older hit is labelled \
-  `superseded: true`. Use `explain=true` only when diagnosing \
+  `superseded: true`. Pass `pin_first=true` to prepend the project's \
+  bounded pinned latest pages ahead of the search hits (deduped, each \
+  marked `pinned: true`) when standing operator-curated context should be \
+  seen before the ranked matches. Use `explain=true` only when diagnosing \
   project/scopes ranking; it adds score provenance, while global search \
   reports only its distinct FTS stream.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
@@ -214,7 +217,8 @@ developer, user, and canonical project instructions.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
   'how big is the knowledge base'. Returns lifetime counts.\n\
 - `memory_briefing` — when the user wants a STRUCTURED snapshot \
-  (counts + 7d/30d activity + rules + recent pages, JSON, no LLM \
+  (counts + 7d/30d activity + rules + recent pages + a bounded `pinned` \
+  list of the project's pinned standing-context pages, JSON, no LLM \
   call). READ-ONLY: it never creates handoffs or mutates state. Use \
   over memory_status when more detail is wanted.\n\
 - `memory_explore` — when the user wants a PROSE digest. \
@@ -512,6 +516,10 @@ pub struct AiMemoryServer {
 
 const MAX_QUERY_SCOPES: usize = 25;
 
+/// Upper bound on how many pinned latest pages `memory_query(pin_first=true)`
+/// prepends, so standing context never crowds out the search result entirely.
+const PIN_FIRST_MAX: usize = 10;
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct MemoryScopeArg {
     /// Project to read inside the workspace.
@@ -561,6 +569,15 @@ struct QueryArgs {
     /// search and folded into `as_of` time-travel. Default false.
     #[serde(default)]
     include_superseded: Option<bool>,
+    /// Pin before search: prepend the project's bounded pinned latest pages
+    /// ahead of the fused search hits, deduped against them so a pinned page
+    /// that also matches the query appears once (marked `pinned: true`).
+    /// Standing operator-curated context an agent should see first. Applies to
+    /// single-project searches (default or `workspace`+`project`); ignored on
+    /// `scopes`, `global`, and `as_of` queries. Default false → ordering
+    /// unchanged.
+    #[serde(default)]
+    pin_first: Option<bool>,
     /// Attach `score_details` to project/scopes hits: per-stream ranks
     /// (FTS5, entity, vector, graph), raw scores, and RRF contributions, plus a
     /// top-level `streams_active` list. A `global=true` query uses a
@@ -2341,13 +2358,46 @@ impl AiMemoryServer {
             streams.push("graph");
             streams
         });
-        let hits = hits
+        let hits: Vec<QueryHit> = hits
             .into_iter()
             .map(|(hit, score_details)| QueryHit {
                 hit,
                 score_details: score_details.filter(|_| explain),
             })
             .collect();
+        // Pin before search: when the caller opts in AND this is a
+        // single-project search (no `scopes`; `global`/`as_of` returned
+        // earlier), prepend the project's bounded pinned latest pages ahead of
+        // the fused hits. Deduped by page id so a pinned page that also matched
+        // the query appears once, and the combined list is re-truncated to the
+        // requested limit so the total stays bounded. Default off → this branch
+        // never runs and the ordering is byte-identical.
+        let hits = if args.pin_first.unwrap_or(false) && resolved_scopes.is_none() {
+            let (ws, proj) = self
+                .effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                )
+                .await?;
+            let pins = self
+                .reader
+                .list_pinned_pages(ws, proj, limit.min(PIN_FIRST_MAX))
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if pins.is_empty() {
+                hits
+            } else {
+                let pin_ids: std::collections::HashSet<PageId> =
+                    pins.iter().map(|p| p.id).collect();
+                let mut combined: Vec<QueryHit> = pins.into_iter().map(QueryHit::from).collect();
+                combined.extend(hits.into_iter().filter(|h| !pin_ids.contains(&h.hit.id)));
+                combined.truncate(limit);
+                combined
+            }
+        } else {
+            hits
+        };
         let response = MemoryQueryResponse {
             hits,
             raw_hits,
@@ -5337,6 +5387,7 @@ mod tests {
                         snippet: format!("candidate {idx}"),
                         rank: idx as f64,
                         superseded: false,
+                        pinned: false,
                     },
                     Some(ai_memory_store::SearchExplain::default()),
                 )
@@ -5534,6 +5585,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         include_superseded: None,
+                        pin_first: None,
                         explain: Some(true),
                         as_of: None,
                     }),
@@ -5566,6 +5618,7 @@ mod tests {
                         global: Some(true),
                         include_expired: None,
                         include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -7294,6 +7347,7 @@ mod tests {
             global,
             include_expired: None,
             include_superseded: None,
+            pin_first: None,
             explain: Some(true),
             as_of,
         };
@@ -7333,6 +7387,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: Some(jiff::Timestamp::now().to_string()),
                 }),
@@ -7403,6 +7458,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7429,6 +7485,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: None,
                 }),
@@ -7523,6 +7580,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         include_superseded: None,
+                        pin_first: None,
                         explain: Some(true),
                         as_of: None,
                     }),
@@ -7611,6 +7669,7 @@ mod tests {
             global: None,
             include_expired: None,
             include_superseded: None,
+            pin_first: None,
             explain: None,
             as_of: None,
         };
@@ -7689,6 +7748,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7818,6 +7878,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7898,6 +7959,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -7994,6 +8056,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -8061,6 +8124,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -8104,6 +8168,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -8180,6 +8245,7 @@ mod tests {
                         global: None,
                         include_expired: None,
                         include_superseded: None,
+                        pin_first: None,
                         explain: None,
                         as_of: None,
                     }),
@@ -8247,6 +8313,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9301,6 +9368,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: None,
                 }),
@@ -9411,6 +9479,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: Some(true),
                     as_of: None,
                 }),
@@ -9459,6 +9528,7 @@ mod tests {
                     global: Some(true),
                     include_expired: Some(true),
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9540,6 +9610,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9573,6 +9644,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -9610,6 +9682,7 @@ mod tests {
                     global: Some(true),
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -12488,6 +12561,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),
@@ -12523,6 +12597,7 @@ mod tests {
                     global: None,
                     include_expired: None,
                     include_superseded: None,
+                    pin_first: None,
                     explain: None,
                     as_of: None,
                 }),

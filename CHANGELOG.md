@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- "Pin before search": `memory_query` gained an opt-in `pin_first` argument and
+  `memory_briefing` now carries a bounded `pinned` list (default off/absent;
+  targets the 2.4 line). Pinned pages previously earned only a small post-RRF
+  authority bump; they were never surfaced *ahead of* the search, and the
+  briefing never listed them by the `pinned` column. With `pin_first: true`, a
+  single-project `memory_query` prepends the project's bounded pinned latest
+  pages (newest first, cap 10) ahead of the fused hits, deduped by page id so a
+  pinned page that also matches the query appears once (marked `pinned: true`),
+  and re-truncates to the requested limit; `scopes`, `global`, and `as_of`
+  queries ignore it. A project-scoped `memory_briefing` snapshot now includes a
+  bounded `pinned` list of pinned latest pages (distinct from the `_slots/`
+  path-prefixed `slots`) so SessionStart hot-context can show standing context.
+  Both are backed by the new `ReaderPool::list_pinned_pages`; default off/empty
+  is byte-identical to the previous query ordering and briefing shape (#780).
 - `memory_read_page` gained an opt-in related-pages graph walk (default false;
   targets the 2.4 line). Passing `include_related: true` adds a `related` array
   of the pages reachable from the read page through the link graph — a bounded
