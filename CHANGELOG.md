@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.1-aerox.1] - 2026-09-19
+
+### Changed
+- Integrated canonical v2.3.1 and subsequent OpenCode capture and end-to-end test updates through bbc96c4a, preserving Aerox scoped MCP profiles, file-backed authentication, and native release packaging.
+
+### Fixed
+- The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
+  `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
+  recognize and drop OpenCode subagent sessions. Previously both plugins emitted
+  only `title`/`projectID` on `session.created`, so the marker never reached the
+  server and the opt-in was a silent no-op for OpenCode. Root sessions (no
+  `parentID`) stay unmarked (#755).
+
+## [2.3.1] - 2026-09-17
+
+### Added
+- `DATA_HANDLING.md`, `docs/sso.md`, and `docs/airgapped-install.md`,
+  consolidating existing data-flow, OIDC, and offline-install facts from
+  `SECURITY.md`/`docs/install.md`/`docs/local-embeddings.md` into the shape
+  enterprise security/legal review typically asks for before approving a dev
+  tool. No behavior change; a small addendum to `SECURITY.md`'s reporting
+  section adds a fallback contact path for reporters who can't use GitHub's
+  private-advisory flow.
+
+### Fixed
+- `export-okf` no longer refuses to export any project that has captured an
+  observation. The bundle walk skipped the reserved names `index.md` and
+  `log.md`, but not the rotated hook ledger `log-YYYY-MM.md` the server itself
+  appends to — which carries no frontmatter, so `okf::is_conformant` failed it
+  and aborted the whole export with `422 page log-YYYY-MM.md is not
+  OKF-conformant; run the server once to migrate before exporting`. Migrating
+  could not help: the OKF migration deliberately skips ledgers (#669), so the
+  file the export demanded be conformed stays frontmatter-less forever. The
+  ledger is raw capture rather than a concept file, so it is now dropped from
+  the bundle exactly as `log.md` already was, sharing the migration scan's
+  content gate — a prose page that happens to be named `log-2026-09.md` still
+  ships and still has to declare a `type`. (#748)
+
 ## [2.3.0-aerox.1] - 2026-09-16
 
 ### Changed
@@ -5937,7 +5975,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.1...HEAD
+[2.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.1
 [2.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.0
 [2.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.2
 [2.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.1
