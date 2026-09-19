@@ -316,7 +316,10 @@ should be proposed from a completed session, or at explicit wrap-up \
   the client-aware project-scope rule above; session-aware clients add \
   explicit scope when reading a page from a named sibling workspace/project. Use \
   this instead of memory_query when the user wants the complete text, \
-  not just snippets.\n\
+  not just snippets. Pass `include_related: true` (with an optional \
+  `related_depth`, default 1, max 3) to also walk the link graph outward and \
+  get a `related` array of the pages reachable from this one, each tagged \
+  with its hop `depth` and `direction`.\n\
 - `memory_read_session_observations` — when the user asks what actually \
   happened in a session, wants to check a compiled page against its raw \
   evidence, or needs the exact prompt/tool text behind a `memory_query` \
@@ -1293,6 +1296,16 @@ struct ReadPageArgs {
     /// both for the current project; static MCP clients must pass both.
     #[serde(default)]
     workspace: Option<String>,
+    /// Opt-in: also walk the link graph outward from this page and return the
+    /// reachable pages in a `related` array. Default false → the response is
+    /// byte-identical to a plain single-page read (no `related` field).
+    #[serde(default)]
+    include_related: bool,
+    /// How many hops to walk when `include_related` is set. Default 1 (direct
+    /// neighbours only); hard-capped at 3, so a larger value is clamped.
+    /// Ignored when `include_related` is false.
+    #[serde(default)]
+    related_depth: Option<u8>,
 }
 
 /// Bounds for `memory_read_session_observations`. The defaults keep one call
@@ -3237,7 +3250,15 @@ impl AiMemoryServer {
         this when the user asks to read, open, or show a specific page by \
         name or topic — not just snippets. Returns `{ path, title, body, \
         frontmatter }` (plus `served_from` when a missing markdown file is \
-        served from the DB fallback). Errors if the page is not found.")]
+        served from the DB fallback). \
+        \
+        Set `include_related: true` to also walk the link graph outward from \
+        this page and get a `related` array of the reachable pages, each with \
+        its `path`/`title`/`kind`/`workspace`/`project` plus the `depth` (hop \
+        distance) and `direction` (`link`/`backlink`) it was reached by; \
+        `related_depth` (default 1, hard-capped at 3) sets how far to walk. \
+        Default off → the response omits `related` entirely. Errors if the \
+        page is not found.")]
     async fn memory_read_page(
         &self,
         Parameters(args): Parameters<ReadPageArgs>,
@@ -3305,6 +3326,32 @@ impl AiMemoryServer {
         // Markdown on disk is the source of truth. Only a missing markdown file
         // uses the DB fallback; parse/permission/corruption errors must surface
         // so operators can fix the disk source of truth.
+        //
+        // Opt-in related-pages walk. Computed once against the resolved scope so
+        // both the disk and DB-fallback branches attach the same `related`
+        // block; default off → `attach_related` is a no-op and the response
+        // stays byte-identical to a plain single-page read.
+        let related = if args.include_related {
+            let depth = args.related_depth.unwrap_or(1);
+            Some(
+                self.reader
+                    .related_walk(ws, proj, page_path.to_string(), depth)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            )
+        } else {
+            None
+        };
+        let attach_related = |mut value: serde_json::Value| {
+            if let (Some(nodes), Some(map)) = (&related, value.as_object_mut()) {
+                map.insert(
+                    "related".into(),
+                    serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            value
+        };
+
         match wiki.read_page(ws, proj, &page_path) {
             Ok(md) => {
                 // Derive the title so an empty/absent frontmatter `title`
@@ -3313,12 +3360,12 @@ impl AiMemoryServer {
                 // frontmatter title was never filled otherwise read back
                 // titleless despite a proper `# Heading` (#599).
                 let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
-                ok_json(&serde_json::json!({
+                ok_json(&attach_related(serde_json::json!({
                     "path": page_path.to_string(),
                     "title": title,
                     "body": md.body,
                     "frontmatter": md.frontmatter,
-                }))
+                })))
             }
             Err(disk_err) if is_missing_wiki_file(&disk_err) => {
                 match self
@@ -3336,13 +3383,13 @@ impl AiMemoryServer {
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .or(Some(stored.title));
-                        ok_json(&serde_json::json!({
+                        ok_json(&attach_related(serde_json::json!({
                             "path": page_path.to_string(),
                             "title": title,
                             "body": stored.body,
                             "frontmatter": frontmatter,
                             "served_from": "db-fallback",
-                        }))
+                        })))
                     }
                     None => {
                         // Not on disk and not in the DB under the resolved
@@ -8610,6 +8657,8 @@ mod tests {
                     path: None,
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8660,6 +8709,8 @@ mod tests {
                     path: Some("notes/sibling.md".into()),
                     project: Some("docs".into()),
                     workspace: Some("practice".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8713,6 +8764,8 @@ mod tests {
                     path: Some("notes/db-only-tool.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8749,6 +8802,8 @@ mod tests {
                     path: Some("does-not-exist.md".into()),
                     project: Some("scratch".into()),
                     workspace: Some("default".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 test_optional_parts(),
             )
@@ -8772,6 +8827,8 @@ mod tests {
                     path: Some("does-not-exist.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 test_optional_parts(),
             )
@@ -10344,6 +10401,8 @@ mod tests {
                     path: Some("notes/default.md".into()),
                     project: Some("typo".into()),
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10421,6 +10480,8 @@ mod tests {
                     path: Some("notes/temp.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10513,6 +10574,8 @@ mod tests {
                     path: Some("notes/keep.md".into()),
                     project: None,
                     workspace: None,
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10622,6 +10685,8 @@ mod tests {
                     path: Some("notes/twin.md".into()),
                     project: Some("shared".into()),
                     workspace: Some("alpha".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -10639,6 +10704,8 @@ mod tests {
                     path: Some("notes/twin.md".into()),
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
+                    include_related: false,
+                    related_depth: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -11454,6 +11521,8 @@ mod tests {
                         path: Some("notes/bob-authored.md".into()),
                         project: None,
                         workspace: None,
+                        include_related: false,
+                        related_depth: None,
                     }),
                     OptionalParts(alice_parts),
                 )

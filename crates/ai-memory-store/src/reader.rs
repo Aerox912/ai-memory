@@ -1482,6 +1482,36 @@ pub struct PageLinks {
     pub backlinks: Vec<RelatedPage>,
 }
 
+/// Hard ceiling on how far [`ReaderPool::related_walk`] traverses the link
+/// graph. A caller's requested depth is clamped into `1..=RELATED_WALK_MAX_DEPTH`
+/// — a deeper walk is refused, not honoured, so one read cannot fan out across
+/// an unbounded slice of the graph.
+pub const RELATED_WALK_MAX_DEPTH: u8 = 3;
+
+/// Hard ceiling on the total number of distinct related nodes a single
+/// [`ReaderPool::related_walk`] returns. Bounds the response regardless of
+/// depth so a dense hub page cannot blow up a read; the walk stops as soon as
+/// this many nodes are collected.
+pub const RELATED_WALK_MAX_NODES: usize = 50;
+
+/// One node discovered by [`ReaderPool::related_walk`]: a [`RelatedPage`]
+/// (flattened into the same fields as a single-hop link) plus how it was
+/// reached — its hop distance from the seed and the direction of the edge that
+/// first reached it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedNode {
+    /// Identity of the related page (path/title/kind/workspace/project),
+    /// flattened so a node serializes exactly like a `page_links` entry with
+    /// two extra fields.
+    #[serde(flatten)]
+    pub page: RelatedPage,
+    /// Hop distance from the seed page (1 = a direct neighbour).
+    pub depth: u8,
+    /// Direction of the edge that first reached this node: `"link"` (the seed
+    /// side links out to it) or `"backlink"` (it links back toward the seed).
+    pub direction: &'static str,
+}
+
 /// One page flagged by a workspace health check, with enough identity to
 /// render a clickable drill-down row across projects.
 #[derive(Debug, Clone, Serialize)]
@@ -6547,6 +6577,127 @@ impl ReaderPool {
                 links: collect(&outgoing)?,
                 backlinks: collect(&incoming)?,
             })
+        })
+        .await
+    }
+
+    /// Bounded breadth-first walk of the link graph outward from one seed
+    /// page, following both outgoing links and incoming back-links.
+    ///
+    /// This is the multi-hop generalisation of [`Self::page_links`]: depth 1
+    /// returns exactly the seed's direct neighbours (the union of `links` and
+    /// `backlinks`), and each further hop expands the frontier by one edge.
+    /// Like `page_links`, both ends are constrained to `is_latest = 1`, and
+    /// neighbours in sibling projects/workspaces resolve and carry their real
+    /// coordinate — the walk is cross-project aware.
+    ///
+    /// Bounds (all enforced regardless of the caller):
+    /// - `depth` is clamped into `1..=`[`RELATED_WALK_MAX_DEPTH`].
+    /// - A global visited set makes the walk dedup- and cycle-safe: no page is
+    ///   returned twice, cycles terminate, and the seed itself is never
+    ///   returned.
+    /// - At most [`RELATED_WALK_MAX_NODES`] nodes are returned; the walk stops
+    ///   as soon as the cap is reached.
+    ///
+    /// Returns an empty vec when the seed is missing or has no neighbours.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn related_walk(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+        depth: u8,
+    ) -> StoreResult<Vec<RelatedNode>> {
+        let depth = depth.clamp(1, RELATED_WALK_MAX_DEPTH);
+        self.with_conn(move |conn| {
+            let seed: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(seed) = seed else {
+                return Ok(Vec::new());
+            };
+
+            // Per-node expansion reuses the exact `page_links` resolution
+            // (latest-only, cross-project) but also selects `pg.id` so the walk
+            // can continue from each neighbour.
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let outgoing = format!(
+                "SELECT DISTINCT pg.id, pg.path, pg.title, {kind_expr}, ws.name, pr.name \
+                     FROM links l \
+                     JOIN pages pg ON pg.id = l.to_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
+                     ORDER BY ws.name, pr.name, pg.path"
+            );
+            let incoming = format!(
+                "SELECT DISTINCT pg.id, pg.path, pg.title, {kind_expr}, ws.name, pr.name \
+                     FROM links l \
+                     JOIN pages pg ON pg.id = l.from_page_id \
+                     JOIN projects pr ON pr.id = pg.project_id \
+                     JOIN workspaces ws ON ws.id = pg.workspace_id \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
+                     ORDER BY ws.name, pr.name, pg.path"
+            );
+            let mut out_stmt = conn.prepare(&outgoing)?;
+            let mut in_stmt = conn.prepare(&incoming)?;
+
+            let mut visited: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            visited.insert(seed.clone());
+            let mut results: Vec<RelatedNode> = Vec::new();
+            let mut frontier: Vec<Vec<u8>> = vec![seed];
+
+            'walk: for hop in 1..=depth {
+                let mut next: Vec<Vec<u8>> = Vec::new();
+                for node in &frontier {
+                    // Outgoing edges are labelled "link", incoming "backlink";
+                    // a node reachable both ways keeps its first-reached label.
+                    for (direction, stmt) in [("link", &mut out_stmt), ("backlink", &mut in_stmt)] {
+                        let rows = stmt.query_map(params![node], |row| {
+                            let id: Vec<u8> = row.get(0)?;
+                            Ok((
+                                id,
+                                RelatedPage {
+                                    path: row.get(1)?,
+                                    title: row.get(2)?,
+                                    kind: row.get(3)?,
+                                    workspace: row.get(4)?,
+                                    project: row.get(5)?,
+                                },
+                            ))
+                        })?;
+                        for row in rows {
+                            let (id, page) = row?;
+                            if !visited.insert(id.clone()) {
+                                continue;
+                            }
+                            results.push(RelatedNode {
+                                page,
+                                depth: hop,
+                                direction,
+                            });
+                            next.push(id);
+                            if results.len() >= RELATED_WALK_MAX_NODES {
+                                break 'walk;
+                            }
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+
+            Ok(results)
         })
         .await
     }
