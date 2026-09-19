@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded `pinned` list of pinned latest pages (distinct from the `_slots/`
   path-prefixed `slots`) so SessionStart hot-context can show standing context.
   Both are backed by the new `ReaderPool::list_pinned_pages`; default off/empty
-  is byte-identical to the previous query ordering and briefing shape (#NNN).
+  is byte-identical to the previous query ordering and briefing shape (#780).
 - `memory_read_page` gained an opt-in related-pages graph walk (default false;
   targets the 2.4 line). Passing `include_related: true` adds a `related` array
   of the pages reachable from the read page through the link graph — a bounded
