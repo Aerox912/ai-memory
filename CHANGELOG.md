@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The V62 page-ingestion-window migration no longer runs its backfill inside a
+  single migration transaction, which on a large store ran for hours and grew
+  the WAL to roughly the size of the database with no progress. V62 is now
+  DDL-only (the two columns plus their index); the window backfill moved to a
+  chunked, resumable, WAL-bounded boot-path step that processes pages in bounded
+  batches, checkpoints the WAL (`TRUNCATE`) between each, and logs progress. The
+  end state is byte-identical to the original V62, the step resumes rather than
+  restarts if interrupted, and it is a fast no-op on a store that already applied
+  the original V62. Because that reshape changes the migration's checksum, the
+  runner now intentionally tolerates a divergent checksum on an already-applied
+  migration (`abort_divergent = false`) so correctly-migrated stores still open;
+  the schema-ahead guard (`abort_missing`) is unchanged (#776).
 - Page writes now refuse git-reserved and non-portable page paths (a `.git`
   component or an 8.3 `git~1`..`git~4` alias, Windows-reserved names and
   characters) on every write funnel, including MCP `memory_write_page` and
