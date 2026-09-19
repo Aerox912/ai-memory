@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path actually runs (`answer: true` with a provider, or `memory_explore` with a
   provider), so the zero-LLM default path is untouched. Omitting `reasoning`, or
   passing `minimal`, is byte-identical to before. No new MCP tool (still 23)
-  (#784).
+  (#783).
 - Dialectic answer on `memory_query`: an opt-in, off-by-default `answer`
   argument (borrowed from Honcho's dialectic endpoint; targets the 2.4 line).
   When `answer: true` AND the server has an LLM provider configured, the query
