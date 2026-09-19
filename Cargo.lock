@@ -216,6 +216,7 @@ dependencies = [
  "jiff",
  "rmcp",
  "schemars",
+ "secrecy",
  "serde",
  "serde_json",
  "subtle",

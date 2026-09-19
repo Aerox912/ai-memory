@@ -71,6 +71,18 @@ score provenance to compiled-page hits, including matched entity names.
 Cross-project `global: true` search has a distinct FTS-only ranker, so it reports
 the active stream without per-hit RRF details.
 
+Pass `answer: true` (opt-in, off by default) to also get a synthesized,
+natural-language answer over the top hits, attached as `answer: { text,
+citations }` where `citations` are the page paths the answer drew from. This
+requires the server to have an LLM provider configured: with no provider the
+call returns the normal hits plus a short `answer_unavailable` note and never
+errors, and the default path (`answer` omitted/`false`) makes no LLM call at
+all. The answer is grounded strictly in the retrieved snippets, so treat it as a
+convenience over the same hits, not a new source — still open the cited pages
+before acting. It applies to the normal single-project / `scopes` search;
+`global` and `as_of` queries ignore it. This is a new 2.4 feature and its answer
+quality is not yet eval-validated.
+
 ## Snippets are not full pages
 
 Search returns snippets, not complete bodies. An empty-looking or short snippet does not prove the page is empty because the match can be outside the snippet window. Fetch the full page when the path or title looks relevant, especially for rules, procedures, decisions, and gotchas.
