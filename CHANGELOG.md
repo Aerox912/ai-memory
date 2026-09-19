@@ -78,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   malformed id now fails as `invalid params`, the code `memory_auto_improve`
   already uses for the same argument.
 
+- `backfill` returned success even when imports failed, and `--quiet` hid
+  their diagnostics. It now reports errors on stderr, includes failure counts
+  in the human summary, and exits nonzero after emitting its report (#786).
+
 ## [2.3.1] - 2026-09-17
 
 ### Added
