@@ -102,6 +102,11 @@ const DESCRIPTOR_SCAN_CHARS: usize = 600;
 /// Maximum length of a synthesised page descriptor, in characters.
 const DESCRIPTOR_MAX_CHARS: usize = 240;
 
+/// Upper bound on the pinned standing-context list carried by a project
+/// [`BriefingSnapshot`] (`memory_briefing`), so SessionStart hot-context stays
+/// bounded no matter how many pages a project has pinned.
+const BRIEFING_PINNED_LIMIT: usize = 10;
+
 /// SQL expression yielding the raw material for [`page_descriptor`]: the
 /// page's own frontmatter `summary` when it has a non-blank one, otherwise a
 /// prefix of the body. `NULLIF(TRIM(...), '')` keeps an empty summary from
@@ -662,6 +667,14 @@ pub struct PageHit {
     /// retrieval output is unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub superseded: bool,
+    /// True only when this hit is standing pinned context prepended by the
+    /// opt-in `memory_query(pin_first=true)` path (via
+    /// [`ReaderPool::list_pinned_pages`]). Ordinary search hits leave it
+    /// `false` — the store's FTS/entity/vector/graph retrieval does not read
+    /// the `pinned` column into the hit — so it is skipped in JSON when false
+    /// and default retrieval output is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// Completed session selected for scheduled auto-improvement.
@@ -1208,6 +1221,15 @@ pub struct BriefingSnapshot {
     /// JSON otherwise so the default briefing shape is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settled: Vec<SettledPage>,
+    /// The project's pinned latest pages (`pinned = 1`), newest first and
+    /// bounded — standing operator-curated context so SessionStart hot-context
+    /// can show it before any search ("pin before search", 2.4 line). Distinct
+    /// from `slots`, which is keyed by the `_slots/` path prefix rather than
+    /// the `pinned` column. Empty and omitted from JSON when the project has no
+    /// pinned pages, so a project without pins keeps the previous briefing
+    /// shape byte-for-byte.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<BriefingPage>,
 }
 
 /// Trimmed page view for the briefing — path, title, kind, updated_at
@@ -1732,6 +1754,7 @@ impl ReaderPool {
                         snippet,
                         rank,
                         superseded: false,
+                        pinned: false,
                     },
                     authority,
                 ));
@@ -1950,6 +1973,7 @@ impl ReaderPool {
                         snippet,
                         rank,
                         superseded: false,
+                        pinned: false,
                     },
                     authority,
                 ));
@@ -2047,6 +2071,7 @@ impl ReaderPool {
                         snippet,
                         rank,
                         superseded: false,
+                        pinned: false,
                     },
                     authority,
                 ));
@@ -2182,6 +2207,7 @@ impl ReaderPool {
                         snippet: entry.snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
                         superseded: false,
+                        pinned: false,
                     },
                     entry.explain,
                 )
@@ -2320,6 +2346,81 @@ impl ReaderPool {
                     snippet,
                     rank,
                     superseded: false,
+                    pinned: false,
+                });
+            }
+            Ok(hits)
+        })
+        .await
+    }
+
+    /// List the project's pinned latest pages, most-recently-updated first.
+    ///
+    /// This is the "list pinned pages" primitive behind the opt-in
+    /// `memory_query(pin_first=true)` prepend and the briefing's `pinned`
+    /// standing-context list (2.4 line): pages an operator explicitly pinned
+    /// are standing context an agent should see *before* it searches. It
+    /// returns only current pinned versions (`pinned = 1 AND is_latest = 1`),
+    /// so an unpinned page and a superseded (older) pinned version are both
+    /// excluded, and `limit` bounds the result.
+    ///
+    /// Recency has no FTS relevance score, so the reused [`PageHit::rank`]
+    /// field carries `updated_at` (µs, cast to REAL) exactly as
+    /// [`Self::recent_pages_for_project`] does — larger means "more recent";
+    /// callers must not read it as an FTS rank. Each hit is marked
+    /// `pinned: true`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_pinned_pages(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        limit: usize,
+    ) -> StoreResult<Vec<PageHit>> {
+        let limit = limit.clamp(1, 100);
+        self.with_conn(move |conn| {
+            let sql = format!(
+                "SELECT id, path, title, \
+                        {descriptor} AS snip, \
+                        CAST(updated_at AS REAL) AS rank \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND is_latest = 1 AND pinned = 1{not_expired} \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?3",
+                descriptor = page_descriptor_expr("body", "frontmatter_json"),
+                not_expired = not_expired("pages", "?4"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            #[allow(clippy::cast_possible_wrap)]
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    limit as i64,
+                    now_us()
+                ],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let path: String = row.get(1)?;
+                    let title: String = row.get(2)?;
+                    let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
+                    let rank: f64 = row.get(4)?;
+                    Ok((id_bytes, path, title, snippet, rank))
+                },
+            )?;
+            let mut hits = Vec::new();
+            for row in rows {
+                let (id_bytes, path, title, snippet, rank) = row?;
+                hits.push(PageHit {
+                    id: PageId::from_slice(&id_bytes)?,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank,
+                    superseded: false,
+                    pinned: true,
                 });
             }
             Ok(hits)
@@ -2377,6 +2478,7 @@ impl ReaderPool {
                     snippet,
                     rank,
                     superseded: false,
+                    pinned: false,
                 });
             }
             Ok(hits)
@@ -4237,6 +4339,7 @@ impl ReaderPool {
                         snippet,
                         rank: 0.0,
                         superseded: false,
+                        pinned: false,
                     },
                     weight,
                     matched,
@@ -4436,6 +4539,7 @@ impl ReaderPool {
                         snippet,
                         rank: 0.0,
                         superseded: false,
+                        pinned: false,
                     },
                     seed_ord,
                     incoming: stream_ord % 2 == 1,
@@ -5028,6 +5132,7 @@ impl ReaderPool {
                         snippet: entry.snippet,
                         rank: -entry.score, // lower = better (matches FTS5 convention)
                         superseded: false,
+                        pinned: false,
                     },
                     entry.explain,
                 )
@@ -5550,6 +5655,9 @@ impl ReaderPool {
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
                 settled: Vec::new(),
+                // The pinned standing-context list is a project-scoped signal;
+                // an aggregate current/workspace briefing leaves it empty.
+                pinned: Vec::new(),
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -5764,6 +5872,25 @@ impl ReaderPool {
                 Vec::new()
             };
 
+            // Pinned latest pages (`pinned = 1`), newest first and bounded —
+            // standing operator-curated context for SessionStart hot-context
+            // ("pin before search"). Empty result → the field is skipped in
+            // JSON, so a project with no pins keeps the prior briefing shape.
+            let mut pinned_stmt = conn.prepare_cached(&format!(
+                "SELECT path, title, {kind_expr} AS kind, \
+                        updated_at \
+                 FROM pages \
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND pinned = 1{not_expired} \
+                  ORDER BY updated_at DESC \
+                  LIMIT {BRIEFING_PINNED_LIMIT}",
+                not_expired = not_expired("pages", "?3"),
+            ))?;
+            let pinned: Vec<BriefingPage> = pinned_stmt
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
             let mut snapshot = BriefingSnapshot {
                 counts,
                 activity_7d,
@@ -5777,6 +5904,7 @@ impl ReaderPool {
                 cross_project_dependents,
                 cross_project_dependencies,
                 settled,
+                pinned,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -6192,6 +6320,9 @@ impl ReaderPool {
                 cross_project_dependents: 0,
                 cross_project_dependencies: 0,
                 settled: Vec::new(),
+                // The pinned standing-context list is a project-scoped signal;
+                // an aggregate current/workspace briefing leaves it empty.
+                pinned: Vec::new(),
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)

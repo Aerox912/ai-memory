@@ -15,7 +15,7 @@ Use this skill for read-only ai-memory lookups, catch-up, and evaluating remembe
 - `memory_read_page` fetches a full page body after a search hit or direct path lookup. Pass `include_related: true` (optional `related_depth`, default 1, hard cap 3) to also walk the link graph outward and return a `related` array of reachable pages, each with its hop `depth` and edge `direction` (`link`/`backlink`); default off omits it.
 - `memory_read_session_observations` reads one session's raw hook observations (prompts, tool calls, stops) in capture order, paged and body-capped, when the user asks what actually happened in a session or wants to check a compiled page against its evidence.
 - `memory_status` reports whether ai-memory is healthy and how large the knowledge base is.
-- `memory_briefing` returns a structured read-only snapshot for agent consumption.
+- `memory_briefing` returns a structured read-only snapshot for agent consumption, including a bounded `pinned` list of the project's pinned standing-context pages (present only when the project has pins).
 - `memory_explore` returns a prose digest when the user asks for an open-ended catch-up.
 
 ## Project scope
@@ -55,6 +55,15 @@ wants a page's history, or an answer that a later edit removed. Each older hit i
 labelled `superseded: true` so you can tell it from the live version; the current
 version is never marked. This applies to project and explicit-scope searches;
 `global=true` search and `as_of` time-travel are unaffected.
+
+Pass `pin_first: true` to prepend the project's bounded pinned latest pages
+ahead of the ranked search hits ("pin before search") when the user's task
+should be anchored in standing operator-curated context first. The pins are
+deduped against the search hits (a pinned page that also matches appears once,
+marked `pinned: true`), the combined result stays within the requested limit,
+and default `false` leaves the ordering unchanged. It applies to single-project
+searches (default or `workspace`+`project`); `scopes`, `global`, and `as_of`
+queries ignore it.
 
 Use `explain: true` only when the user asks why project or explicit-scope hits
 ranked as they did. It adds FTS, lexical entity, optional vector, and graph
