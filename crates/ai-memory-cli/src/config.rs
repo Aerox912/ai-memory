@@ -3349,6 +3349,41 @@ mod tests {
         );
     }
 
+    /// The placeholder that validates a profile with an absent credential
+    /// must be accepted by every API-key provider's constructor. If one ever
+    /// checks key shape (a prefix, a length), a correct profile would fail
+    /// `load` over a key the operator never set — this pins that it does not.
+    #[test]
+    fn every_api_key_provider_accepts_the_unresolved_placeholder() {
+        for (provider, extra) in [
+            ("anthropic", ""),
+            ("openai", ""),
+            ("gemini", ""),
+            ("opencode", ""),
+            (
+                "openai-compat",
+                "base_url = \"https://openrouter.ai/api/v1\"\n",
+            ),
+        ] {
+            let config = load_with_toml(&format!(
+                "[[llm_fallbacks]]\nprovider = \"{provider}\"\nmodel = \"m\"\n{extra}\
+                 api_key_env = \"AI_MEMORY_TEST_FALLBACK_UNSET_KEY_762\"\n"
+            ))
+            .unwrap_or_else(|error| {
+                panic!("{provider}: load must defer the credential: {error:#}")
+            });
+            assert_eq!(
+                config.llm_fallback_unresolved.len(),
+                1,
+                "{provider}: the absent credential must be recorded"
+            );
+            assert!(
+                config.llm_fallback_configs.is_empty(),
+                "{provider}: the placeholder-built config must be discarded"
+            );
+        }
+    }
+
     #[test]
     fn a_config_without_unresolved_fallbacks_passes_the_serve_check() {
         let config = load_with_toml("").unwrap();
