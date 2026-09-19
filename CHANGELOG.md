@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`link`/`backlink`) it was reached by; the walk is cross-project aware,
   dedup- and cycle-safe via a global visited set, and bounded by a total-node
   cap. Default-off behaviour is byte-identical to the previous single-page
-  response (no `related` field) (#NNN).
+  response (no `related` field) (#775).
 - `memory_query` gained an opt-in `include_superseded` argument (default false;
   targets the 2.4 line). When set, project and explicit-scope searches also
   return superseded (older) page versions across the FTS/entity/vector/graph
