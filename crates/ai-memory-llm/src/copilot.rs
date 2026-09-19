@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::auth::CopilotAuth;
 use crate::auth_file::{load_entry, now_ms, save_entry};
@@ -339,16 +339,24 @@ impl CopilotProvider {
             return Ok(CopilotEndpoint::ChatCompletions);
         }
         let metadata = response_json_limited::<CopilotModelsResponse>(response).await?;
-        let model = metadata
+        let Some(model) = metadata
             .data
             .into_iter()
             .find(|entry| entry.id == self.model)
-            .ok_or_else(|| {
-                LlmError::UnexpectedShape(format!(
-                    "copilot model metadata did not contain configured model {:?}",
-                    self.model
-                ))
-            })?;
+        else {
+            // A configured model that the catalogue does not enumerate
+            // (enterprise/custom deployments, aliases, casing, a model newer
+            // than this list) reached Chat Completions directly before this
+            // metadata check existed. Keep that backward-compatible path rather
+            // than hard-erroring; only models the catalogue lists as
+            // Responses-only route through `/responses`.
+            warn!(
+                model = %self.model,
+                "copilot model not found in /models catalogue; using chat completions"
+            );
+            *cached = Some(CopilotEndpoint::ChatCompletions);
+            return Ok(CopilotEndpoint::ChatCompletions);
+        };
         let endpoint = CopilotEndpoint::from_supported(&model.supported_endpoints).ok_or_else(|| {
             LlmError::UnexpectedShape(format!(
                 "copilot model {:?} has no supported completion endpoint; advertised endpoints: {:?}",

@@ -131,6 +131,43 @@ async fn metadata_with_both_endpoints_deterministically_prefers_chat() {
 }
 
 #[tokio::test]
+async fn model_absent_from_catalogue_falls_back_to_chat_completions() {
+    // A 200 `/models` response that does not enumerate the configured model
+    // (enterprise/custom deployments, aliases, a model newer than the list)
+    // must keep the pre-metadata-check Chat Completions path, not hard-error.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(metadata("some-other-model", &["/chat/completions"])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat("fallback")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    assert_eq!(
+        provider(&server, "enterprise-custom-deployment")
+            .complete(ai_memory_llm::ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap()
+            .text,
+        "fallback"
+    );
+}
+
+#[tokio::test]
 async fn metadata_without_a_compatible_endpoint_fails_with_model_and_capabilities() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
