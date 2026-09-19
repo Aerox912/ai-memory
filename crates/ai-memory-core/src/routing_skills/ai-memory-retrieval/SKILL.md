@@ -83,6 +83,15 @@ before acting. It applies to the normal single-project / `scopes` search;
 `global` and `as_of` queries ignore it. This is a new 2.4 feature and its answer
 quality is not yet eval-validated.
 
+Pair `answer: true` with a `reasoning` tier — `minimal` (default), `low`,
+`medium`, `high`, or `max` — to tune how hard the model works on the synthesis.
+Higher tiers hand the model a larger token budget so it can reason longer before
+its answer is truncated; `minimal` (and omitting `reasoning`) is byte-identical
+to today. `memory_explore` takes the same `reasoning` tier for its prose digest.
+The tier only matters when the LLM path actually runs: with `answer: false` (or
+no provider configured) it is inert and no LLM call is made. An unknown value is
+rejected by the schema.
+
 ## Snippets are not full pages
 
 Search returns snippets, not complete bodies. An empty-looking or short snippet does not prove the page is empty because the match can be outside the snippet window. Fetch the full page when the path or title looks relevant, especially for rules, procedures, decisions, and gotchas.
