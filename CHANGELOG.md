@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Dialectic answer on `memory_query`: an opt-in, off-by-default `answer`
+  argument (borrowed from Honcho's dialectic endpoint; targets the 2.4 line).
+  When `answer: true` AND the server has an LLM provider configured, the query
+  synthesizes a concise, cited natural-language answer over the top retrieved
+  hits and attaches it as `answer: { text, citations }`, where `citations` are
+  the page paths the answer drew from (JSON-schema structured output, grounded
+  strictly in the retrieved snippets). When `answer: true` but no provider is
+  configured, the normal hits are returned plus a short `answer_unavailable`
+  note rather than an error. With `answer` omitted/`false` (the default), no LLM
+  provider is accessed and the response is byte-identical to before, so the
+  zero-LLM default path is untouched. Applies to the normal single-project /
+  `scopes` search; `global` and `as_of` queries ignore it. Honest caveat: the
+  feature is new and its answer quality is not yet eval-validated — treat the
+  synthesized answer as a convenience over the same hits and still open the
+  cited pages before acting (#782).
 - "Pin before search": `memory_query` gained an opt-in `pin_first` argument and
   `memory_briefing` now carries a bounded `pinned` list (default off/absent;
   targets the 2.4 line). Pinned pages previously earned only a small post-RRF

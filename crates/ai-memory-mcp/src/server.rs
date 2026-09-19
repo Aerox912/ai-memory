@@ -209,7 +209,12 @@ developer, user, and canonical project instructions.\n\
   `superseded: true`. Pass `pin_first=true` to prepend the project's \
   bounded pinned latest pages ahead of the search hits (deduped, each \
   marked `pinned: true`) when standing operator-curated context should be \
-  seen before the ranked matches. Use `explain=true` only when diagnosing \
+  seen before the ranked matches. Pass `answer=true` (opt-in, off by \
+  default, and only when the server has an LLM provider) to also synthesize \
+  a cited natural-language answer over the top hits, attached as \
+  `answer: { text, citations }`; with no provider it returns the hits plus \
+  an `answer_unavailable` note (never an error), and the default path makes \
+  no LLM call. Use `explain=true` only when diagnosing \
   project/scopes ranking; it adds score provenance, while global search \
   reports only its distinct FTS stream.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
@@ -595,6 +600,17 @@ struct QueryArgs {
     /// combined with `global` or `scopes`. Omit for a normal search.
     #[serde(default)]
     as_of: Option<String>,
+    /// Opt-in, off by default. When `true` AND the server has an LLM provider
+    /// configured, synthesize a natural-language, cited answer over the top
+    /// retrieved hits and attach it as `answer: { text, citations }` (the
+    /// citations are the page paths the answer drew from). When `true` but no
+    /// provider is configured, the normal hits are returned plus an
+    /// `answer_unavailable` note — never an error. When `false`/omitted (the
+    /// default) the response is unchanged and NO LLM call is made. Applies to
+    /// the normal single-project / `scopes` search; ignored on `global` and
+    /// `as_of` queries.
+    #[serde(default)]
+    answer: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -656,9 +672,44 @@ struct ProjectSearchOptions<'a> {
     include_superseded: bool,
 }
 
+/// Synthesized "dialectic" answer attached to a `memory_query` response when
+/// the caller opts in with `answer=true` and a provider is configured. The
+/// `text` is a natural-language answer drawn strictly from the retrieved hit
+/// snippets; `citations` are the page paths the model reported drawing from.
+#[derive(Debug, Serialize)]
+struct QueryAnswer {
+    text: String,
+    citations: Vec<String>,
+}
+
+/// LLM structured-output schema for `memory_query(answer=true)`. JSON-schema
+/// structured output only (invariant #7): derived via `schemars` and passed to
+/// [`ai_memory_llm::complete_structured`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AnswerSynthesis {
+    /// A concise natural-language answer to the user's query, drawn strictly
+    /// from the provided page snippets. If the snippets do not contain the
+    /// answer, say so plainly instead of guessing.
+    answer: String,
+    /// The page paths (exactly as given in the context) that the answer drew
+    /// from. Empty when the context did not contain the answer.
+    citations: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct MemoryQueryResponse {
     hits: Vec<QueryHit>,
+    /// Present only when the caller set `answer=true` and a provider produced a
+    /// synthesized answer. Omitted otherwise so the default response is
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer: Option<QueryAnswer>,
+    /// Present only when the caller set `answer=true` but synthesis could not
+    /// run (no provider configured, or the provider call failed). A short
+    /// human-readable reason; the hits are still returned normally and this is
+    /// never an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer_unavailable: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     raw_hits: Vec<ai_memory_store::ObservationHit>,
     /// Populated only by a `global=true` query: cross-project hits, each
@@ -1979,6 +2030,25 @@ impl AiMemoryServer {
         self
     }
 
+    /// Attach a bare LLM provider so `memory_query(answer=true)` can synthesize
+    /// a cited answer over the retrieved hits, without the full consolidation
+    /// pipeline that [`with_consolidator_arc`](Self::with_consolidator_arc)
+    /// wires.
+    ///
+    /// Production startup always populates `self.llm` through
+    /// `with_consolidator_arc` (a provider without a consolidator has no
+    /// production use), so this thin builder exists only for the query-answer
+    /// tests, which need a provider but not the rest of that machinery — hence
+    /// `#[cfg(test)]`. It is behavior-preserving: it only sets the same
+    /// `self.llm` field the production builder does, and `answer` defaults off
+    /// so an attached provider is never called unless the caller opts in.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
+        self.llm = Some(llm);
+        self
+    }
+
     /// Override the retention-sweep parameters (typically populated
     /// from the user's config.toml `[decay]` table).
     #[must_use]
@@ -2105,6 +2175,11 @@ impl AiMemoryServer {
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryQueryResponse {
                 hits: Vec::new(),
+                answer: None,
+                answer_unavailable: args.answer.unwrap_or(false).then(|| {
+                    "answer synthesis is not supported for global (cross-project) queries"
+                        .to_string()
+                }),
                 raw_hits: Vec::new(),
                 global_hits,
                 global_scope_hits: Vec::new(),
@@ -2169,6 +2244,10 @@ impl AiMemoryServer {
                         score_details: details,
                     })
                     .collect(),
+                answer: None,
+                answer_unavailable: args.answer.unwrap_or(false).then(|| {
+                    "answer synthesis is not supported for as_of (time-travel) queries".to_string()
+                }),
                 raw_hits: Vec::new(),
                 global_hits: Vec::new(),
                 global_scope_hits: Vec::new(),
@@ -2398,8 +2477,54 @@ impl AiMemoryServer {
         } else {
             hits
         };
+        // Opt-in dialectic answer (off by default). Only when the caller set
+        // `answer=true` do we touch the LLM at all — this is the invariant-#13
+        // guard: with `answer` unset/false the provider (if any) is never
+        // accessed and the response is byte-identical to today. When requested
+        // but no provider is configured, we return the hits plus a short
+        // `answer_unavailable` note rather than erroring.
+        let (answer, answer_unavailable) = if args.answer.unwrap_or(false) {
+            match self.llm.as_ref() {
+                Some(llm) => {
+                    let request = build_answer_request(&args.query, &hits, &global_scope_hits);
+                    match ai_memory_llm::complete_structured::<AnswerSynthesis>(
+                        llm.as_ref(),
+                        request,
+                    )
+                    .await
+                    {
+                        Ok(synth) => (
+                            Some(QueryAnswer {
+                                text: synth.answer,
+                                citations: synth.citations,
+                            }),
+                            None,
+                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "memory_query answer synthesis failed; returning hits without an answer"
+                            );
+                            (None, Some(format!("answer synthesis failed: {e}")))
+                        }
+                    }
+                }
+                None => (
+                    None,
+                    Some(
+                        "no LLM provider configured on the server; returning hits without a \
+                         synthesized answer"
+                            .to_string(),
+                    ),
+                ),
+            }
+        } else {
+            (None, None)
+        };
         let response = MemoryQueryResponse {
             hits,
+            answer,
+            answer_unavailable,
             raw_hits,
             global_hits: Vec::new(),
             global_scope_hits,
@@ -5088,6 +5213,60 @@ fn build_explore_request(
 /// `prompts/explore_system.md`.
 const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md");
 
+/// System prompt for the opt-in `memory_query(answer=true)` synthesis. Keeps
+/// the model strictly grounded in the supplied snippets and forces the cited
+/// paths to come from the provided context (invariant against fabricated
+/// citations).
+const ANSWER_SYSTEM_PROMPT: &str = "You answer a user's question using ONLY the \
+    numbered memory-page snippets provided. Do not use any outside knowledge. \
+    Write a concise, direct answer grounded strictly in those snippets. In \
+    `citations`, list the exact `path` values (as given) of the pages you drew \
+    from — never invent a path, and cite only pages you actually used. If the \
+    snippets do not contain enough information to answer, say so plainly in \
+    `answer` and return an empty `citations` list.";
+
+/// Build the structured-output request for `memory_query(answer=true)`. Inlines
+/// the retrieved hit snippets (project hits first, then any `_global` scope
+/// hits) as numbered, path-labelled context so the model can ground its answer
+/// and cite exact paths. Snippets are stripped of the FTS `<mark>` HTML so the
+/// model sees clean text.
+fn build_answer_request(
+    query: &str,
+    hits: &[QueryHit],
+    global_scope_hits: &[QueryHit],
+) -> ai_memory_llm::ChatRequest {
+    fn clean(snippet: &str) -> String {
+        snippet.replace("<mark>", "").replace("</mark>", "")
+    }
+    let mut user = String::new();
+    user.push_str("## Question\n\n");
+    user.push_str(query);
+    user.push_str("\n\n## Memory page snippets\n\n");
+    let mut n = 0usize;
+    for hit in hits.iter().chain(global_scope_hits.iter()) {
+        n += 1;
+        user.push_str(&format!(
+            "{}. path: `{}`\n   title: {}\n   snippet: {}\n\n",
+            n,
+            hit.hit.path.as_str(),
+            hit.hit.title,
+            clean(&hit.hit.snippet),
+        ));
+    }
+    if n == 0 {
+        user.push_str("(no snippets matched the query)\n\n");
+    }
+    ai_memory_llm::ChatRequest {
+        system: Some(ANSWER_SYSTEM_PROMPT.into()),
+        messages: vec![ai_memory_llm::ChatMessage {
+            role: ai_memory_llm::Role::User,
+            content: user,
+        }],
+        max_tokens: 2_000,
+        temperature: Some(0.1),
+    }
+}
+
 /// Synthetic anonymous request `Parts` for callers arriving without request
 /// parts (for example stdio): no actor headers, so downstream resolves an
 /// anonymous `ActorKey` — the correct identity for a local, unauthenticated
@@ -5588,6 +5767,7 @@ mod tests {
                         pin_first: None,
                         explain: Some(true),
                         as_of: None,
+                        answer: None,
                     }),
                     test_optional_parts(),
                 )
@@ -5621,6 +5801,7 @@ mod tests {
                         pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
                     }),
                     test_optional_parts(),
                 )
@@ -7350,6 +7531,7 @@ mod tests {
             pin_first: None,
             explain: Some(true),
             as_of,
+            answer: None,
         };
 
         // Historical instant → the superseded version answers.
@@ -7390,6 +7572,7 @@ mod tests {
                     pin_first: None,
                     explain: Some(true),
                     as_of: Some(jiff::Timestamp::now().to_string()),
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7461,6 +7644,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7488,6 +7672,7 @@ mod tests {
                     pin_first: None,
                     explain: Some(true),
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7583,6 +7768,7 @@ mod tests {
                         pin_first: None,
                         explain: Some(true),
                         as_of: None,
+                        answer: None,
                     }),
                     OptionalParts(test_parts_default()),
                 )
@@ -7672,6 +7858,7 @@ mod tests {
             pin_first: None,
             explain: None,
             as_of: None,
+            answer: None,
         };
 
         let result = server
@@ -7751,6 +7938,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7881,6 +8069,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7962,6 +8151,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 test_optional_parts(),
             )
@@ -8059,6 +8249,7 @@ mod tests {
                         pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8127,6 +8318,7 @@ mod tests {
                         pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8171,6 +8363,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 test_optional_parts(),
             )
@@ -8248,6 +8441,7 @@ mod tests {
                         pin_first: None,
                         explain: None,
                         as_of: None,
+                        answer: None,
                     }),
                     test_optional_parts(),
                 )
@@ -8316,6 +8510,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9371,6 +9566,7 @@ mod tests {
                     pin_first: None,
                     explain: Some(true),
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9482,6 +9678,7 @@ mod tests {
                     pin_first: None,
                     explain: Some(true),
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9531,6 +9728,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9613,6 +9811,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9647,6 +9846,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -9685,6 +9885,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -12564,6 +12765,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -12600,6 +12802,7 @@ mod tests {
                     pin_first: None,
                     explain: None,
                     as_of: None,
+                    answer: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
