@@ -708,10 +708,12 @@ const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
 /// or an 8.3 short-name alias like `git~1`..`git~4`).
 #[must_use]
 pub fn is_git_reserved_component(component: &str) -> bool {
+    // Compare on bytes: a `str` slice at a fixed byte index panics on a
+    // multibyte component (a 5-byte UTF-8 name like "abcé" has no char
+    // boundary at 4), and this runs on untrusted write input.
+    let b = component.as_bytes();
     component.eq_ignore_ascii_case(".git")
-        || (component.len() == 5
-            && component[..4].eq_ignore_ascii_case("git~")
-            && (b'1'..=b'4').contains(&component.as_bytes()[4]))
+        || (b.len() == 5 && b[..4].eq_ignore_ascii_case(b"git~") && (b'1'..=b'4').contains(&b[4]))
 }
 
 fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
@@ -839,6 +841,30 @@ mod portable_page_path_tests {
             "git-notes/index.md",
         ] {
             let path = PagePath::new(raw).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// A multibyte component whose byte length is 5 must not be mistaken for
+    /// a `git~N` alias, and must not panic: `is_git_reserved_component` once
+    /// sliced the string at byte index 4, which is not a char boundary in a
+    /// name like "abcé" (5 bytes) or "a😀" (5 bytes). Since this runs on the
+    /// write funnel for untrusted input, the panic was a crashable defect.
+    #[test]
+    fn multibyte_components_are_not_git_reserved_and_do_not_panic() {
+        for component in ["abcé", "ab€", "a😀", "éé", "🦀🦀"] {
+            assert!(
+                !super::is_git_reserved_component(component),
+                "{component:?} is an ordinary name, not a git-reserved alias"
+            );
+        }
+        // The full write funnel (construct + ensure_portable) must accept a
+        // page path with a 5-byte multibyte component without panicking.
+        for raw in ["notes/abcé.md", "notes/a😀.md", "notes/ab€.md"] {
+            let path = PagePath::new(raw).expect("valid non-ASCII path");
             assert!(
                 path.ensure_portable().is_ok(),
                 "{raw:?} is portable and must stay writable"
