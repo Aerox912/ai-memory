@@ -51,7 +51,7 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 |---|---|---|---|
 | Fact extractors | Mem0, LangMem | Cheap per-turn personalization | Atomic facts lose relational/causal context (see [TriMem](research-2026-landscape.md#4-research-developments-worth-knowing)); LLM-per-turn; not file-first |
 | Hosted memory API (hybrid) | **Supermemory**, **LiquidLM** | Chunk-RAG + LLM temporal fact-graph + per-user profiles in one query; managed connectors (Drive/Notion/GitHub), multimodal, metadata/tag query filters | Cloud-first (best features + extraction are paid/hosted); LLM-required quality path; an opaque store is the source of truth (not file-first, nothing to `grep`/diff). Supermemory's MIT self-host binary drops the connectors + extraction models; LiquidLM is closed-source and cloud-only (no self-host at all) |
-| User-modeling / theory-of-mind | **Honcho** (Plastic Labs) | Reasoning-derived model of what each "peer" knows/believes over time — personalizes around the *human* the agent serves | Different problem: it remembers the *user*, ai-memory remembers the *project*. Opaque Postgres, LLM-required (Deriver/Dreamer), multi-service stack; adjacent (shares MCP/plugin delivery) but not a coding-memory migration target |
+| User-modeling / theory-of-mind | **Honcho** (Plastic Labs) | Reasoning-derived model of what each "peer" knows/believes over time — personalizes around the *human* the agent serves | Different problem: it remembers the *user*, ai-memory remembers the *project*. Opaque Postgres, LLM-required (Deriver/Dreamer), multi-service stack; adjacent (shares MCP/plugin delivery) but not a coding-memory migration target. ai-memory borrowed the *conveniences*, not the engine: an opt-in dialectic **answer** over its own hits and a **reasoning** tier now ship (both off by default, LLM-required) |
 | Temporal knowledge graph | Zep/Graphiti, Cognee | Bi-temporal "what was true vs believed when" | Needs a graph DB; heavier to self-host. ai-memory ships **bi-temporal-lite** on SQLite ([`temporal.md`](temporal.md)) + typed edges ([`typed-edges.md`](typed-edges.md)) for the useful part |
 | Memory OS / self-editing | Letta, MemOS, MIRIX | Agent curates its own tiered memory | Token-expensive self-editing; Letta itself now concedes file-first ("Is a Filesystem All You Need?") |
 | Hosted context database | **OpenViking** (ByteDance) | Progressive L0/L1/L2 loading; directory-scoped retrieval; broad integrations | LLM-**required** (VLM + embeddings); opaque swappable storage; AGPLv3 core + SaaS/enterprise weight |
@@ -116,7 +116,13 @@ core bets independently, from different substrates:
 ai-memory also **shipped the borrowable ideas** from that research rather than
 just cataloguing them: typed relation edges, ingestion-time temporal validity
 with `as_of` queries, local (no-key) embeddings as the default, and the
-cross-session abstraction pass are all in the product today.
+cross-session abstraction pass are all in the product today. The 2.4 line added
+five more, each **opt-in with defaults byte-identical**: a bounded related-pages
+graph walk (`memory_read_page include_related`, basic-memory/LiquidLM), an opt-in
+dialectic **answer** over hits and a **reasoning** tier (Honcho, both
+LLM-required and off by default), a **pin-before-search** contract (`memory_query
+pin_first` + a pinned standing-context briefing, LiquidLM), and a
+**show-superseded** retrieval knob over the supersession chains.
 
 ## Coming from another tool?
 
@@ -139,7 +145,9 @@ cross-session abstraction pass are all in the product today.
   explicit uploads. You give up (for now) their multimodal ingestion
   (video/audio/PDF/Office), a polished consumer web app + grounded chat, and
   managed hosting; you gain data ownership, no required API spend, offline
-  operation, and per-project team sharing. Different job: they build a general
+  operation, per-project team sharing, and — now opt-in on the 2.4 line — a
+  pin-before-search contract and a bounded related-pages graph walk over the link
+  neighbours ai-memory already computes. Different job: they build a general
   "second brain," ai-memory remembers *this repo*.
 - **From Hindsight / OpenViking:** you trade a hosted, LLM-required service for
   a self-contained binary that runs zero-LLM by default and keeps memory in
@@ -152,11 +160,16 @@ cross-session abstraction pass are all in the product today.
 
 Fair means saying this plainly:
 
-- **Raw retrieval score.** 0.823 hit@5 on LongMemEval-S is comparable to
-  mcp-memory-service and below agentmemory's 0.967 (hybrid + reranking). Part
-  is deliberate — a 2 KB privacy cap on captured excerpts puts evidence deep
-  inside one long turn out of the index's reach; the benchmark measures the
-  *shipped, sanitized* system, not an idealized retriever.
+- **Raw retrieval score, and no local reranker.** 0.823 hit@5 on LongMemEval-S
+  is comparable to mcp-memory-service and below agentmemory's 0.967 (hybrid +
+  reranking). Part is deliberate — a 2 KB privacy cap on captured excerpts puts
+  evidence deep inside one long turn out of the index's reach; the benchmark
+  measures the *shipped, sanitized* system, not an idealized retriever. The only
+  reranker is LLM-as-judge, so the zero-LLM default path has none; the opt-in
+  `answer=true` dialectic synthesis (2.4) is likewise LLM-required, off by
+  default, and its end-to-end QA-accuracy is early and small-sample (see
+  [`benchmarks/retrieval-ab-r2.md`](benchmarks/retrieval-ab-r2.md)), not a
+  headline claim.
 - **Headline benchmark comparability.** Hindsight quotes 91.4% *accuracy* and
   OpenViking quotes LoCoMo lifts — different datasets/metrics than our hit@5,
   and both are self-reported/preprint. We publish a reproducible harness and a
