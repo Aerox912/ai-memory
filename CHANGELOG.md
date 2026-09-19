@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Page writes now refuse git-reserved and non-portable page paths (a `.git`
+  component or an 8.3 `git~1`..`git~4` alias, Windows-reserved names and
+  characters) on every write funnel, including MCP `memory_write_page` and
+  consolidation `apply_batch`; reads of already-stored pages stay tolerant so
+  a bad row never breaks a listing. The git-reserved check is byte-safe and no
+  longer panics on a 5-byte multibyte path component (#781).
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted

@@ -1394,6 +1394,7 @@ impl Wiki {
             .ok_or_else(|| ai_memory_wiki_error("auto-improve proposal not found in scope"))?;
 
         let path = detail.summary.target_path.clone();
+        path.ensure_portable()?;
         let mut frontmatter = serde_json::json!({
             "kind": detail.summary.kind,
             "title": detail.summary.title,
@@ -1809,6 +1810,11 @@ impl Wiki {
     pub async fn apply_batch(&self, requests: Vec<WritePageRequest>) -> WikiResult<Vec<PageId>> {
         if requests.is_empty() {
             return Ok(Vec::new());
+        }
+        // Reject any path that cannot be materialised and checkpointed on every
+        // supported platform, before anything is written.
+        for req in &requests {
+            req.path.ensure_portable()?;
         }
         // Pre-compute markdown for each request. Filesystem work happens only
         // after the mutation guard + project/workspace validation below.
@@ -5685,5 +5691,66 @@ mod tests {
             store.reader.session_project_ids(sid).await.unwrap(),
             Some((ws, dst))
         );
+    }
+
+    #[tokio::test]
+    async fn write_page_and_apply_batch_refuse_git_reserved_and_non_portable_paths() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+
+        for bad in [
+            "CON.md",
+            "notes/aux.md",
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+        ] {
+            let bad_path = PagePath::new(bad).unwrap();
+            let write_err = wiki
+                .write_page(req(
+                    ws,
+                    proj,
+                    bad_path.as_str(),
+                    "content",
+                    serde_json::json!({}),
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    write_err,
+                    WikiError::Memory(ai_memory_core::MemoryError::InvalidPagePath(_))
+                ),
+                "write_page should refuse {bad:?}, got: {write_err}"
+            );
+
+            let batch_err = wiki
+                .apply_batch(vec![req(
+                    ws,
+                    proj,
+                    bad_path.as_str(),
+                    "content",
+                    serde_json::json!({}),
+                )])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    batch_err,
+                    WikiError::Memory(ai_memory_core::MemoryError::InvalidPagePath(_))
+                ),
+                "apply_batch should refuse {bad:?}, got: {batch_err}"
+            );
+
+            assert!(
+                !wiki.abs_path(ws, proj, &bad_path).exists(),
+                "file for {bad:?} must not be written to disk"
+            );
+        }
     }
 }

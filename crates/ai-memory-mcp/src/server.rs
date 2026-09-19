@@ -3081,6 +3081,8 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        path.ensure_portable()
+            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
@@ -9905,8 +9907,64 @@ mod tests {
             .unwrap();
         assert!(
             recent_text.contains("notes/santander-2025.md"),
-            "write-page result must be visible to read tools; got {recent_text}"
+            "got {recent_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_write_page_refuses_git_reserved_and_non_portable_paths() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        for bad in [
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+            "CON.md",
+            "notes/aux.md",
+            "notes/a|b.md",
+        ] {
+            let err = server
+                .memory_write_page(
+                    Parameters(WritePageArgs {
+                        path: bad.into(),
+                        body: "# Bad\n\nShould be refused.".into(),
+                        title: None,
+                        tier: None,
+                        tags: vec![],
+                        pinned: false,
+                        project: None,
+                        workspace: None,
+                        scope: None,
+                        expires_at: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid path"),
+                "expected invalid path error for {bad:?}, got: {err}"
+            );
+        }
     }
 
     #[tokio::test]
