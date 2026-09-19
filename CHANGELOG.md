@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `ai-memory serve` no longer hard-fails to take its single-instance lock on a
+  transient error under load. Acquiring the serve lock now retries `open` and
+  `try_lock_exclusive` a few times with a short (~25ms) backoff when they hit a
+  transient failure (EMFILE/ENFILE fd exhaustion, EINTR), mirroring
+  `acquire_drain_lock`. A genuinely contended lock (`WouldBlock`, another server
+  holds it) is never retried and still refuses startup immediately. The
+  serve-lock tests also assert with the concrete errno so any remaining
+  environmental flake is diagnosable rather than silent (#745).
 - The generated OpenCode and OpenCode 2 plugins now forward a subagent session's
   `parentID` as the `agent_id` marker, so `[capture] drop_subagent_captures` can
   recognize and drop OpenCode subagent sessions. Previously both plugins emitted
