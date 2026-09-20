@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Belief-strength confidence over the `page_evidence` substrate
+  (design-memory-aging.md bucket B1 / design-hindsight-borrowings.md §3): a
+  read-time, **zero-LLM** `confidence` derived per page version from its
+  evidence — distinct supporting sessions (breadth, not raw count), recency of
+  the newest sighting, and live `contradicts` count — bounded to
+  `[0.0, 0.95]`. It is **exposed inertly** everywhere it helps diagnosis:
+  `memory_query(explain=true)` now reports `confidence` and `evidence_count`
+  per hit (and `belief_factor` when folding is on), and `memory_status` reports
+  the project's `evidence_rows` count — none of which changes ranking. It can
+  optionally be **folded into ranking authority** as one more bounded factor
+  inside the existing `[0.55, 1.50]` clamp (never a new multiplier tower) via
+  the new `[retrieval] belief_authority_weight` config key, which **defaults to
+  `0.0` (OFF)** so upgrades rank byte-identically. The anti-entrenchment guards
+  are baked in: breadth weighting by distinct sessions, recency shading, a
+  hard confidence cap, and — the caller-side guard for invariant #16 — **a
+  supersession always wins regardless of evidence** (a superseded version's
+  stale evidence never boosts it, and confidence never gates whether a write or
+  correction takes). Turning the authority factor on is **gated on a positive
+  R2 delta** (retrieval-triple / QA), not yet performed (#815).
 - Zero-LLM contradiction detection surfaced through `memory_lint`
   (design-memory-aging.md bucket A5): the lint pass now flags likely-conflicting
   pages by cosine-similarity band. Cold knowledge pages (semantic / procedural)

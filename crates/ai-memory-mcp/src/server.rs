@@ -10207,6 +10207,9 @@ mod tests {
             .map(|t| t.text.clone())
             .unwrap();
         assert!(text.contains("\"pages_latest\": 1"));
+        // The belief-strength substrate footprint (P2) is surfaced in status;
+        // this fresh project has consolidated nothing, so it reads 0.
+        assert!(text.contains("\"evidence_rows\": 0"));
     }
 
     /// A scope that does not resolve is caller input, not a server fault: the
