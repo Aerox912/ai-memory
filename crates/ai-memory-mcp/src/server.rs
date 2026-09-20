@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_options,
+    run_auto_improve_review, run_lint, run_sweep_with_compaction,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -452,6 +452,9 @@ pub struct AiMemoryServer {
     /// Opt-in bound on how long raw observations outlive their consolidation.
     /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
     observation_retention: ObservationRetention,
+    /// A2 opt-in: compact cold episodic pages (tier-down) instead of evicting
+    /// them. Default `false`, so the sweep evicts exactly as before.
+    compact_cold_episodic: bool,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
@@ -1626,6 +1629,7 @@ impl AiMemoryServer {
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
             observation_retention: ObservationRetention::default(),
+            compact_cold_episodic: false,
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
@@ -2192,6 +2196,14 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_decay_breadth_weight(mut self, breadth_weight: f64) -> Self {
         self.decay_breadth_weight = breadth_weight;
+        self
+    }
+
+    /// Enable A2 extractive tier-down: the sweep compacts cold episodic pages
+    /// instead of evicting them. Off by default.
+    #[must_use]
+    pub fn with_compact_cold_episodic(mut self, compact: bool) -> Self {
+        self.compact_cold_episodic = compact;
         self
     }
 
@@ -2995,7 +3007,7 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
-        let report = run_sweep_with_options(
+        let report = run_sweep_with_compaction(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -3004,6 +3016,7 @@ impl AiMemoryServer {
             &self.decay_params,
             self.decay_breadth_weight,
             self.observation_retention,
+            self.compact_cold_episodic,
             args.dry_run.unwrap_or(false),
         )
         .await

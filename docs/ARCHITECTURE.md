@@ -293,6 +293,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version — consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Surfaced as `evidence_count` in `memory_query(explain=true)` and used to order the opt-in `settled_first` briefing. Ranking-inert: the confidence→authority factor is deferred behind the eval harness (`docs/design-hindsight-borrowings.md` P2). |
 | `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`). Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
+| `pages.compacted_at` | V65 nullable A2 tier-down marker (`docs/design-memory-aging.md` §A2). Set when the forget-sweep extractively compacts a cold episodic page (opt-in `[decay] compact_cold_episodic`) instead of evicting it; derived at the single page-upsert choke point from a `compacted: true` frontmatter mirror, so the marker and compacted body land in one transaction. Additive `ADD COLUMN`, no backfill — populated lazily by the sweep. The sweep and curator skip a marked page so it is never re-compacted, re-evicted, or re-reported as cold. Reversible: the full pre-compaction body stays in git + the supersession chain. |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
@@ -303,7 +304,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | Tier | Lifetime | Decay |
 |---|---|---|
 | Working | Current session only | Hard-drop on session end (kept in `observations` for forensics) |
-| Episodic | 30d hot → 180d cold → evict | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access) · (1 + breadth_weight · ln(1 + max(distinct_actors−1, 0)))` |
+| Episodic | 30d hot → 180d cold → evict (or tier-down, opt-in A2) | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access) · (1 + breadth_weight · ln(1 + max(distinct_actors−1, 0)))` |
 | Semantic | Indefinite | None - only supersedeable via M7 LLM rewrite |
 | Procedural | Indefinite | Frequency-decay if not re-observed |
 
@@ -311,6 +312,18 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 `[decay.half_life_days]` (a half-life in days per tier, converted to
 `λ = ln(2)/days`); an unset tier uses the scalar, so the default reproduces
 today's single-λ scores exactly.
+
+**Extractive tier-down (A2, opt-in).** With `[decay] compact_cold_episodic =
+true`, the sweep runs a compaction pass *before* the decay-eviction pass: a cold
+episodic page that is not already compacted is rewritten through the wiki layer
+to keep its L0 `abstract:`, an L1 first-paragraph summary, and an L2 regex-mined
+keep-token set (paths, URLs, code spans, error codes, identifiers), dropping the
+prose — instead of being tombstoned. The rewrite supersedes the prior version,
+so the full body stays reachable (git + supersession chain; `restore-page`
+recovers it). The `V65` `pages.compacted_at` marker makes a compacted page
+terminal for the decay pass (never re-compacted, never re-evicted, never
+re-reported as cold). Zero-LLM, off by default; the R2 recall no-regression
+proof gates any future default-on.
 
 Pinned pages (`pinned: true` in frontmatter) are exempt from all
 decay paths. Pages under `_slots/` are pinned automatically and surfaced
@@ -585,6 +598,11 @@ hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 observation_retention_days = 0     # 0 = never prune raw observations
 observation_prune_batch = 5000     # rows per prune transaction
+compact_cold_episodic = false      # A2 opt-in: tier-down (compact) a cold
+                                   # episodic page instead of evicting it —
+                                   # keep abstract+summary+keep-tokens, drop
+                                   # prose. Reversible (git + supersession),
+                                   # zero-LLM. false = today's evict behaviour.
 
 [decay.half_life_days]             # opt-in per-tier retention curves (all keys
                                    # optional). Half-life in DAYS; converted to

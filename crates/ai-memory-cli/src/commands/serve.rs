@@ -9,7 +9,7 @@ use std::time::Duration;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint, run_sweep_with_options,
+    run_lint, run_sweep_with_compaction,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -1027,6 +1027,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -1263,6 +1264,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -1601,6 +1603,7 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.compact_cold_episodic,
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -1613,6 +1616,7 @@ async fn start_maintenance_scheduler(
                             scopes = outcome.scopes,
                             candidates_evaluated = outcome.candidates_evaluated,
                             evicted = outcome.evicted,
+                            compacted = outcome.compacted,
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
@@ -1867,6 +1871,7 @@ struct ScheduledSweepTickOutcome {
     scopes: usize,
     candidates_evaluated: usize,
     evicted: usize,
+    compacted: usize,
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
@@ -1880,6 +1885,7 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    compact_cold_episodic: bool,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1888,7 +1894,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_options(
+        match run_sweep_with_compaction(
             reader,
             writer,
             Some(wiki),
@@ -1897,6 +1903,7 @@ async fn run_scheduled_sweep_tick(
             decay,
             breadth_weight,
             retention,
+            compact_cold_episodic,
             false,
         )
         .await
@@ -1904,6 +1911,11 @@ async fn run_scheduled_sweep_tick(
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
                 outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
+                outcome.compacted += report
+                    .compacted
+                    .iter()
+                    .filter(|page| page.compacted)
+                    .count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
@@ -3652,6 +3664,7 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            false,
         )
         .await
         .unwrap();

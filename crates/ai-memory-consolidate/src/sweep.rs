@@ -29,14 +29,16 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ai_memory_core::{PageId, ProjectId, Tier, WorkspaceId};
+use ai_memory_core::{ActorContext, PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_store::{
     DecayCandidate, DecayParams, ReaderPool, WriterHandle, retention_score_with_breadth,
 };
-use ai_memory_wiki::Wiki;
+use ai_memory_wiki::{Wiki, WritePageRequest};
 use jiff::Timestamp;
 use serde::Serialize;
 use thiserror::Error;
+
+use crate::compaction::build_compacted_markdown;
 
 /// One evicted page surfaced in the [`SweepReport`].
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +56,30 @@ pub struct EvictedPage {
     /// `true` when the Markdown removal and tombstone write landed. Always
     /// `false` on `dry_run`; failures are retried by the next sweep.
     pub deleted: bool,
+}
+
+/// One cold episodic page tiered DOWN (extractively compacted) instead of
+/// evicted, surfaced in the [`SweepReport`] (A2, docs/design-memory-aging.md).
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactedPage {
+    /// Identifier of the pre-compaction page version selected for tier-down.
+    pub id: PageId,
+    /// Relative wiki path.
+    pub path: String,
+    /// Retention score at the time of the sweep (below the cold threshold).
+    pub retention: f64,
+    /// Days since the page's last update.
+    pub age_days: f64,
+    /// Total access count.
+    pub access_count: u32,
+    /// `true` when the compacting rewrite landed through the wiki layer.
+    /// Always `false` on `dry_run`; a failed rewrite is retried next sweep.
+    pub compacted: bool,
+    /// Identifier of the new compacted latest version, once the rewrite lands.
+    /// The prior full-body version stays reachable via the supersession chain
+    /// and git history, so tier-down is reversible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_id: Option<PageId>,
 }
 
 /// One TTL-expired page surfaced in the [`SweepReport`].
@@ -82,6 +108,11 @@ pub struct SweepReport {
     /// Pages that fell below the cold threshold (evicted through the wiki
     /// layer unless `dry_run`).
     pub evicted: Vec<EvictedPage>,
+    /// Cold episodic pages tiered DOWN (extractively compacted) instead of
+    /// evicted, when `compact_cold_episodic` is enabled (A2). Empty — and the
+    /// sweep behaves exactly as before — while the flag is off, which is the
+    /// default. Reported in both modes so every run is observable.
+    pub compacted: Vec<CompactedPage>,
     /// Pages past their frontmatter `expires_at:` TTL (hard-deleted
     /// through the wiki layer unless `dry_run`).
     pub expired: Vec<ExpiredPage>,
@@ -223,7 +254,10 @@ pub async fn run_sweep_with_breadth(
 /// Run a sweep with the breadth coefficient and the opt-in observation prune.
 ///
 /// The prune is the only pass that can delete raw capture, and it is off unless
-/// `retention.days` is positive.
+/// `retention.days` is positive. Extractive tier-down (A2) is left OFF, so this
+/// behaves exactly as it did before A2 existed — cold episodic pages are
+/// evicted (tombstoned). Callers that want tier-down use
+/// [`run_sweep_with_compaction`].
 ///
 /// # Errors
 /// Returns [`SweepError::InvalidObservationRetention`] for a negative age, in
@@ -240,6 +274,50 @@ pub async fn run_sweep_with_options(
     retention: ObservationRetention,
     dry_run: bool,
 ) -> Result<SweepReport, SweepError> {
+    run_sweep_with_compaction(
+        reader,
+        writer,
+        wiki,
+        workspace_id,
+        project_id,
+        params,
+        breadth_weight,
+        retention,
+        false,
+        dry_run,
+    )
+    .await
+}
+
+/// Run a sweep with the breadth coefficient, the observation prune, and the
+/// opt-in A2 extractive tier-down (`compact_cold_episodic`).
+///
+/// With `compact_cold_episodic = false` (the default everywhere) this is
+/// byte-for-byte the historical sweep: a cold episodic page is evicted
+/// (tombstoned). With it `true`, a cold episodic page that has NOT already been
+/// compacted is tiered DOWN instead — rewritten through the wiki layer to keep
+/// its L0 abstract, an L1 summary and the L2 keep-token set, dropping the prose
+/// — and reported under [`SweepReport::compacted`] rather than `evicted`. The
+/// original full body stays reachable via supersession + git (reversible,
+/// invariant #16). An already-compacted cold page (its V65 marker set) is
+/// terminal for the decay pass: it is neither re-compacted nor evicted, so the
+/// durable residue survives.
+///
+/// # Errors
+/// Same as [`run_sweep_with_options`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sweep_with_compaction(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: Option<&Wiki>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+    compact_cold_episodic: bool,
+    dry_run: bool,
+) -> Result<SweepReport, SweepError> {
     if !breadth_weight.is_finite() || breadth_weight < 0.0 {
         return Err(SweepError::InvalidBreadthWeight);
     }
@@ -252,6 +330,7 @@ pub async fn run_sweep_with_options(
     let now_us = Timestamp::now().as_microsecond();
 
     let mut evicted = Vec::new();
+    let mut compacted: Vec<CompactedPage> = Vec::new();
     let mut expired: Vec<ExpiredPage> = Vec::new();
 
     for c in &candidates {
@@ -284,14 +363,34 @@ pub async fn run_sweep_with_options(
             breadth_weight,
         );
         if score < params.cold_threshold {
-            evicted.push(EvictedPage {
-                id: c.id,
-                path: c.path.as_str().to_string(),
-                retention: score,
-                age_days,
-                access_count: c.access_count,
-                deleted: false,
-            });
+            if compact_cold_episodic {
+                // A2 tier-down replaces eviction for cold episodic pages. An
+                // already-compacted page (its V65 marker set) is terminal — the
+                // durable residue is what we chose to keep, so re-evicting it
+                // would destroy exactly what tier-down preserved, and
+                // re-compacting it is a no-op loop. Skip it entirely.
+                if c.compacted_at_us.is_some() {
+                    continue;
+                }
+                compacted.push(CompactedPage {
+                    id: c.id,
+                    path: c.path.as_str().to_string(),
+                    retention: score,
+                    age_days,
+                    access_count: c.access_count,
+                    compacted: false,
+                    new_id: None,
+                });
+            } else {
+                evicted.push(EvictedPage {
+                    id: c.id,
+                    path: c.path.as_str().to_string(),
+                    retention: score,
+                    age_days,
+                    access_count: c.access_count,
+                    deleted: false,
+                });
+            }
         }
     }
 
@@ -339,6 +438,74 @@ pub async fn run_sweep_with_options(
                 }
             }
         }
+        // A2 compaction runs BEFORE the decay-eviction pass. When
+        // `compact_cold_episodic` is on, `evicted` is empty and this pass owns
+        // the cold episodic pages; when it is off, `compacted` is empty and this
+        // pass is a no-op, so the historical eviction path below is unchanged.
+        //
+        // One batched wiki write for the whole cold set (invariant #2): the
+        // rewrite supersedes each page's prior version, keeping the full body
+        // reachable (invariant #16) through git + the supersession chain.
+        if !compacted.is_empty() {
+            match wiki {
+                Some(wiki) => {
+                    let mut requests: Vec<WritePageRequest> = Vec::new();
+                    let mut request_index: Vec<usize> = Vec::new();
+                    for (i, page) in compacted.iter().enumerate() {
+                        let path = match PagePath::new(page.path.clone()) {
+                            Ok(path) => path,
+                            Err(_) => continue,
+                        };
+                        let markdown = match wiki.read_page(workspace_id, project_id, &path) {
+                            Ok(md) => md,
+                            Err(error) => {
+                                tracing::warn!(
+                                    path = %page.path,
+                                    %error,
+                                    "forget sweep: could not read page for compaction; retrying next sweep"
+                                );
+                                continue;
+                            }
+                        };
+                        let (frontmatter, body) =
+                            build_compacted_markdown(&markdown.frontmatter, &markdown.body);
+                        requests.push(WritePageRequest {
+                            workspace_id,
+                            project_id,
+                            path,
+                            frontmatter,
+                            body,
+                            tier: Tier::Episodic,
+                            pinned: false,
+                            title: None,
+                            admission_ctx: None,
+                            author_id: None,
+                            actor: ActorContext::anonymous(),
+                            evidence: Vec::new(),
+                        });
+                        request_index.push(i);
+                    }
+                    if !requests.is_empty() {
+                        match wiki.apply_batch(requests).await {
+                            Ok(new_ids) => {
+                                for (slot, new_id) in request_index.into_iter().zip(new_ids) {
+                                    compacted[slot].compacted = true;
+                                    compacted[slot].new_id = Some(new_id);
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "forget sweep: compaction batch failed; retrying on next sweep"
+                            ),
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!("forget sweep: wiki unavailable; refusing store-only compaction")
+                }
+            }
+        }
+
         for page in &mut evicted {
             let path = match ai_memory_core::PagePath::new(page.path.clone()) {
                 Ok(path) => path,
@@ -430,6 +597,7 @@ pub async fn run_sweep_with_options(
         dry_run,
         candidates_evaluated: candidates.len(),
         evicted,
+        compacted,
         expired,
         hard_deleted,
         observations_prunable,
@@ -503,6 +671,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         assert!(!is_decayable(&c));
     }
@@ -520,6 +689,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         assert!(!is_decayable(&c));
     }
@@ -537,6 +707,7 @@ mod tests {
             frontmatter_json: r#"{"pinned": true}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         assert!(!is_decayable(&c));
     }
@@ -554,6 +725,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         assert!(is_decayable(&c));
     }

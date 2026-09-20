@@ -94,6 +94,13 @@ pub struct DecaySettings {
     pub observation_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
+    /// A2 extractive tier-down (`[decay] compact_cold_episodic`). When `true`,
+    /// the forget sweep COMPACTS a cold episodic page — keeping its L0 abstract,
+    /// an L1 summary and the L2 keep-token set, dropping the prose — instead of
+    /// evicting it. Reversible (the full body stays in git + the supersession
+    /// chain) and non-destructive. Defaults to `false`, so an upgrade changes
+    /// nothing until an operator opts in.
+    pub compact_cold_episodic: bool,
     /// Optional per-tier half-life overrides (`[decay.half_life_days]`). All
     /// keys default to unset ⇒ the scalar `lambda` applies to every tier, which
     /// is byte-identical to the historical single-λ behaviour.
@@ -113,6 +120,7 @@ impl Default for DecaySettings {
             breadth_weight: 0.0,
             observation_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
+            compact_cold_episodic: false,
             half_life_days: DecayHalfLifeDays::default(),
         }
     }
