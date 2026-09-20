@@ -135,6 +135,7 @@ pub async fn run_curator_report_with_breadth(
         let days_since_access = c.last_accessed_at_us.map(|us| age_days(now_us, us));
         let score = retention_score_with_breadth(
             &params.decay_params,
+            c.tier,
             page_age_days,
             c.access_count,
             days_since_access,

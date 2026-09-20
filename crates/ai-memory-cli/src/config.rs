@@ -46,6 +46,27 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
 
+/// Optional per-tier retention half-lives, expressed in **days**.
+///
+/// This is the operator-facing `[decay.half_life_days]` sub-table. Half-life in
+/// days is the intuitive knob ("episodic pages: a 180-day half-life"); it is
+/// converted to the internal per-day decay rate λ (`λ = ln(2) / days`) in
+/// [`DecaySettings::decay_params`]. Every key is optional: an omitted key falls
+/// back to the scalar `lambda`, so the default (all keys unset) reproduces
+/// today's single-λ behaviour byte-for-byte and no upgrade changes a score.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecayHalfLifeDays {
+    /// Half-life in days for `working`-tier pages; unset uses the scalar λ.
+    pub working: Option<f64>,
+    /// Half-life in days for `episodic`-tier pages; unset uses the scalar λ.
+    pub episodic: Option<f64>,
+    /// Half-life in days for `semantic`-tier pages; unset uses the scalar λ.
+    pub semantic: Option<f64>,
+    /// Half-life in days for `procedural`-tier pages; unset uses the scalar λ.
+    pub procedural: Option<f64>,
+}
+
 /// Config-file representation of retention settings.
 ///
 /// The breadth coefficient lives here rather than expanding the public
@@ -73,6 +94,10 @@ pub struct DecaySettings {
     pub observation_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
+    /// Optional per-tier half-life overrides (`[decay.half_life_days]`). All
+    /// keys default to unset ⇒ the scalar `lambda` applies to every tier, which
+    /// is byte-identical to the historical single-λ behaviour.
+    pub half_life_days: DecayHalfLifeDays,
 }
 
 impl Default for DecaySettings {
@@ -88,6 +113,7 @@ impl Default for DecaySettings {
             breadth_weight: 0.0,
             observation_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
+            half_life_days: DecayHalfLifeDays::default(),
         }
     }
 }
@@ -103,6 +129,28 @@ impl DecaySettings {
             salience_default: self.salience_default,
             cold_threshold: self.cold_threshold,
             hard_delete_after_days: self.hard_delete_after_days,
+            // Half-life-in-days is the user surface; λ is the math. Convert here
+            // once. An unset key stays `None`, so `lambda_for` falls back to the
+            // scalar `lambda` unchanged — the identity default, no days↔λ
+            // round-trip that could perturb an unconfigured store's scores.
+            tier_lambda: ai_memory_store::TierLambdas {
+                working: self
+                    .half_life_days
+                    .working
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                episodic: self
+                    .half_life_days
+                    .episodic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                semantic: self
+                    .half_life_days
+                    .semantic
+                    .map(ai_memory_store::lambda_from_half_life_days),
+                procedural: self
+                    .half_life_days
+                    .procedural
+                    .map(ai_memory_store::lambda_from_half_life_days),
+            },
         }
     }
 
@@ -1149,6 +1197,27 @@ impl Config {
             anyhow::bail!(
                 "decay.breadth_weight must be a finite number greater than or equal to zero"
             );
+        }
+
+        // A per-tier half-life must be a real, positive number of days: `0` (or
+        // negative/NaN) would convert to a nonsensical λ (+inf / negative /
+        // NaN) and silently mass-evict or never decay that tier. Reject it at
+        // load rather than at 3am inside the sweep. An unset key is fine — it
+        // falls back to the scalar `lambda`.
+        for (tier, value) in [
+            ("working", config.decay.half_life_days.working),
+            ("episodic", config.decay.half_life_days.episodic),
+            ("semantic", config.decay.half_life_days.semantic),
+            ("procedural", config.decay.half_life_days.procedural),
+        ] {
+            if let Some(days) = value
+                && (!days.is_finite() || days <= 0.0)
+            {
+                anyhow::bail!(
+                    "decay.half_life_days.{tier} must be a finite number greater than zero \
+                     (got {days}); omit the key to use the default decay rate"
+                );
+            }
         }
 
         // Fail closed at load rather than at 3am inside a destructive pass: a
@@ -2242,6 +2311,97 @@ mod tests {
             assert!(
                 error.to_string().contains("breadth_weight"),
                 "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    /// `[decay.half_life_days]` parses per-tier half-lives (in days) and
+    /// converts each to the internal λ; an omitted key falls back to the scalar
+    /// `lambda`, so the resulting `DecayParams` is a pure identity for every
+    /// unset tier.
+    #[test]
+    fn load_parses_per_tier_half_lives_and_falls_back_for_omitted_keys() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[decay.half_life_days]\nepisodic = 365.0\nworking = 7.0\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+
+        // Configured tiers convert days -> λ = ln(2) / days.
+        let expect = |days: f64| std::f64::consts::LN_2 / days;
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Episodic).to_bits(),
+            expect(365.0).to_bits(),
+        );
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Working).to_bits(),
+            expect(7.0).to_bits(),
+        );
+        // Omitted tiers fall back to the scalar λ, byte-for-byte.
+        assert_eq!(
+            params.lambda_for(ai_memory_core::Tier::Semantic).to_bits(),
+            params.lambda.to_bits(),
+        );
+        assert_eq!(
+            params
+                .lambda_for(ai_memory_core::Tier::Procedural)
+                .to_bits(),
+            params.lambda.to_bits(),
+        );
+    }
+
+    /// With no `[decay.half_life_days]` table the resolved `DecayParams` is the
+    /// store default: every tier's λ is the scalar `lambda` (the identity
+    /// upgrade guarantee at the config layer).
+    #[test]
+    fn load_without_half_lives_is_identity_to_the_default_params() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        let params = cfg.decay.decay_params();
+        let default = ai_memory_store::DecayParams::default();
+        for tier in [
+            ai_memory_core::Tier::Working,
+            ai_memory_core::Tier::Episodic,
+            ai_memory_core::Tier::Semantic,
+            ai_memory_core::Tier::Procedural,
+        ] {
+            assert_eq!(
+                params.lambda_for(tier).to_bits(),
+                default.lambda_for(tier).to_bits(),
+                "tier {tier:?} must decay at the default scalar λ",
+            );
+        }
+    }
+
+    /// A zero, negative, or non-finite half-life converts to a nonsensical λ,
+    /// so it is rejected at load rather than silently mass-evicting (or never
+    /// decaying) that tier.
+    #[test]
+    fn load_rejects_invalid_per_tier_half_lives() {
+        for (tier, value) in [
+            ("episodic", "0.0"),
+            ("working", "-5.0"),
+            ("semantic", "nan"),
+            ("procedural", "inf"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[decay.half_life_days]\n{tier} = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("an invalid per-tier half-life must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("decay.half_life_days.{tier}")),
+                "unexpected error for {tier} = {value}: {error:#}"
             );
         }
     }

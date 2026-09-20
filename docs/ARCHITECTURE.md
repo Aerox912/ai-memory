@@ -307,6 +307,11 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | Semantic | Indefinite | None - only supersedeable via M7 LLM rewrite |
 | Procedural | Indefinite | Frequency-decay if not re-observed |
 
+`λ` is the scalar `[decay] lambda` by default, but can be set per tier via
+`[decay.half_life_days]` (a half-life in days per tier, converted to
+`λ = ln(2)/days`); an unset tier uses the scalar, so the default reproduces
+today's single-λ scores exactly.
+
 Pinned pages (`pinned: true` in frontmatter) are exempt from all
 decay paths. Pages under `_slots/` are pinned automatically and surfaced
 in briefing/explore snapshots as tiny editable memory slots. Slot pages
@@ -572,7 +577,7 @@ run_autowire = true                # `ai-memory run <harness>` auto-installs tha
                                    # one-time per harness+version). Also `--no-autowire`.
 
 [decay]                            # M8 retention params
-lambda = 0.02                      # ↓ to forget less aggressively
+lambda = 0.02                      # ↓ to forget less aggressively (fallback λ)
 sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → remove file + retain tombstone
@@ -580,6 +585,17 @@ hard_delete_after_days = 180
 breadth_weight = 0.0               # opt-in reward for distinct operators
 observation_retention_days = 0     # 0 = never prune raw observations
 observation_prune_batch = 5000     # rows per prune transaction
+
+[decay.half_life_days]             # opt-in per-tier retention curves (all keys
+                                   # optional). Half-life in DAYS; converted to
+                                   # λ = ln(2)/days. An omitted key falls back to
+                                   # the scalar `lambda` above, so the default
+                                   # (no keys) is byte-identical to today — no
+                                   # score change or mass-eviction on upgrade.
+# working = 7                      # e.g. keep scratch short…
+# episodic = 365                   # …and session history long
+# semantic = 180
+# procedural = 90
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context

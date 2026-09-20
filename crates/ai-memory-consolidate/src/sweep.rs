@@ -275,6 +275,7 @@ pub async fn run_sweep_with_options(
         let days_since_access = c.last_accessed_at_us.map(|us| elapsed_days(now_us, us));
         let score = retention_score_with_breadth(
             params,
+            c.tier,
             age_days,
             c.access_count,
             days_since_access,
