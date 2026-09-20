@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved by the startup seed or by the default after a session mismatch,
   rather than by the caller's own hook session (#757, #774).
 
+## [2.3.2] - 2026-09-20
+
 ### Changed
 - `memory_consolidate` accepts an omitted `session_id`. Omitting the field (or
   sending `null`) no longer fails deserialization with `missing field
@@ -97,6 +99,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the first attempt, since retrying them only burns another call.
 
 ### Fixed
+- CLI commands no longer fail at startup when an `[[llm_fallbacks]]` profile's
+  `api_key_env` variable is absent from the invoking shell. `Config::load`
+  validated every fallback credential eagerly, so read-only commands such as
+  `ai-memory status` exited with `llm_fallbacks[0].api_key_env=... is set but
+  the environment variable is missing or empty` even when the running server
+  had the key injected by its service wrapper, which pushed operators to export
+  provider keys in every shell. The missing credential is now enforced where it
+  is needed: `ai-memory serve` still refuses to start without it, and building
+  the LLM chain still fails rather than silently dropping the fallback. Every
+  other profile check (provider, model, base URL) still runs at load for every
+  command (#762).
+- `backfill --dry-run` recorded a completed attempt and suppressed the next
+  automatic import. Planning now leaves the backfill sentinel untouched, even
+  for populated projects or an opted-out automatic invocation (#785).
 - `ai-memory serve` no longer hard-fails to take its single-instance lock on a
   transient error under load. Acquiring the serve lock now retries `open` and
   `try_lock_exclusive` a few times with a short (~25ms) backoff when they hit a
@@ -150,6 +166,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like an omitted one — the resolved project's latest completed session — and a
   malformed id now fails as `invalid params`, the code `memory_auto_improve`
   already uses for the same argument.
+
+- `backfill` returned success even when imports failed, and `--quiet` hid
+  their diagnostics. It now reports errors on stderr, includes failure counts
+  in the human summary, and exits nonzero after emitting its report (#786).
 
 ## [2.3.1] - 2026-09-17
 
@@ -5964,7 +5984,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.3.2...HEAD
+[2.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.2
 [2.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.1
 [2.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.3.0
 [2.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v2.2.2
