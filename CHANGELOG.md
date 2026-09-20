@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `page_evidence`. Every run reports its collapses in the `SweepReport`. Reuses
   existing tables: **no new migration**, and no new MCP tool (still 23). Ships
   opt-in/off; the R2 recall no-regression proof is the gate before any future
-  default-on (#809).
+  default-on (#812).
 - Entropy / boilerplate pre-filter before consolidation (design-memory-aging.md
   bucket A4): a pure, zero-LLM Shannon-entropy + boilerplate gate that skips
   low-information session pages (near-empty, whitespace, single-character, or
@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a file path and an error code is KEPT), so an upgrade changes no consolidation
   output until an operator opts in. Every run surfaces the skip count in the
   experience report warnings. No schema change and no new MCP tool (still 23)
-  (#809).
+  (#812).
 - Extractive tier-down of cold episodic pages (design-memory-aging.md bucket
   A2): instead of evicting a cold episodic page, the forget-sweep can now
   *compact* it — keeping the L0 frontmatter `abstract:`, an L1 first-paragraph
