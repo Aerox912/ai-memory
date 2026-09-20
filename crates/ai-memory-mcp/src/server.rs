@@ -466,6 +466,11 @@ pub struct AiMemoryServer {
     /// burst costs the writer one tiny upsert batch, not one write per
     /// call (same reasoning as the M8 access-bump throttle).
     client_activity: Arc<std::sync::Mutex<ClientActivityBuffer>>,
+    /// Shared "last client activity" clock (microseconds), bumped on every tool
+    /// call. The B3 dream scheduler reads it to detect idle and to cancel a
+    /// running pass the moment the operator returns — consolidation must never
+    /// contend with live work.
+    activity_clock: ai_memory_consolidate::ActivityClock,
     /// Shared across cloned request handlers so concurrent searches cannot
     /// create an unbounded number of billable provider calls.
     rerank_gate: Arc<tokio::sync::Semaphore>,
@@ -1633,6 +1638,9 @@ impl AiMemoryServer {
             embedder: None,
             reranker: None,
             client_activity: Arc::new(std::sync::Mutex::new(ClientActivityBuffer::new())),
+            activity_clock: ai_memory_consolidate::ActivityClock::new(
+                jiff::Timestamp::now().as_microsecond(),
+            ),
             rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
@@ -1643,6 +1651,13 @@ impl AiMemoryServer {
             per_user_slots: false,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The shared last-client-activity clock, so the B3 dream scheduler reads the
+    /// same signal the tool router bumps on every call.
+    #[must_use]
+    pub fn activity_clock(&self) -> ai_memory_consolidate::ActivityClock {
+        self.activity_clock.clone()
     }
 
     /// Declare that a trusted proxy may assert end-user identities — mirror of
@@ -5279,9 +5294,11 @@ impl AiMemoryServer {
                     .and_then(sanitize_client_name)
             })
             .unwrap_or_else(|| "unknown".to_string());
-        let day = jiff::Timestamp::now()
-            .as_microsecond()
-            .div_euclid(US_PER_DAY);
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        // B3: record that a client is active NOW so the dream scheduler can tell
+        // idle from busy and cancel a running pass the moment work resumes.
+        self.activity_clock.mark(now_us);
+        let day = now_us.div_euclid(US_PER_DAY);
         let is_write = tool_call_is_write(tool);
         let schedule_flush = {
             let mut buffer = self

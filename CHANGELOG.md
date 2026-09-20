@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- LLM "dream" pass — cross-session rewrite/merge of cold clusters, scheduled on
+  idle (design-memory-aging.md buckets B2/B3/B4). Where A3 collapses
+  near-duplicate cold clusters *extractively* (zero-LLM, keep-token union), the
+  dream pass hands each cold cluster to the configured provider to be rewritten
+  into ONE coherent page. It is **opt-in LLM, OFF by default, and gated on an R2
+  number before it may default on**: it runs only when the new `[dream] enabled`
+  flag is set AND a provider AND an embedder are configured — a provider-less
+  store keeps the zero-LLM A3 path untouched (invariant #13). **It never deletes
+  a source** (invariant #16): the highest-retention member is rewritten and every
+  merged-away member is *superseded* with a merge-note stub pointing at it, so the
+  full pre-merge body stays reachable via the supersession chain + git and
+  `restore-page` recovers it; `page_evidence` (`reconsolidation` +
+  `b2_dream:<id>`) records which members fed each merge (the hallucinated-merge
+  guard). The rewrite routes through the existing gated apply path
+  (`preflight_admission(Consolidate)` → `Wiki::apply_batch`, single-writer actor,
+  invariant #2) with **`dry_run` first** (a dry run returns the plan and calls
+  neither the LLM nor the writer), and uses **JSON-schema structured output only**
+  (invariant #7). Scheduling (B3) runs the pass only after a configurable idle
+  window with no client activity and **cancels it the moment the operator
+  returns** (a cheap cancellation flag polled between clusters), bounded to a
+  capped number of clusters per run (invariant #5). Work is ordered
+  **surprisal-first** (B4): most-novel clusters — those farthest from the nearest
+  existing page — first. Every run returns an observable `DreamReport` (clusters
+  considered, merged, pages rewritten/superseded, skipped, cancelled) so a bad
+  run is never silent. New `[dream]` config section; no new migration (reuses
+  `page_evidence` + supersession); no new MCP tool (still 23) (#816).
 - Belief-strength confidence over the `page_evidence` substrate
   (design-memory-aging.md bucket B1 / design-hindsight-borrowings.md §3): a
   read-time, **zero-LLM** `confidence` derived per page version from its

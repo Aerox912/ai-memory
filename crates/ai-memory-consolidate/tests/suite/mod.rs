@@ -7,6 +7,7 @@ mod access_breadth_sweep;
 mod cold_cluster_sweep;
 mod compaction_sweep;
 mod contradiction_lint;
+mod dream_pass;
 mod embed_backfill;
 mod embeddings;
 mod entropy_experience;

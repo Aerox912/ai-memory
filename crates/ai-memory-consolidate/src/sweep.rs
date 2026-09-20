@@ -495,30 +495,8 @@ pub async fn run_sweep_with_hygiene(
             });
             continue;
         }
-        if !is_decayable(c) {
-            continue;
-        }
-        let age_days = elapsed_days(now_us, c.updated_at_us);
-        let days_since_access = c.last_accessed_at_us.map(|us| elapsed_days(now_us, us));
-        let score = retention_score_with_breadth(
-            params,
-            c.tier,
-            age_days,
-            c.access_count,
-            days_since_access,
-            c.salience,
-            breadth.get(&c.id).copied().unwrap_or(0),
-            breadth_weight,
-        );
-        if score < params.cold_threshold {
-            cold.push(ColdEntry {
-                id: c.id,
-                path: c.path.clone(),
-                retention: score,
-                age_days,
-                access_count: c.access_count,
-                compacted_at_us: c.compacted_at_us,
-            });
+        if let Some(entry) = cold_entry_for(c, &breadth, breadth_weight, params, now_us) {
+            cold.push(entry);
         }
     }
 
@@ -813,13 +791,95 @@ pub async fn run_sweep_with_hygiene(
 
 /// A cold page (scored below `cold_threshold`) captured once so the A3 dedup
 /// pass and the evict/compact remainder read the same materialised set.
-struct ColdEntry {
-    id: PageId,
-    path: PagePath,
-    retention: f64,
-    age_days: f64,
-    access_count: u32,
-    compacted_at_us: Option<i64>,
+///
+/// `pub(crate)` so the B2 dream pass ([`crate::dream`]) clusters the *same*
+/// bounded cold set the forget sweep does — invariant #2: one materialisation of
+/// the retention scoring, not two chances to drift.
+pub(crate) struct ColdEntry {
+    pub(crate) id: PageId,
+    pub(crate) path: PagePath,
+    pub(crate) retention: f64,
+    pub(crate) age_days: f64,
+    pub(crate) access_count: u32,
+    pub(crate) compacted_at_us: Option<i64>,
+}
+
+/// Score one decay candidate and return a [`ColdEntry`] when it is a decayable
+/// episodic page below `cold_threshold`. `None` for a non-decayable tier, a
+/// pinned page, or a page still above the threshold. TTL expiry is the caller's
+/// concern (the sweep hard-deletes those; the dream pass skips them).
+///
+/// The single scoring path shared by the forget sweep's inline loop and
+/// [`materialize_cold_set`], so the cold set is defined once (invariant #2).
+pub(crate) fn cold_entry_for(
+    c: &DecayCandidate,
+    breadth: &HashMap<PageId, u32>,
+    breadth_weight: f64,
+    params: &DecayParams,
+    now_us: i64,
+) -> Option<ColdEntry> {
+    if !is_decayable(c) {
+        return None;
+    }
+    let age_days = elapsed_days(now_us, c.updated_at_us);
+    let days_since_access = c.last_accessed_at_us.map(|us| elapsed_days(now_us, us));
+    let score = retention_score_with_breadth(
+        params,
+        c.tier,
+        age_days,
+        c.access_count,
+        days_since_access,
+        c.salience,
+        breadth.get(&c.id).copied().unwrap_or(0),
+        breadth_weight,
+    );
+    if score < params.cold_threshold {
+        Some(ColdEntry {
+            id: c.id,
+            path: c.path.clone(),
+            retention: score,
+            age_days,
+            access_count: c.access_count,
+            compacted_at_us: c.compacted_at_us,
+        })
+    } else {
+        None
+    }
+}
+
+/// Materialise the bounded cold set for a scope, reusing the sweep's exact
+/// retention scoring (invariant #2). TTL-expired pages are excluded — an expired
+/// page is the sweep's to hard-delete, never the dream pass's to rewrite.
+///
+/// # Errors
+/// Returns [`SweepError::InvalidBreadthWeight`] for a negative or non-finite
+/// coefficient, or a store error while reading candidates.
+pub(crate) async fn materialize_cold_set(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+    breadth_weight: f64,
+) -> Result<Vec<ColdEntry>, SweepError> {
+    if !breadth_weight.is_finite() || breadth_weight < 0.0 {
+        return Err(SweepError::InvalidBreadthWeight);
+    }
+    let candidates = reader.decay_candidates(workspace_id, project_id).await?;
+    let breadth =
+        access_breadth_for_scoring(reader, workspace_id, project_id, breadth_weight).await?;
+    let now_us = Timestamp::now().as_microsecond();
+    let mut cold = Vec::new();
+    for c in &candidates {
+        if let Some(expires_us) = c.expires_at_us
+            && expires_us <= now_us
+        {
+            continue;
+        }
+        if let Some(entry) = cold_entry_for(c, &breadth, breadth_weight, params, now_us) {
+            cold.push(entry);
+        }
+    }
+    Ok(cold)
 }
 
 /// The read-only output of the A3 dedup planner: what to report, which page ids
@@ -1078,7 +1138,9 @@ async fn plan_cold_cluster_dedup(
 }
 
 /// Coerce a frontmatter value into an object map, discarding a non-object shape.
-fn frontmatter_object(fm: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+pub(crate) fn frontmatter_object(
+    fm: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
     match fm {
         serde_json::Value::Object(m) => m.clone(),
         _ => serde_json::Map::new(),

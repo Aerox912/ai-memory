@@ -16,6 +16,7 @@ pub mod cold_cluster;
 pub mod compaction;
 pub mod consolidator;
 pub mod curator;
+pub mod dream;
 pub mod embed;
 pub mod entropy_filter;
 pub mod experience;
@@ -66,6 +67,11 @@ pub use consolidator::{
 pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
     run_curator_report, run_curator_report_with_breadth,
+};
+pub use dream::{
+    ActivityClock, DEFAULT_DREAM_IDLE_WINDOW_SECS, DEFAULT_DREAM_MAX_CLUSTERS_PER_RUN,
+    DEFAULT_DREAM_MIN_COLD_PAGES, DreamCancel, DreamConfig, DreamError, DreamMerge,
+    DreamMergedPage, DreamReport, dream_idle_ready, run_dream_pass,
 };
 pub use embed::{
     EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,

@@ -1046,6 +1046,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
+    // Share the tool router's last-activity clock with the B3 dream scheduler so
+    // it can tell an idle box from a busy one and cancel a run on the operator's
+    // return.
+    let activity_clock = server.activity_clock();
     let _maintenance_tasks = start_maintenance_scheduler(
         config.maintenance.clone(),
         config.auto_improve.clone(),
@@ -1055,6 +1059,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         embedder.clone(),
         admin_llm.clone(),
         config.decay,
+        config.dream,
+        activity_clock,
     )
     .await;
 
@@ -1554,6 +1560,8 @@ async fn start_maintenance_scheduler(
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
     decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    activity_clock: ai_memory_consolidate::ActivityClock,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -1873,12 +1881,149 @@ async fn start_maintenance_scheduler(
         info!("auto-improve scheduler enabled but no LLM provider is configured; job not started");
     }
 
+    // B2/B3/B4 — the opt-in LLM dream pass. OFF by default; it starts only when
+    // `[dream] enabled` is set AND a provider AND an embedder are configured (a
+    // provider-less store keeps the zero-LLM A3 path, invariant #13). It never
+    // contends with live work: it runs only after `idle_window_secs` of quiet and
+    // cancels the moment activity resumes (invariant #5, cancellable + bounded).
+    if dream.enabled {
+        match (llm.clone(), dedup_embedding.clone()) {
+            (Some(llm), Some(embedding)) => {
+                let reader = reader.clone();
+                let wiki = wiki.clone();
+                let activity_clock = activity_clock.clone();
+                let interval = std::time::Duration::from_secs(dream.effective_interval_secs());
+                tasks.push(tokio::spawn(async move {
+                    run_dream_scheduler_loop(
+                        reader,
+                        wiki,
+                        llm,
+                        decay,
+                        dream,
+                        embedding,
+                        activity_clock,
+                        interval,
+                    )
+                    .await;
+                }));
+            }
+            (None, _) => info!(
+                "dream pass enabled but no LLM provider is configured; job not started (the zero-LLM A3 path is unaffected)"
+            ),
+            (_, None) => info!(
+                "dream pass enabled but no embedder is configured; job not started (nothing to cluster)"
+            ),
+        }
+    }
+
     if tasks.is_empty() {
         info!("scheduled maintenance enabled but all intervals are disabled");
     } else {
         info!(jobs = tasks.len(), "scheduled maintenance started");
     }
     tasks
+}
+
+/// The B3 dream scheduler loop: on its interval, run the dream pass across every
+/// scope ONLY when the operator has been idle for the configured window, and
+/// cancel the in-flight run the moment activity resumes. A cheap watcher task
+/// flips the shared [`ai_memory_consolidate::DreamCancel`] when the activity
+/// clock advances past the run's start; `run_dream_pass` polls it between
+/// clusters.
+#[allow(clippy::too_many_arguments)]
+async fn run_dream_scheduler_loop(
+    reader: ReaderPool,
+    wiki: Wiki,
+    llm: Arc<dyn LlmProvider>,
+    decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    embedding: ai_memory_consolidate::EmbeddingCoord,
+    activity_clock: ai_memory_consolidate::ActivityClock,
+    interval: std::time::Duration,
+) {
+    /// How often the cancel watcher samples the activity clock during a run.
+    const DREAM_ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    let cfg = dream.dream_config(Some(embedding));
+    let decay_params = decay.decay_params();
+    loop {
+        tokio::time::sleep(interval).await;
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        if !ai_memory_consolidate::dream_idle_ready(&cfg, activity_clock.last_activity_us(), now_us)
+        {
+            continue;
+        }
+
+        // Cancel-on-activity: snapshot the last activity, then spawn a watcher
+        // that flips the cancel as soon as the clock moves past that snapshot.
+        let cancel = ai_memory_consolidate::DreamCancel::new();
+        let run_start_activity = activity_clock.last_activity_us();
+        let watcher = {
+            let cancel = cancel.clone();
+            let activity_clock = activity_clock.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(DREAM_ACTIVITY_POLL).await;
+                    if activity_clock.last_activity_us() > run_start_activity {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let scopes = match reader.list_all_scopes().await {
+            Ok(scopes) => scopes,
+            Err(error) => {
+                tracing::warn!(%error, "dream scheduler: could not list scopes; skipping tick");
+                watcher.abort();
+                continue;
+            }
+        };
+        let mut merged = 0usize;
+        let mut superseded = 0usize;
+        let mut cancelled = false;
+        for scope in scopes {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            match ai_memory_consolidate::run_dream_pass(
+                &reader,
+                &wiki,
+                Some(llm.as_ref()),
+                scope.workspace_id,
+                scope.project_id,
+                &decay_params,
+                decay.breadth_weight,
+                &cfg,
+                &cancel,
+                false,
+            )
+            .await
+            {
+                Ok(report) => {
+                    merged += report.clusters_merged;
+                    superseded += report.pages_superseded;
+                    cancelled |= report.cancelled;
+                }
+                Err(error) => tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    %error,
+                    "dream pass failed for scope"
+                ),
+            }
+        }
+        watcher.abort();
+        info!(
+            merged,
+            superseded,
+            cancelled,
+            elapsed_ms = started.elapsed().as_millis(),
+            "dream pass tick completed"
+        );
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3198,6 +3343,8 @@ mod tests {
             None,
             None,
             crate::config::DecaySettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
         )
         .await;
         assert!(tasks.is_empty());
@@ -3242,6 +3389,8 @@ mod tests {
                 None,
                 None,
                 crate::config::DecaySettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
