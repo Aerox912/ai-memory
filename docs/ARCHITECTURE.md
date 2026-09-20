@@ -325,6 +325,34 @@ terminal for the decay pass (never re-compacted, never re-evicted, never
 re-reported as cold). Zero-LLM, off by default; the R2 recall no-regression
 proof gates any future default-on.
 
+**LLM "dream" pass (B2/B3/B4, opt-in LLM, OFF by default, R2-gated before
+default-on).** Where A3 collapses near-duplicate cold clusters *extractively*
+(zero-LLM, keep-token union), the dream pass
+(`ai-memory-consolidate::dream::run_dream_pass`) hands each cold cluster to the
+configured provider to be rewritten into ONE coherent page — the prose-coherent
+merge extraction cannot do. It reuses A3's clustering math (`adaptive_eps` /
+`dbscan`) over the *same* bounded cold set the forget sweep materialises
+(`sweep::materialize_cold_set`, invariant #2). It runs only when `[dream]
+enabled` is set AND a provider AND an embedder are configured; a provider-less
+store keeps the zero-LLM A3 path (invariant #13). It **never deletes a source**
+(invariant #16): the highest-retention member is rewritten and every merged-away
+member is *superseded* with a merge-note stub, so the full pre-merge body stays
+reachable (git + supersession chain; `restore-page` recovers it), and
+`page_evidence` (`reconsolidation` + `b2_dream:<id>`) records which members fed
+each merge (the hallucinated-merge guard). The rewrite routes through the gated
+apply path — `preflight_admission(Consolidate)` before the LLM, then
+`Wiki::apply_batch` (single-writer actor, invariant #2) — with **`dry_run`
+first** (returns the plan, calls neither the LLM nor the writer) and
+**JSON-schema structured output only** (invariant #7). Scheduling (B3, in
+`serve.rs`) starts a run only after `[dream] idle_window_secs` of no client
+activity (read from the tool router's shared `ActivityClock`) and **cancels it
+the moment activity resumes** — a cheap `DreamCancel` flag polled between
+clusters — bounded to `max_clusters_per_run` clusters per run (invariant #5).
+Work is ordered **surprisal-first** (B4): the most-novel clusters, farthest in
+embedding space from the nearest existing (non-cold) page, first. Every run
+returns an observable `DreamReport` so a bad run is never silent. No new
+migration (reuses `page_evidence` + supersession); no new MCP tool.
+
 Pinned pages (`pinned: true` in frontmatter) are exempt from all
 decay paths. Pages under `_slots/` are pinned automatically and surfaced
 in briefing/explore snapshots as tiny editable memory slots. Slot pages
@@ -691,6 +719,20 @@ belief_authority_weight = 0.0     # fold read-time belief-strength confidence (P
                                   # no belief query runs. confidence/evidence_count are still
                                   # exposed in explain regardless (inert). DEFAULT OFF,
                                   # R2-gated: do not default on without a positive R2 delta.
+
+[dream]                           # B2/B3/B4 opt-in LLM "dream" pass. OFF by default,
+                                  # R2-gated before it may default on. Never deletes a source.
+enabled = false                   # true starts the scheduled pass — but ONLY if a provider AND
+                                  # an embedder are also configured. A provider-less store keeps
+                                  # the zero-LLM A3 path untouched (invariant #13).
+interval_secs = 3600              # how often the scheduler CONSIDERS a run (0 ⇒ 3600)
+idle_window_secs = 300            # operator must be quiet this long before a run starts; returning
+                                  # activity CANCELS an in-flight run at the next cluster boundary
+                                  # (B3). 0 ⇒ default 300.
+# min_pts = 2                     # DBSCAN density floor (0 ⇒ default 2)
+# max_eps = 0.15                  # conservative eps ceiling (cosine distance; 0 ⇒ default)
+# max_clusters_per_run = 8        # bounded fan-out per run (invariant #5; 0 ⇒ default 8)
+# min_cold_pages = 2             # events-accrued gate: skip a run below this many cold pages
 ```
 
 **LLM provider env** (opt-in):
