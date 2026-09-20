@@ -161,15 +161,31 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
         r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)\s*[=:]\s*\S+"#,
         "env_secret",
     ),
-    // Filesystem paths that commonly contain credentials.
-    (r"(?:/[^/\s]+)*/\.ssh(?:/[^\s]+)?", "credential_path"),
-    (r"(?:/[^/\s]+)*/\.aws(?:/[^\s]+)?", "credential_path"),
-    (r"(?:/[^/\s]+)*/\.kube(?:/[^\s]+)?", "credential_path"),
+    // Filesystem paths that commonly contain credentials. The separator
+    // class is `[\\/]` and an optional `X:` drive prefix is accepted so a
+    // Windows agent echoing `C:\Users\alice\.ssh\id_rsa` is redacted the
+    // same way as `/home/user/.ssh/id_rsa`. Case-insensitive because NTFS
+    // is; Unix paths stay covered because they still start with `/`.
     (
-        r"(?:/[^/\s]+)*/\.config/gcloud(?:/[^\s]+)?",
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.ssh(?:[\\/][^\s]+)?",
         "credential_path",
     ),
-    (r"(?:/[^/\s]+)*/\.gnupg(?:/[^\s]+)?", "credential_path"),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.aws(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.kube(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.config[\\/]gcloud(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
+    (
+        r"(?i)(?:[A-Za-z]:)?(?:[\\/][^\\/\s]+)*[\\/]\.gnupg(?:[\\/][^\s]+)?",
+        "credential_path",
+    ),
 ];
 
 /// Stateful sanitizer. Cheap to clone — wraps an `Arc` of compiled
@@ -674,6 +690,31 @@ mod tests {
         assert!(out.contains("[REDACTED:"));
         let out2 = s().scrub("set KUBECONFIG=/home/user/.kube/config");
         assert!(out2.contains("[REDACTED:"));
+    }
+
+    /// Windows agent output uses backslashes. The Unix-only `/.ssh` rules left
+    /// `C:\Users\alice\.ssh\id_rsa` (and the same for `.aws` / `.kube` /
+    /// `.gnupg` / `.config\gcloud`) in the stored observation.
+    #[test]
+    fn scrubs_windows_credential_paths() {
+        for text in [
+            r"read C:\Users\alice\.ssh\id_rsa",
+            r"copy C:\Users\alice\.aws\credentials",
+            r"KUBECONFIG=C:\Users\alice\.kube\config",
+            r"GNUPGHOME=C:\Users\alice\.gnupg\private-keys-v1.d",
+            r"gcloud auth C:\Users\alice\.config\gcloud\credentials.db",
+        ] {
+            let out = s().scrub(text);
+            assert!(out.contains("[REDACTED:"), "not redacted: {text} -> {out}");
+            assert!(
+                !out.to_ascii_lowercase().contains(r"\users\alice\"),
+                "leaked profile path: {text} -> {out}"
+            );
+        }
+        // Unix paths still redact after the separator class is widened.
+        let unix = s().scrub("see /home/user/.ssh/id_ed25519");
+        assert!(unix.contains("[REDACTED:"));
+        assert!(!unix.contains("/home/user/.ssh"));
     }
 
     /// Opaque auth headers reach capture via tool output echoing curl. The

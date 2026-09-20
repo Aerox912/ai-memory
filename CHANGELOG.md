@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `Ctrl+C` at the native-session chooser leaving the launcher alive and
   renewing its workstream lease. Cancelling now releases the acquired run and
   exits without waiting for Enter or linking a native session (#795).
+- The privacy strip now redacts Windows credential paths (`C:\Users\…\.ssh`,
+  `.aws`, `.kube`, `.gnupg`, `.config\gcloud`). The previous patterns required
+  a POSIX `/` separator, so a captured tool result that echoed a native
+  Windows path stored the profile directory and key file name verbatim. (#805)
 
 ## [2.3.2] - 2026-09-20
 
