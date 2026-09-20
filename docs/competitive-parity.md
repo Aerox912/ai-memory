@@ -48,11 +48,11 @@ None of the competitors below has more than one or two of these; none has all.
 
 | From | Migrate to ai-memory? | You gain | You give up |
 |---|---|---|---|
-| **mcp-memory-service** (fact-row twin) | **Yes** if you liked hook capture + typed edges + honest numbers | Files-as-truth (not opaque fact rows), handoffs, cross-project messaging, `as_of` temporal, a marginally better + reproducible number | Belief-strength + clustering consolidation, cloud/multi-backend replication (Cloudflare/Milvus), graph viz |
+| **mcp-memory-service** (fact-row twin) | **Yes** if you liked hook capture + typed edges + honest numbers | Files-as-truth (not opaque fact rows), handoffs, cross-project messaging, `as_of` temporal, a marginally better + reproducible number, and — new on 2.4 — its aging set at parity done zero-LLM/reversible/off-by-default (per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access boosts, 0.4–0.75-band contradiction flagging) | Cloud/multi-backend replication (Cloudflare/Milvus), graph viz. (Belief-strength + clustering consolidation are no longer a give-up — ai-memory now ships both, clustering as a zero-LLM default-off pass, belief-strength off/R2-gated) |
 | **basic-memory** (file-first sibling) | **Yes** for multi-harness coding continuity; **no** for a personal Obsidian KB with live team co-edit | Ambient capture (no `write_note` ceremony), full lifecycle, handoffs/messaging, git-versioned truth, published numbers | Local zero-cost reranking, real-time collaborative editing, Postgres backend, `build_context` graph-walk, hosted mobile/web UX |
 | **agentmemory** (ideological sibling) | **Yes** for operability + data ownership | Self-contained binary (no `iii-engine` sidecar), files-as-truth, SQL indexes committed in-txn, typed handoffs, Windows parity, fuller auth | ~13 pts raw R@5 (they rerank), a P2P mesh-sync primitive, ~31 tools of (mostly speculative) surface |
 | **Claude Code built-in memory** | **Yes** for teams / multi-machine / multi-harness; **not obviously** for a solo dev on one machine in Claude only | Cross-machine, cross-harness, team sharing, tool-lifecycle capture, real search | Zero setup — it's already on with no server to run (our one honest structural disadvantage for the solo case) |
-| **Hindsight** (pages-over-facts) | **Yes** for self-hosted/offline/team; **no** if you need their published accuracy + are fine with an LLM-required cloud | Zero-LLM, files you own, one binary, in-project team sharing (vs strict per-bank isolation) | Their published headline accuracy, VLM/LLM extraction depth, belief-strength that actually moves ranking |
+| **Hindsight** (pages-over-facts) | **Yes** for self-hosted/offline/team; **no** if you need their published accuracy + are fine with an LLM-required cloud | Zero-LLM, files you own, one binary, in-project team sharing (vs strict per-bank isolation), and — new on 2.4 — a belief-strength `confidence` + an opt-in "dream" rewrite that borrow their model but never delete a source and keep the zero-LLM default | Their published headline accuracy, VLM/LLM extraction depth, and belief-strength that *actually moves ranking by default* (ours ships but is off/R2-gated until an eval proves it) |
 | **Zep/Graphiti** (temporal KG) | **Yes** for self-hosting coders avoiding Neo4j+LLM (Community Edition is discontinued); **no** for enterprise graph-query/world-time | One binary on SQLite, zero-LLM, files, coding-harness native, a supported self-host | True bi-temporal (world vs observed time), Cypher/BFS graph queries, custom entity/edge types, `minRating` |
 | **Mem0** | **Mostly no — different buyer** (app end-user personalization). Yes only if you (mis)used it as coding-session memory | Zero-LLM, per-repo, cross-harness, editable pages, no API spend | Mem0's SDK/integration ecosystem + managed cloud personalization |
 | **Letta / MemOS** | **No** if you're building your agent *on* Letta; **yes** if you only wanted your existing coding agent to remember | Additive memory under your existing harness, zero-LLM, no runtime adoption | The ADE + agent-framework machinery (which you don't need unless building on Letta) |
@@ -81,12 +81,19 @@ until the eval harness (R2) that would justify activating them gets built.
 | Local embeddings (all-MiniLM-L6-v2) | mcp-memory-service | **BETTER** | Pure-Rust candle (no ONNX/C++ per target), checksum-pinned, default-on with background backfill |
 | Hook capture | mcp-memory-service | **BETTER** | 20+ harnesses + typed sanitizer boundary + backpressure vs Claude-Code-centric |
 | Versioned supersession | agentmemory | **BETTER** | A concurrent divergent write supersedes but the loser stays reachable (invariant #16); theirs flips `isLatest` |
-| Retention-as-formula (decay) | agentmemory | **BETTER** | Real SQL decay math vs in-memory O(N²) Jaccard capped at 1000 rows |
+| Retention-as-formula (decay) | agentmemory | **BETTER** | Real SQL decay math vs in-memory O(N²) Jaccard capped at 1000 rows; 2.4 adds opt-in per-tier half-life curves (identity default) |
+| Per-tier retention curves (365/180/90/30) | mcp-memory-service | **SHIPPED (parity), better default** | `[decay.half_life_days]` per tier (2.4, #807); their shape, but the omitted-key default is byte-identical to the old single-λ — no upgrade mass-evicts |
+| Extractive, zero-LLM compression | agentmemory / mcp-memory-service | **BETTER** | 2.4 tier-down (#808) keeps abstract+summary+regex keep-tokens and drops prose, but is **reversible** (git + supersession chain, `restore-page`) and off by default, not a lossy in-place rewrite |
+| Cold-cluster dedup (DBSCAN, adaptive-eps) | mcp-memory-service | **SHIPPED (parity), better safety** | 2.4 (#812) over the bounded cold set (no O(N²)); collapses by **supersede-not-delete** (invariant #16), conservative eps ceiling, zero-LLM, off by default |
+| Access-weighted retention (access boost) | mcp-memory-service | **SHIPPED (parity+), closed a real gap** | 2.4 (#798) wired reinforcement into `read_page`, the related-walk, and `explore` — every read path, not just search; throttled/async/FTS-exempt |
+| Contradiction detection (0.4–0.75 band) | mcp-memory-service | **SHIPPED (parity), advisory-only** | 2.4 (#814) surfaces likely conflicts in `memory_lint` from existing embeddings; zero-LLM, never edits/deletes/persists an edge |
+| Surprisal-first + idle/cancel dream scheduling | Honcho (Dreamer) / Supermemory | **SHIPPED (parity), opt-in** | 2.4 (#816) idle-scheduled, cancels on activity, orders most-novel-first; off by default, observable `DreamReport` per run |
 | Git-as-snapshot | agentmemory | **BETTER** | The wiki files *are* the truth (diffable), not a `state.json` dump |
 | Pages-over-facts / living pages | Hindsight | **PARITY** (native) | Same architecture, file-first vs their Postgres-first; `settled_first` briefing shipped |
 | Cross-session experience/abstraction pass | Letta/Hindsight/surveys | **REAL, ~parity** | ≥2-session evidence guard is the genuine article — but LLM-required and **off by default** |
 | Typed relation edges | graph camp | **PARTLY SHIPPED** | Link-neighbours are now a first-class retrieval surface — `memory_read_page include_related` walks the `page_links` graph outward (bounded BFS, #775) — but retrieval **RANK weighting by edge type is still not done** (edge kind stays explain-only in `memory_query`) |
-| Belief-strength consolidation | Hindsight / mcp-memory-service | **BEHIND** | `page_evidence` substrate shipped but **ranking-inert**; we still correct via binary supersession, not evidence-weighted belief |
+| Belief-strength consolidation | Hindsight / mcp-memory-service | **SHIPPED, off by default (parity of mechanism, unproven)** | 2.4 (#815) computes a read-time, zero-LLM `confidence` over `page_evidence` (distinct-session breadth, recency, live `contradicts`, capped `[0,0.95]`), exposed inertly in `explain`/`status`; foldable into ranking authority behind a **default-0.0, R2-gated** weight. Our improvement over Hindsight's documented **entrenchment** failure: breadth-not-raw-count weighting, recency shading, a confidence cap, and **supersession always wins** regardless of evidence. Not yet default-on — no R2 delta run |
+| LLM merge/rewrite "dream" pass | Hindsight (Dreamer) / Supermemory ("dreaming") | **SHIPPED, opt-in/off (parity of mechanism, unproven)** | 2.4 (#816) rewrites cold clusters into one page via the gated `apply_batch` path, `dry_run` first, JSON-schema output; **never deletes a source** (superseded with a merge-note stub, `restore-page` recovers), off by default, provider-less stores keep the zero-LLM A3 path. Off until an R2 quality delta is shown |
 | bi-temporal-lite | Zep/Graphiti | **BEHIND by design** | Ingestion-time only; world-time validity deferred (honestly, because dating facts needs an LLM and breaks the zero-LLM path) |
 
 ## Honest gaps (consolidated) and recommended adjustments
@@ -108,12 +115,18 @@ implemented without a separate decision.** Ordered by leverage.
    our headline — has *no* reranking, while basic-memory ships a local one and
    agentmemory/Hindsight's score lead is largely reranking (0.823 vs 0.952 same
    dataset). Closes a gap on our own keyless turf. Gate on R2.
-3. **Activate the dormant substrate (once R2 exists):** wire `page_evidence`
-   confidence into `PageAuthority` (clamped) — belief-strength; and add typed-edge
-   rank weighting + a `contradicts` authority cap — turning typed edges from
-   explain-only into a retriever. Both are designed in
-   [`design-hindsight-borrowings.md`](design-hindsight-borrowings.md); both are
-   inert today.
+3. **Activate the dormant substrate — belief-strength now wired, off by
+   default (2.4, #815).** `page_evidence` confidence is now computed at read
+   time (zero-LLM) and can be folded into `PageAuthority` behind a clamped,
+   **default-0.0** `[retrieval] belief_authority_weight` — the design in
+   [`design-hindsight-borrowings.md`](design-hindsight-borrowings.md) §3, with
+   the anti-entrenchment guards baked in. It is exposed inertly in
+   `memory_query explain` and `memory_status` today; **it does not move ranking
+   until an operator sets the weight, and turning it on is gated on a positive
+   R2 delta that has not been run.** Still genuinely behind: **typed-edge rank
+   weighting** (edge kind stays explain-only) and a `contradicts` *authority*
+   cap — A5 (#814) surfaces contradictions in `memory_lint` but does not yet
+   feed rank.
 4. **Sharpen the cross-machine story.** `comparison.md`'s "cross-machine *by
    construction*" is overstated — it's one shared server + manual git/rsync, with
    **no automatic replication** (agentmemory ships a P2P primitive; mcp-memory-
@@ -142,10 +155,17 @@ implemented without a separate decision.** Ordered by leverage.
    retrieval knob** shipped as `memory_query include_superseded=true` (#773) over
    our supersession chains. All five are strictly opt-in LLM/retrieval layers
    *over* the zero-LLM FTS/RRF core, never a requirement (invariant #13).
+   The **memory-aging** set (A1–A5, B1–B4, C1) landed on 2.4 as well —
+   per-tier decay curves, extractive tier-down, DBSCAN cold-cluster dedup,
+   the contradiction band, access reinforcement on all read paths,
+   belief-strength confidence, and the LLM dream pass — audited row-by-row in
+   the borrowed-ideas table above; the design of record is
+   [`design-memory-aging.md`](design-memory-aging.md).
    **Still unshipped:** MCP tool behavior hints
-   (readOnly/destructive/idempotent) on the 23-tool surface; a clustering/dedup
-   consolidation pass (mcp-memory-service's DBSCAN); a read-only graph
-   visualization in `/web`; a first-class TS SDK story for ecosystem parity.
+   (readOnly/destructive/idempotent) on the 23-tool surface; typed-edge **rank**
+   weighting and a `contradicts` authority cap (A5 flags, it doesn't yet rank);
+   a read-only graph visualization in `/web`; a first-class TS SDK story for
+   ecosystem parity.
    Deliberately out of scope: Honcho's theory-of-mind user-modeling engine and
    LiquidLM's opaque-cloud / LLM-mandatory / multimodal-second-brain substrate
    (all off-mission for file-first, zero-LLM coding memory; the global-scope
@@ -163,17 +183,27 @@ implemented without a separate decision.** Ordered by leverage.
   cross-harness capture, claim-once handoffs + messaging, and multi-user
   shared-within-project. On operability, data ownership, and cross-agent/team
   continuity, ai-memory is genuinely ahead of every overlapping competitor.
-- **The borrowed conveniences now ship (opt-in).** The 2.4 line landed the five
-  competitor-specific closes above — related-walk, dialectic answer, reasoning
-  tier, pin-before-search, and the show-superseded knob — each opt-in with
-  defaults byte-identical, and the R2 harness that gates the quality work now
-  exists and measures the accuracy+latency+context-tokens triple plus end-to-end
+- **The borrowed conveniences now ship (opt-in), and so does the aging set.**
+  The 2.4 line landed the five competitor-specific closes above — related-walk,
+  dialectic answer, reasoning tier, pin-before-search, and the show-superseded
+  knob — plus the memory-aging program (per-tier decay curves, extractive
+  tier-down, DBSCAN cold-cluster dedup, contradiction flagging,
+  access-weighted retention, belief-strength confidence, and the LLM "dream"
+  pass), each opt-in with defaults byte-identical. Our consistent improvements
+  over the sources borrowed from (mcp-memory-service, agentmemory, Honcho,
+  Hindsight, LiquidLM): **zero-LLM by default**, **reversible** (supersede-not-
+  delete + `restore-page`, never a lossy in-place rewrite or a deleted source),
+  **file-first**, and **R2/opt-in discipline** on anything that touches ranking
+  or calls an LLM. The R2 harness that gates the quality work now exists and
+  measures the accuracy+latency+context-tokens triple plus end-to-end
   QA-accuracy (illustrative sample-20 only so far).
 - **The honest weakness is still retrieval quality**, and it remains
   *self-inflicted by discipline, not by copying*: no local zero-LLM reranker
-  exists, belief-strength (`page_evidence`) and typed-edge **RANK** weighting are
-  built but still switched off, and the published *full-dataset* triple is still
-  pending (only illustrative sample-20 numbers so far). The gate (R2) is now
+  exists, belief-strength (`page_evidence`) is now wired but **default-off**,
+  typed-edge **RANK** weighting is still not built, and the published
+  *full-dataset* triple is still pending (only illustrative sample-20 numbers so
+  far). No R2 delta has been run, so nothing quality-affecting defaults on. The
+  gate (R2) is now
   open — **activate what's already there against a full-500 run.**
 - **Migration answer:** for the self-hosted, multi-harness, team, zero-LLM,
   own-your-data coding-memory user, yes — we do the basics and add what they

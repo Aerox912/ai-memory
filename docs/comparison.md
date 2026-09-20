@@ -55,7 +55,7 @@ not). See [where we're behind](#where-were-behind-or-different-by-choice).
 | Temporal knowledge graph | Zep/Graphiti, Cognee | Bi-temporal "what was true vs believed when" | Needs a graph DB; heavier to self-host. ai-memory ships **bi-temporal-lite** on SQLite ([`temporal.md`](temporal.md)) + typed edges ([`typed-edges.md`](typed-edges.md)) for the useful part |
 | Memory OS / self-editing | Letta, MemOS, MIRIX | Agent curates its own tiered memory | Token-expensive self-editing; Letta itself now concedes file-first ("Is a Filesystem All You Need?") |
 | Hosted context database | **OpenViking** (ByteDance) | Progressive L0/L1/L2 loading; directory-scoped retrieval; broad integrations | LLM-**required** (VLM + embeddings); opaque swappable storage; AGPLv3 core + SaaS/enterprise weight |
-| Paper-backed pages | **Hindsight** (Vectorize) | "Mental models" = living markdown pages an agent boots from; belief-strength consolidation; a preprint | Postgres/pgvector-primary, LLM-required; strict per-bank isolation (no team-sharing within a project) |
+| Paper-backed pages | **Hindsight** (Vectorize) | "Mental models" = living markdown pages an agent boots from; belief-strength consolidation; a preprint | Postgres/pgvector-primary, LLM-required; strict per-bank isolation (no team-sharing within a project). ai-memory now ships belief-strength `confidence` + an opt-in LLM "dream" rewrite, both zero-LLM-default-preserving, off by default, and R2-gated before default-on |
 | Closest sibling (fact-row twin) | doobidoo/mcp-memory-service | SQLite(+vec), local ONNX, hook capture, typed edges, honest numbers | What ai-memory would be if it chose fact-rows over wiki **pages** |
 | Platform-native | Claude Code auto-memory | Zero setup, on by default | Machine-local, **no sync**, single-agent, repo-scoped, no tool-lifecycle capture, no team |
 | **File-first wiki (ai-memory)** | ai-memory, basic-memory, OKF | Human-editable markdown truth + derived index; cross-agent; zero-LLM default; multi-user | Below the reranking leaders on raw R@5; LLM-optional means no VLM fact-extraction sophistication |
@@ -117,12 +117,50 @@ ai-memory also **shipped the borrowable ideas** from that research rather than
 just cataloguing them: typed relation edges, ingestion-time temporal validity
 with `as_of` queries, local (no-key) embeddings as the default, and the
 cross-session abstraction pass are all in the product today. The 2.4 line added
-five more, each **opt-in with defaults byte-identical**: a bounded related-pages
-graph walk (`memory_read_page include_related`, basic-memory/LiquidLM), an opt-in
-dialectic **answer** over hits and a **reasoning** tier (Honcho, both
-LLM-required and off by default), a **pin-before-search** contract (`memory_query
-pin_first` + a pinned standing-context briefing, LiquidLM), and a
-**show-superseded** retrieval knob over the supersession chains.
+five retrieval conveniences, each **opt-in with defaults byte-identical**: a
+bounded related-pages graph walk (`memory_read_page include_related`,
+basic-memory/LiquidLM), an opt-in dialectic **answer** over hits and a
+**reasoning** tier (Honcho, both LLM-required and off by default), a
+**pin-before-search** contract (`memory_query pin_first` + a pinned
+standing-context briefing, LiquidLM), and a **show-superseded** retrieval knob
+over the supersession chains.
+
+The 2.4 line also closed most of the **memory-aging** gap — the decay,
+compression, and consolidation machinery the field converged on — on
+ai-memory's own zero-LLM, file-first terms (design of record:
+[`design-memory-aging.md`](design-memory-aging.md)):
+
+- **Per-tier decay curves** (mcp-memory-service's 365/180/90/30 shape): the
+  single global half-life is now a tunable per-tier `[decay.half_life_days]`
+  table. Identity default — an upgrade changes no score.
+- **Extractive tier-down of cold episodic pages** (agentmemory and
+  mcp-memory-service ship extractive, zero-LLM compression as a default):
+  instead of evicting a cold page, ai-memory can compact it to its abstract,
+  a summary, and a regex-mined keep-token set (paths, URLs, code spans, error
+  codes) and drop the prose — reversible through git + the supersession chain.
+- **Cold-cluster dedup** (mcp-memory-service's DBSCAN): near-duplicate cold
+  episodic pages cluster (adaptive-eps DBSCAN over already-stored embeddings)
+  and collapse to one survivor — superseded, never deleted.
+- **Zero-LLM contradiction flagging** (mcp-memory-service's 0.4–0.75
+  cosine band): `memory_lint` now surfaces likely-conflicting pages, advisory
+  only, from existing embeddings.
+- **Access-weighted retention** (mcp-memory-service's access boost): a page a
+  human opens, searches, or reaches through the link graph resists decay like
+  a search hit — now on *every* read path.
+- **Belief-strength confidence** (Hindsight, mcp-memory-service): a read-time,
+  zero-LLM `confidence` per page (distinct-session breadth, recency, live
+  `contradicts` count), surfaced in `memory_query explain` and `memory_status`.
+- **An opt-in LLM "dream" pass** (Hindsight's Dreamer, Honcho's Dreamer,
+  Supermemory's "dreaming"): idle-scheduled, cancel-on-activity,
+  surprisal-first cross-session rewrite/merge of cold clusters.
+
+Two of these change behavior only where a provider is configured and the
+operator opts in — belief-strength folded into ranking, and the dream pass —
+and both are **off by default and gated on a recall eval (R2) before they may
+default on**. No such eval has been run yet, so ai-memory claims *parity of
+mechanism, not a measured quality win*: the substrate ships, honestly, off.
+Everything else here is zero-LLM, reversible, and off by default until an
+operator turns it on.
 
 ## Coming from another tool?
 
@@ -137,7 +175,12 @@ pin_first` + a pinned standing-context briefing, LiquidLM), and a
 - **From mcp-memory-service:** a very close sibling; the switch is fact-rows →
   wiki pages (human-editable markdown truth) and cross-agent handoffs as a
   first-class protocol. Cross-project [agent messaging](agent-messaging.md) is
-  new ground neither had as a typed queue.
+  new ground neither had as a typed queue. On aging you keep what you relied on
+  — the 2.4 line matches its per-tier decay curves, extractive compression,
+  DBSCAN cold-cluster dedup, access boosts, and 0.4–0.75-band contradiction
+  detection — but done **zero-LLM by default, reversibly** (every collapse
+  supersedes rather than deletes; `restore-page` recovers the original), and
+  **off by default** so an upgrade evicts nothing.
 - **From Supermemory / LiquidLM (a hosted memory API):** you trade a cloud
   vault and a managed multimodal RAG service for a self-contained binary whose
   memory lives in git-versioned markdown you own, works zero-LLM by default, and
@@ -151,10 +194,17 @@ pin_first` + a pinned standing-context briefing, LiquidLM), and a
   "second brain," ai-memory remembers *this repo*.
 - **From Hindsight / OpenViking:** you trade a hosted, LLM-required service for
   a self-contained binary that runs zero-LLM by default and keeps memory in
-  files you own. You give up (for now) their VLM-driven extraction depth and
-  their published headline accuracy numbers; you gain no vendor lock-in, no
-  required API spend, and per-project team sharing rather than strict per-bank
-  isolation.
+  files you own. The consolidation shape you came for is here on 2.4 — a
+  belief-strength `confidence` over evidence and an idle-scheduled,
+  cancel-on-activity, surprisal-first LLM "dream" rewrite of cold clusters —
+  but as **opt-in layers that never delete a source** (the pre-merge versions
+  stay reachable) and are **off by default and gated on a recall eval before
+  default-on**, over a zero-LLM core, rather than a mandatory loop. OpenViking's
+  L0/L1/L2 progressive tiers map onto ai-memory's extractive tier-down
+  (abstract + summary + keep-tokens). You give up (for now) their VLM-driven
+  extraction depth and their published headline accuracy numbers; you gain no
+  vendor lock-in, no required API spend, and per-project team sharing rather
+  than strict per-bank isolation.
 
 ## Where we're behind, or different by choice
 
@@ -170,6 +220,14 @@ Fair means saying this plainly:
   default, and its end-to-end QA-accuracy is early and small-sample (see
   [`benchmarks/retrieval-ab-r2.md`](benchmarks/retrieval-ab-r2.md)), not a
   headline claim.
+- **Belief-strength and the dream pass ship, but off — no proven win yet.**
+  The 2.4 memory-aging set includes the two pieces that could move retrieval
+  *quality* — folding belief-strength `confidence` into ranking authority, and
+  the LLM "dream" rewrite of cold clusters — but both are **off by default and
+  gated on a recall eval (R2) that has not been run**. We claim parity of
+  *mechanism* with Hindsight/mcp-memory-service here, not a measured recall or
+  QA improvement; until R2 shows a positive delta the honest statement is
+  "shipped, opt-in, unproven," and the default path is unchanged.
 - **Headline benchmark comparability.** Hindsight quotes 91.4% *accuracy* and
   OpenViking quotes LoCoMo lifts — different datasets/metrics than our hit@5,
   and both are self-reported/preprint. We publish a reproducible harness and a
