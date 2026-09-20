@@ -603,6 +603,17 @@ compact_cold_episodic = false      # A2 opt-in: tier-down (compact) a cold
                                    # keep abstract+summary+keep-tokens, drop
                                    # prose. Reversible (git + supersession),
                                    # zero-LLM. false = today's evict behaviour.
+dedup_cold_clusters = false        # A3 opt-in: cluster near-duplicate cold
+                                   # episodic pages by embedding (cosine DBSCAN,
+                                   # adaptive eps) and collapse each cluster to
+                                   # one survivor (union of keep-tokens), others
+                                   # superseded with a merge note. Reversible
+                                   # (git + supersession), zero generative LLM,
+                                   # no-op with no embedder. Merge provenance in
+                                   # page_evidence. false = no clustering.
+# dedup_min_pts = 2                # DBSCAN density floor (0 ⇒ default 2)
+# dedup_max_eps = 0.15             # conservative eps ceiling (cosine distance;
+                                   # 0 ⇒ default). Lower = merges less.
 
 [decay.half_life_days]             # opt-in per-tier retention curves (all keys
                                    # optional). Half-life in DAYS; converted to
@@ -651,6 +662,18 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1        # per project; scheduler ticks do not overlap
 min_session_age_secs = 600
+experience_every_sessions = 0    # 0 disables the cross-session experience pass
+experience_sessions = 10         # session summaries one experience pass reads
+
+[auto_improve.scheduler.experience_entropy_filter]  # A4 opt-in; off by default
+enabled = false                  # true: skip low-information session pages from
+                                 # the experience consolidation pass BEFORE the
+                                 # prompt/eval-gate/apply_batch. Advisory (skip,
+                                 # never delete); zero-LLM. false = no filtering.
+# min_chars = 16                 # near-empty floor (non-whitespace chars)
+# min_entropy_bits_per_char = 2.0
+# max_repetition_ratio = 0.7     # 1 - distinct/total tokens above this ⇒ skip
+# repetition_min_tokens = 6      # repetition check applies only above this
 
 [retrieval]                       # opt-in ranking signals; all off by default
 query_intent = false              # lexical session-recall routing: queries phrased as
