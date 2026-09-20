@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the Docker Desktop helper) comparing host cwds from Explorer, Git, and
   PowerShell previously required a byte-exact match, so `C:\Users\…\repo`
   vs `c:\users\…\repo` missed the pending auto-handoff and could mint a
-  fragment project. Unix paths stay case-sensitive.
+  fragment project. Unix paths stay case-sensitive. (#806)
 
 ## [2.3.2] - 2026-09-20
 
