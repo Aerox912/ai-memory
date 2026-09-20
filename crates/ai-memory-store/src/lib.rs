@@ -44,8 +44,9 @@ pub use auto_improve::{
     StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use decay::{
-    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
-    retention_score_with_breadth, salience_after_feedback,
+    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, TierLambdas,
+    lambda_from_half_life_days, retention_score, retention_score_with_breadth,
+    salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
