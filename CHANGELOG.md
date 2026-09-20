@@ -239,7 +239,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that visible. The server also logs a warning whenever an unscoped MCP read is
   resolved by the startup seed or by the default after a session mismatch,
   rather than by the caller's own hook session (#757, #774).
-||||||| 353841d9
 
 ### Docs
 - `docs/llm-providers.md` now covers the `opencode` LLM provider, which has
