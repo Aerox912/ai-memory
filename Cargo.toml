@@ -152,6 +152,9 @@ flate2 = "1"
 
 # Text munging / hook payload sanitisation.
 regex = "1"
+# Unicode NFC for the portable page-path key. Already in the tree via
+# idna -> idna_adapter, so this adds no new code to the binary.
+icu_normalizer = "2"
 
 # Wiki git versioning.
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
