@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scalar `[decay] lambda`, so the default (no table) is byte-identical to the
   previous single-λ behaviour — an upgrade changes no score and mass-evicts
   nothing on the first post-upgrade sweep. Pure math + config: no new column,
-  no migration, and no new MCP tool (still 23) (#799).
+  no migration, and no new MCP tool (still 23) (#807).
 - Access reinforcement on the remaining read paths (design-memory-aging.md
   bucket C1): `memory_read_page` (a direct by-path/by-query read), its
   `include_related` link-graph walk (the walked neighbours, not just the seed),
