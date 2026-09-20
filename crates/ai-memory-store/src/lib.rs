@@ -16,6 +16,7 @@ use rusqlite::Connection;
 
 mod api_credentials;
 mod auto_improve;
+pub mod belief;
 pub mod decay;
 mod error;
 mod fts_query;
@@ -43,9 +44,11 @@ pub use auto_improve::{
     OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
     StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
+pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use decay::{
-    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
-    retention_score_with_breadth, salience_after_feedback,
+    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, TierLambdas,
+    lambda_from_half_life_days, retention_score, retention_score_with_breadth,
+    salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
@@ -65,16 +68,18 @@ pub use reader::{
     DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
     ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
     OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
-    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool,
+    ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions, ScopeRow, SearchExplain,
+    SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage, StatusCounts,
+    StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
+    f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
-    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
-    create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
-    lookup_global_scope, resolve_many_existing_scopes,
+    ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, ScopeSource,
+    WORKSPACE_PROJECT_PAIR_REQUIRED, create_explicit_scope, create_global_scope,
+    lookup_existing_scope, lookup_existing_workspace, lookup_global_scope,
+    resolve_many_existing_scopes,
 };
 pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{
@@ -2360,6 +2365,7 @@ mod tests {
                 0,
                 1,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2558,6 +2564,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2847,6 +2854,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2869,6 +2877,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2936,6 +2945,7 @@ mod tests {
                 2,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3014,6 +3024,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3072,6 +3083,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3111,6 +3123,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -3137,6 +3150,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -6716,7 +6730,7 @@ mod tests {
         // as_of between v1 and v2: the superseded version answers.
         let then_hits = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(between), false)
             .await
             .unwrap();
         assert_eq!(then_hits.len(), 1, "{then_hits:?}");
@@ -6732,6 +6746,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -6741,7 +6756,7 @@ mod tests {
         // And before v1 existed: nothing was known.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1))
+            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(1), false)
             .await
             .unwrap();
         assert!(before.is_empty(), "{before:?}");
@@ -7218,7 +7233,7 @@ mod tests {
         // window opened at the version's creation.
         let later = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1))
+            .entity_hits_for_project_at(ws, proj, "sqlite", 10, None, Some(created + 1), false)
             .await
             .unwrap();
         assert_eq!(later.len(), 1, "{later:?}");
@@ -7261,7 +7276,15 @@ mod tests {
         // Before retirement: visible.
         let before = store
             .reader
-            .entity_hits_for_project_at(ws, proj, "postgres", 10, None, Some(retired_at - 1000))
+            .entity_hits_for_project_at(
+                ws,
+                proj,
+                "postgres",
+                10,
+                None,
+                Some(retired_at - 1000),
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(before.len(), 1, "{before:?}");
@@ -7275,6 +7298,7 @@ mod tests {
                 10,
                 None,
                 Some(jiff::Timestamp::now().as_microsecond()),
+                false,
             )
             .await
             .unwrap();
@@ -7612,6 +7636,7 @@ mod tests {
                 0,
                 10,
                 None,
+                false,
             )
             .await
             .unwrap();

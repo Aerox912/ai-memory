@@ -27,6 +27,222 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name), the feature set is unchanged, and the 23-tool MCP surface is
   unaffected. (#794)
 
+### Added
+- LLM "dream" pass — cross-session rewrite/merge of cold clusters, scheduled on
+  idle (design-memory-aging.md buckets B2/B3/B4). Where A3 collapses
+  near-duplicate cold clusters *extractively* (zero-LLM, keep-token union), the
+  dream pass hands each cold cluster to the configured provider to be rewritten
+  into ONE coherent page. It is **opt-in LLM, OFF by default, and gated on an R2
+  number before it may default on**: it runs only when the new `[dream] enabled`
+  flag is set AND a provider AND an embedder are configured — a provider-less
+  store keeps the zero-LLM A3 path untouched (invariant #13). **It never deletes
+  a source** (invariant #16): the highest-retention member is rewritten and every
+  merged-away member is *superseded* with a merge-note stub pointing at it, so the
+  full pre-merge body stays reachable via the supersession chain + git and
+  `restore-page` recovers it; `page_evidence` (`reconsolidation` +
+  `b2_dream:<id>`) records which members fed each merge (the hallucinated-merge
+  guard). The rewrite routes through the existing gated apply path
+  (`preflight_admission(Consolidate)` → `Wiki::apply_batch`, single-writer actor,
+  invariant #2) with **`dry_run` first** (a dry run returns the plan and calls
+  neither the LLM nor the writer), and uses **JSON-schema structured output only**
+  (invariant #7). Scheduling (B3) runs the pass only after a configurable idle
+  window with no client activity and **cancels it the moment the operator
+  returns** (a cheap cancellation flag polled between clusters), bounded to a
+  capped number of clusters per run (invariant #5). Work is ordered
+  **surprisal-first** (B4): most-novel clusters — those farthest from the nearest
+  existing page — first. Every run returns an observable `DreamReport` (clusters
+  considered, merged, pages rewritten/superseded, skipped, cancelled) so a bad
+  run is never silent. New `[dream]` config section; no new migration (reuses
+  `page_evidence` + supersession); no new MCP tool (still 23) (#816).
+- Belief-strength confidence over the `page_evidence` substrate
+  (design-memory-aging.md bucket B1 / design-hindsight-borrowings.md §3): a
+  read-time, **zero-LLM** `confidence` derived per page version from its
+  evidence — distinct supporting sessions (breadth, not raw count), recency of
+  the newest sighting, and live `contradicts` count — bounded to
+  `[0.0, 0.95]`. It is **exposed inertly** everywhere it helps diagnosis:
+  `memory_query(explain=true)` now reports `confidence` and `evidence_count`
+  per hit (and `belief_factor` when folding is on), and `memory_status` reports
+  the project's `evidence_rows` count — none of which changes ranking. It can
+  optionally be **folded into ranking authority** as one more bounded factor
+  inside the existing `[0.55, 1.50]` clamp (never a new multiplier tower) via
+  the new `[retrieval] belief_authority_weight` config key, which **defaults to
+  `0.0` (OFF)** so upgrades rank byte-identically. The anti-entrenchment guards
+  are baked in: breadth weighting by distinct sessions, recency shading, a
+  hard confidence cap, and — the caller-side guard for invariant #16 — **a
+  supersession always wins regardless of evidence** (a superseded version's
+  stale evidence never boosts it, and confidence never gates whether a write or
+  correction takes). Turning the authority factor on is **gated on a positive
+  R2 delta** (retrieval-triple / QA), not yet performed (#815).
+- Zero-LLM contradiction detection surfaced through `memory_lint`
+  (design-memory-aging.md bucket A5): the lint pass now flags likely-conflicting
+  pages by cosine-similarity band. Cold knowledge pages (semantic / procedural)
+  whose already-stored embeddings sit in the **0.4–0.75 cosine-similarity band** —
+  "same topic, but not a near-duplicate", the shape of a likely contradiction
+  (a pair ≥ 0.75 is A3 dedup territory; < 0.4 is unrelated) — get an advisory
+  `contradiction` lint finding naming both pages, with timestamp-based
+  resolution advice (the newer page supersedes on a timestamp basis; reconcile).
+  It is fully **zero generative LLM**: it reads only existing embeddings and
+  cosine (invariant #13), so with no embedder configured — or no embeddings for
+  the configured `(provider, model, dim)` triple — it is a clean no-op, not an
+  error, and never a provider call. It runs on the user-invoked `memory_lint`
+  (MCP and admin) and is **advisory-only and non-destructive**: it emits a
+  finding and never deletes, edits, or supersedes a page (invariant #16), and
+  never persists an edge (the `links` table's `contradicts` edges are
+  body-derived and rewritten on every page write, so a programmatic edge would
+  be silently wiped) — hence **no new migration**, and no new MCP tool (still
+  23). The scan is bounded: one embeddings load over the already-bounded cold
+  set, capped page and finding counts, deterministic ordering (invariant #2)
+  (#814).
+- Cold-cluster dedup of near-duplicate episodic pages (design-memory-aging.md
+  bucket A3): the forget-sweep can now cluster near-duplicate cold episodic
+  pages by embedding (cosine-distance DBSCAN with an adaptive k-distance eps,
+  `minPts = 2`) and collapse each cluster to one survivor — the highest-retention
+  member, its body the *extractive union* of the cluster's keep-tokens, so every
+  member's durable facts survive — superseding the other members with a merge
+  note that points at the survivor. It runs only over the bounded cold-episodic
+  candidate set the sweep already materialises (never O(N²) over the whole
+  corpus), is **opt-in and off by default** via `[decay] dedup_cold_clusters`
+  (a `false` default), and fully **zero generative LLM**: it reads only
+  already-stored embeddings, so with no embedder configured — or no embeddings
+  for the configured `(provider, model, dim)` triple — it is a clean no-op, not
+  an error. The eps is clamped to a conservative ceiling (`[decay] dedup_max_eps`,
+  default cosine distance ≈ 0.15) so it errs toward NOT merging. **Non-destructive
+  and reversible**: no source is ever hard-deleted — every merged-away member
+  stays reachable via the supersession chain and git history and is recoverable
+  with `restore-page` (invariant #16) — and the merge provenance is recorded in
+  `page_evidence`. Every run reports its collapses in the `SweepReport`. Reuses
+  existing tables: **no new migration**, and no new MCP tool (still 23). Ships
+  opt-in/off; the R2 recall no-regression proof is the gate before any future
+  default-on (#812).
+- Entropy / boilerplate pre-filter before consolidation (design-memory-aging.md
+  bucket A4): a pure, zero-LLM Shannon-entropy + boilerplate gate that skips
+  low-information session pages (near-empty, whitespace, single-character, or
+  highly-repetitive boilerplate) from the cross-session experience consolidation
+  pass *before* they reach the LLM prompt, the eval gate, or `apply_batch`.
+  It is **advisory and non-destructive** — a skipped page is not consolidated,
+  never deleted (invariant #16) — and **opt-in / off by default** via
+  `[auto_improve.scheduler.experience_entropy_filter]` (a `false` default with
+  conservative, validated thresholds tuned so a terse-but-informative note with
+  a file path and an error code is KEPT), so an upgrade changes no consolidation
+  output until an operator opts in. Every run surfaces the skip count in the
+  experience report warnings. No schema change and no new MCP tool (still 23)
+  (#812).
+- Extractive tier-down of cold episodic pages (design-memory-aging.md bucket
+  A2): instead of evicting a cold episodic page, the forget-sweep can now
+  *compact* it — keeping the L0 frontmatter `abstract:`, an L1 first-paragraph
+  summary, and an L2 regex-mined keep-token set (file paths, URLs, inline-code
+  spans, error codes, `UPPER_SNAKE` constants and long identifiers), and
+  dropping the prose body. Tier-down beats eviction because the durable facts
+  survive while the expensive, low-signal prose does not. It is **opt-in and
+  off by default** via `[decay] compact_cold_episodic` (a `false` default, so an
+  upgrade changes nothing until an operator opts in), fully zero-LLM (regex
+  only), and **reversible and non-destructive**: the rewrite goes through the
+  wiki layer, so the full pre-compaction body stays reachable in git history and
+  the supersession chain and is recoverable with `restore-page`. A new `V65`
+  migration adds a nullable `pages.compacted_at` marker (additive `ADD COLUMN`,
+  no backfill; populated lazily by the sweep from a `compacted: true` frontmatter
+  mirror) so the sweep and the curator tell a deliberately-short compacted page
+  from a cold one — a compacted page is never re-compacted, re-evicted, or
+  re-reported as cold. Only unpinned episodic pages compact; pinned/semantic/
+  procedural pages are never touched. Every run reports what it compacted in the
+  `SweepReport`. Ships opt-in/off; the R2 recall no-regression proof is the gate
+  before any future default-on. No new MCP tool (still 23) (#808).
+- Per-tier retention half-life curves (design-memory-aging.md bucket A1): the
+  forget-sweep's decay rate can now be tuned per memory tier via an opt-in
+  `[decay.half_life_days]` config table, replacing the single global λ. Each
+  key (`working` / `episodic` / `semantic` / `procedural`) is a half-life in
+  *days*, converted internally to `λ = ln(2) / days`, so an operator can keep
+  episodic session history longer and working-tier scratch shorter (the
+  mcp-memory-service 365/180/90/30 shape). An omitted key falls back to the
+  scalar `[decay] lambda`, so the default (no table) is byte-identical to the
+  previous single-λ behaviour — an upgrade changes no score and mass-evicts
+  nothing on the first post-upgrade sweep. Pure math + config: no new column,
+  no migration, and no new MCP tool (still 23) (#807).
+- Access reinforcement on the remaining read paths (design-memory-aging.md
+  bucket C1): `memory_read_page` (a direct by-path/by-query read), its
+  `include_related` link-graph walk (the walked neighbours, not just the seed),
+  and `memory_explore` (the pages it surfaces — rules, slots, recent, pinned,
+  settled) now bump `access_count` + `last_accessed_at` exactly as
+  `memory_query` and `memory_recent` already do. A page a human opens directly,
+  or one the graph surfaces, is *used* and now resists decay like a search hit.
+  Reuses the sanctioned reinforcement path: fire-and-forget on the single-writer
+  actor, throttled to ≤1 per (page, operator) per minute, and FTS-exempt. It is
+  strictly additive — reinforcement only raises retention scores, never blocks,
+  never touches the response payloads, and adds no new MCP tool (still 23)
+  (#798).
+- Reasoning tier on the LLM synthesis paths: an opt-in `reasoning` argument on
+  `memory_query` (its `answer` path) and `memory_explore` (borrowed from
+  Honcho's reasoning-effort ladder; targets the 2.4 line). The knob is a schema
+  enum `minimal` (default) / `low` / `medium` / `high` / `max`; an unknown value
+  is rejected. Because the provider-neutral `ChatRequest` carries no per-request
+  reasoning/effort field (the provider-level `reasoning_effort` is fixed at
+  construction from config), the tier maps honestly to a per-tier max-token
+  budget scaled off each path's base budget (answer 2 000, explore 16 000):
+  `minimal` = 1x, `low` = 1.5x, `medium` = 2x, `high` = 3x, `max` = 4x — a
+  higher tier gives the model more room to reason before its output is
+  truncated. It only tunes the answer path: `reasoning` is inert unless the LLM
+  path actually runs (`answer: true` with a provider, or `memory_explore` with a
+  provider), so the zero-LLM default path is untouched. Omitting `reasoning`, or
+  passing `minimal`, is byte-identical to before. No new MCP tool (still 23)
+  (#783).
+- Dialectic answer on `memory_query`: an opt-in, off-by-default `answer`
+  argument (borrowed from Honcho's dialectic endpoint; targets the 2.4 line).
+  When `answer: true` AND the server has an LLM provider configured, the query
+  synthesizes a concise, cited natural-language answer over the top retrieved
+  hits and attaches it as `answer: { text, citations }`, where `citations` are
+  the page paths the answer drew from (JSON-schema structured output, grounded
+  strictly in the retrieved snippets). When `answer: true` but no provider is
+  configured, the normal hits are returned plus a short `answer_unavailable`
+  note rather than an error. With `answer` omitted/`false` (the default), no LLM
+  provider is accessed and the response is byte-identical to before, so the
+  zero-LLM default path is untouched. Applies to the normal single-project /
+  `scopes` search; `global` and `as_of` queries ignore it. Honest caveat: the
+  feature is new and its answer quality is not yet eval-validated — treat the
+  synthesized answer as a convenience over the same hits and still open the
+  cited pages before acting (#782).
+- "Pin before search": `memory_query` gained an opt-in `pin_first` argument and
+  `memory_briefing` now carries a bounded `pinned` list (default off/absent;
+  targets the 2.4 line). Pinned pages previously earned only a small post-RRF
+  authority bump; they were never surfaced *ahead of* the search, and the
+  briefing never listed them by the `pinned` column. With `pin_first: true`, a
+  single-project `memory_query` prepends the project's bounded pinned latest
+  pages (newest first, cap 10) ahead of the fused hits, deduped by page id so a
+  pinned page that also matches the query appears once (marked `pinned: true`),
+  and re-truncates to the requested limit; `scopes`, `global`, and `as_of`
+  queries ignore it. A project-scoped `memory_briefing` snapshot now includes a
+  bounded `pinned` list of pinned latest pages (distinct from the `_slots/`
+  path-prefixed `slots`) so SessionStart hot-context can show standing context.
+  Both are backed by the new `ReaderPool::list_pinned_pages`; default off/empty
+  is byte-identical to the previous query ordering and briefing shape (#780).
+- `memory_read_page` gained an opt-in related-pages graph walk (default false;
+  targets the 2.4 line). Passing `include_related: true` adds a `related` array
+  of the pages reachable from the read page through the link graph — a bounded
+  breadth-first walk that reuses the single-hop link primitive per node,
+  following both outgoing links and incoming back-links out to `related_depth`
+  hops (default 1, hard-capped at 3). Each entry carries its
+  path/title/kind/workspace/project plus the hop `depth` and edge `direction`
+  (`link`/`backlink`) it was reached by; the walk is cross-project aware,
+  dedup- and cycle-safe via a global visited set, and bounded by a total-node
+  cap. Default-off behaviour is byte-identical to the previous single-page
+  response (no `related` field) (#775).
+- `memory_query` gained an opt-in `include_superseded` argument (default false;
+  targets the 2.4 line). When set, project and explicit-scope searches also
+  return superseded (older) page versions across the FTS/entity/vector/graph
+  streams, each hit labelled `superseded: true` so callers can tell historical
+  versions from the current one; the current version is never marked. Default-off
+  behaviour is byte-identical to the previous latest-only retrieval, and
+  `global=true` and `as_of` time-travel are unaffected (#773).
+- `memory_status` now reports which project answered: a `scope` object with
+  `workspace`, `project`, and `resolved_by` (`explicit`, `session`,
+  `shared_slot`, `startup_seed`, `default`, or `default_after_mismatch`). An
+  unscoped call from a static MCP client, whose transport session id is not a
+  lifecycle-hook session id, returned plausible counts for a project it never
+  named, with nothing in the response to question them; `resolved_by` now makes
+  that visible. The server also logs a warning whenever an unscoped MCP read is
+  resolved by the startup seed or by the default after a session mismatch,
+  rather than by the caller's own hook session (#757, #774).
+||||||| 353841d9
+
 ### Docs
 - `docs/llm-providers.md` now covers the `opencode` LLM provider, which has
   shipped since 1.x but was missing from the recommended-defaults table:
