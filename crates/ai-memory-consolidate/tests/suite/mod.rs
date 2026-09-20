@@ -4,6 +4,7 @@
 
 mod abstract_backfill;
 mod access_breadth_sweep;
+mod aging_lifecycle;
 mod cold_cluster_sweep;
 mod compaction_sweep;
 mod contradiction_lint;
