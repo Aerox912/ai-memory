@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported "not configured" on native Windows Docker Desktop even though the
   same export worked through `bin/ai-memory`. The POSIX wrapper also now
   forwards `OPENCODE_API_KEY`. (#803)
+- `Config::load` now treats Windows `%USERPROFILE%` (then `dirs::home_dir`) as
+  the operator home when `AI_MEMORY_HOME` and `$HOME` are unset. Native
+  Windows often has no `HOME`, so the #103 catch-all guard — skip a stored
+  `repo_path` equal to the user profile so it cannot prefix-match every
+  project beneath it — was inert there and a home-directory project could
+  swallow unrelated cwds. (#804)
 
 ## [2.3.2] - 2026-09-20
 
