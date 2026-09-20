@@ -6765,6 +6765,12 @@ async fn handle_write_page(
             Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
         )
     })?;
+    path.ensure_portable().map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
 
     let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
 
@@ -8904,6 +8910,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "write-page setup failed");
+    }
+
+    #[tokio::test]
+    async fn admin_write_page_refuses_git_reserved_and_non_portable_paths() {
+        let (_tmp, router) = read_page_test_router();
+        for bad in [
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "CON.md",
+            "notes/aux.md",
+            "notes/a|b.md",
+        ] {
+            let req_body = serde_json::json!({
+                "workspace": "default",
+                "project": "audit",
+                "path": bad,
+                "body": "bad path body",
+            });
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/write-page")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected 422 for {bad:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -23,8 +23,17 @@ behavior and touches the trust boundary (retroactive untrusted text enters the s
    re-spawning. Live hook capture (install-time forward) and backfill (before-install
    history) do not overlap, so there is no double-capture to reconcile.
 
+`backfill --dry-run` only plans the import; it neither creates nor overwrites
+the local sentinel, so it does not suppress a later automatic attempt.
+
 The automatic path runs detached and silent (like Claude Code's own auto-memory); the
 `📼 imported N session(s)` summary is shown on a **manual** `ai-memory backfill` only.
+Failed imports are always written to stderr (the detached worker's
+`logs/backfill.log`), including with `--quiet`. Any failed session makes the
+command exit nonzero after emitting its report; `--json` still produces the
+complete report on stdout. Other selected sessions are still attempted, and
+the one-attempt sentinel policy is unchanged.
+
 Surfacing the count in the next session's on-start context is a possible follow-up
 (§ "Notice delivery" describes the delivery path it would reuse).
 
