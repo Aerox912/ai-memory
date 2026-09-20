@@ -97,7 +97,7 @@ rule.
 
 **⚠️ Unofficial and against Anthropic's usage policies — use at your own risk;
 it may get your account rate-limited or banned. See
-[the warning in `docs/install.md`](docs/install.md#anthropic-via-claude-subscription-oauth).**
+[the warning in `docs/install.md`](install.md#anthropic-via-claude-subscription-oauth).**
 
 `copilot` stores a GitHub user token in the same auth file, exchanges it for a
 short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
@@ -186,7 +186,7 @@ sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
 384-dim), with the model fetched once into `<data_dir>/models/` under
 pinned checksums — see [`docs/local-embeddings.md`](local-embeddings.md).
 
-See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
+See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter examples, and
-[`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md)
+[`docs/llm-provider-comparison.md`](llm-provider-comparison.md)
 for the empirical model comparison.
