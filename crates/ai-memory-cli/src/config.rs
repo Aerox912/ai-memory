@@ -1144,6 +1144,12 @@ pub struct RetrievalSettings {
     /// the RRF fusion. Pages gain an abstract vector when their frontmatter
     /// carries `abstract:` and the embedding backfill runs.
     pub abstract_vectors: bool,
+    /// Weight of the belief-strength confidence factor folded into page
+    /// authority (P2). `0.0` (the default) is inert — ranking is byte-identical
+    /// and no belief query runs. Positive folds a page's evidence-derived
+    /// `confidence` into its authority factor, inside the existing bounds.
+    /// OFF by default: enabling it is gated on a positive R2 delta.
+    pub belief_authority_weight: f64,
 }
 
 impl Default for RetrievalSettings {
@@ -1153,6 +1159,7 @@ impl Default for RetrievalSettings {
             query_intent: base.session_recall_routing,
             session_recall_bonus: base.session_recall_bonus,
             abstract_vectors: base.abstract_vectors,
+            belief_authority_weight: base.belief_authority_weight,
         }
     }
 }
@@ -1165,6 +1172,10 @@ impl RetrievalSettings {
             session_recall_routing: self.query_intent,
             session_recall_bonus: self.session_recall_bonus.max(0.0),
             abstract_vectors: self.abstract_vectors,
+            // A negative weight would flip the boost into a penalty on
+            // supported pages; clamp it out so misconfiguration is inert, not
+            // inverted.
+            belief_authority_weight: self.belief_authority_weight.max(0.0),
         }
     }
 }

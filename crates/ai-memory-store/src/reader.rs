@@ -642,10 +642,28 @@ pub struct SearchExplain {
     /// sessions/observations/feedback/reconsolidation passes produced or
     /// reaffirmed it. Populated only on the explained path
     /// ([`Reader::hybrid_search_explained`]), batch-fetched after fusion;
-    /// `None` on the default (non-explained) path. Inert this release: it
-    /// never feeds `fused`/`authority` or changes ranking.
+    /// `None` on the default (non-explained) path. Populated on every
+    /// explained query and, additionally, whenever the belief-authority weight
+    /// is on (it is an input to the factor then). Exposing the count is inert:
+    /// the count itself never feeds `fused`/`authority`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_count: Option<u32>,
+    /// Belief-strength confidence in `[0.0, `[`crate::belief::CONFIDENCE_CAP`]`]`
+    /// derived from this page version's evidence (P2,
+    /// docs/design-hindsight-borrowings.md §3): distinct supporting sessions,
+    /// recency of the newest sighting, and live contradiction count. Populated
+    /// alongside `evidence_count`. Informational unless
+    /// `[retrieval] belief_authority_weight` is positive; see `belief_factor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// The belief contribution actually folded into `authority` for this hit:
+    /// `belief_authority_weight * confidence`, or `0.0` when the confidence
+    /// applied but was zero. `None` when the belief-authority weight is off
+    /// (the default) or the hit was skipped (a superseded version — a
+    /// supersession always wins, so stale evidence never boosts it). Inert
+    /// exposure of `confidence`/`evidence_count` does not set this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_factor: Option<f64>,
 }
 
 /// One hit returned by [`ReaderPool::search_pages`].
@@ -898,6 +916,12 @@ pub struct StatusCounts {
     pub sessions: u64,
     /// Total observations across all sessions.
     pub observations: u64,
+    /// Total `page_evidence` rows in the project (P2,
+    /// docs/design-hindsight-borrowings.md §3): the belief-strength substrate's
+    /// footprint — how many session/observation/feedback/reconsolidation
+    /// citations back this project's pages. `0` on a store that predates the
+    /// evidence write path or has consolidated nothing yet.
+    pub evidence_rows: u64,
 }
 
 /// One likely cross-project contamination finding from
@@ -4116,22 +4140,30 @@ impl ReaderPool {
         .await
     }
 
-    /// Number of `page_evidence` rows for each of `page_ids` (P2,
-    /// docs/design-hindsight-borrowings.md §3): what produced or
-    /// reaffirmed that page version. One batch query for the whole
-    /// result page — never one per hit — so
-    /// [`Self::hybrid_search_explained`] can attach
-    /// `SearchExplain::evidence_count` without touching the hot,
-    /// non-explained default path. A page id with zero evidence rows is
-    /// simply absent from the map; callers read that as count 0
-    /// ("unknown", not "unsupported").
+    /// Batched belief-strength inputs for each of `page_ids` (P2,
+    /// docs/design-hindsight-borrowings.md §3): the evidence aggregate and the
+    /// live-contradiction count that [`crate::belief::confidence`] needs.
+    ///
+    /// Two fixed batch queries for the whole result page — never one per hit
+    /// (invariant #2). Only called when the belief signal is needed (an
+    /// explained query, or the belief-authority weight is on), so the hot,
+    /// non-explained default path pays nothing. A page id with no evidence rows
+    /// is absent from the map; the caller reads that as
+    /// [`BeliefInputs::default`] (confidence 0, i.e. no ranking effect).
+    ///
+    /// `distinct_sessions` counts distinct `source_id`s over the `session` and
+    /// `reconsolidation` kinds — the breadth signal — and `newest_evidence_us`
+    /// is `MAX(created_at)`. The contradiction count is the number of
+    /// `contradicts` edges the page declares whose target resolves to a *live*
+    /// (latest) page; a stale (dangling) contradiction does not weaken the
+    /// belief, matching the lint's resolved/stale split.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn page_evidence_counts(
+    pub async fn page_belief_inputs(
         &self,
         page_ids: &[PageId],
-    ) -> StoreResult<std::collections::HashMap<PageId, u32>> {
+    ) -> StoreResult<std::collections::HashMap<PageId, crate::belief::BeliefInputs>> {
         if page_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -4143,21 +4175,63 @@ impl ReaderPool {
             let placeholders = std::iter::repeat_n("?", page_id_blobs.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
-                "SELECT page_id, COUNT(*) FROM page_evidence \
+            let mut out: std::collections::HashMap<PageId, crate::belief::BeliefInputs> =
+                std::collections::HashMap::new();
+
+            // Evidence aggregate: total rows, distinct supporting sessions, and
+            // the newest sighting, in one grouped pass.
+            let evidence_sql = format!(
+                "SELECT page_id, COUNT(*), \
+                        COUNT(DISTINCT CASE WHEN source_kind IN ('session','reconsolidation') \
+                                            THEN source_id END), \
+                        MAX(created_at) \
+                 FROM page_evidence \
                  WHERE page_id IN ({placeholders}) GROUP BY page_id"
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare(&evidence_sql)?;
+            let rows = stmt.query_map(params_from_iter(page_id_blobs.iter()), |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                let distinct: i64 = row.get(2)?;
+                let newest: Option<i64> = row.get(3)?;
+                Ok((id, count, distinct, newest))
+            })?;
+            for r in rows {
+                let (id, count, distinct, newest) = r?;
+                out.insert(
+                    PageId::from_slice(&id)?,
+                    crate::belief::BeliefInputs {
+                        evidence_count: u32::try_from(count).unwrap_or(u32::MAX),
+                        distinct_sessions: u32::try_from(distinct).unwrap_or(u32::MAX),
+                        newest_evidence_us: newest,
+                        unresolved_contradictions: 0,
+                    },
+                );
+            }
+
+            // Live contradictions each page declares. Only edges whose target
+            // resolves to a latest page count — a dangling `contradicts` is
+            // stale, not an active disagreement (mirrors the lint split).
+            let contradiction_sql = format!(
+                "SELECT l.from_page_id, COUNT(*) \
+                 FROM links l \
+                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
+                 WHERE l.link_type = 'contradicts' \
+                   AND l.from_page_id IN ({placeholders}) \
+                 GROUP BY l.from_page_id"
+            );
+            let mut stmt = conn.prepare(&contradiction_sql)?;
             let rows = stmt.query_map(params_from_iter(page_id_blobs.iter()), |row| {
                 let id: Vec<u8> = row.get(0)?;
                 let n: i64 = row.get(1)?;
-                Ok((id, u32::try_from(n).unwrap_or(u32::MAX)))
+                Ok((id, n))
             })?;
-            let mut out = std::collections::HashMap::new();
             for r in rows {
                 let (id, n) = r?;
-                out.insert(PageId::from_slice(&id)?, n);
+                let entry = out.entry(PageId::from_slice(&id)?).or_default();
+                entry.unresolved_contradictions = u32::try_from(n).unwrap_or(u32::MAX);
             }
+
             Ok(out)
         })
         .await
@@ -4867,18 +4941,13 @@ impl ReaderPool {
                 include_superseded,
             )
             .await?;
-        // Evidence counts (P2, docs/design-hindsight-borrowings.md §3) are
-        // explain-only: one batch query over the already-fused result page
-        // ids, never a per-hit query on the hot default path.
-        let page_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
-        let counts = self.page_evidence_counts(&page_ids).await?;
+        // Belief-strength fields (`evidence_count`, `confidence`,
+        // `belief_factor`; P2, docs/design-hindsight-borrowings.md §3) are
+        // populated inside the explained path of `hybrid_search_inner` from one
+        // batched query — never per-hit — so no second pass is needed here.
         Ok(hits
             .into_iter()
-            .map(|(hit, explain)| {
-                let mut explain = explain.unwrap_or_default();
-                explain.evidence_count = Some(counts.get(&hit.id).copied().unwrap_or(0));
-                (hit, explain)
-            })
+            .map(|(hit, explain)| (hit, explain.unwrap_or_default()))
             .collect())
     }
 
@@ -5181,18 +5250,69 @@ impl ReaderPool {
                 .await?
         };
         authorities.extend(extra_authorities);
+
+        // Belief-strength (P2, docs/design-hindsight-borrowings.md §3).
+        // Fetched only when needed: an explained query exposes
+        // `confidence`/`evidence_count` inertly, and a positive weight folds
+        // confidence into the authority factor. The default, non-explained,
+        // weight-off path skips the query entirely and ranks byte-identically.
+        let belief_weight = tuning.belief_authority_weight;
+        let need_belief = explain || belief_weight > 0.0;
+        let belief_inputs = if need_belief {
+            let ids: Vec<PageId> = out.iter().map(|(hit, _)| hit.id).collect();
+            self.page_belief_inputs(&ids).await?
+        } else {
+            std::collections::HashMap::new()
+        };
+        // Anti-entrenchment: a supersession always wins regardless of count
+        // (invariant #16). A superseded version's stale evidence must not boost
+        // it, so the fold skips those ids. Only needed on the opt-in
+        // include_superseded path — the default path returns latest only.
+        let boost_skip = if belief_weight > 0.0 && include_superseded {
+            let ids: Vec<PageId> = out.iter().map(|(hit, _)| hit.id).collect();
+            self.superseded_page_ids(workspace_id, project_id, ids)
+                .await?
+        } else {
+            std::collections::HashSet::new()
+        };
+        let belief_now = now_us();
         for (hit, explain) in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
-                let factor = authority.factor_for(session_recall, tuning.session_recall_bonus);
+                let base = authority.factor_for(session_recall, tuning.session_recall_bonus);
+                // Belief confidence is one more bounded factor folded *inside*
+                // the existing authority clamp — never a new multiplier tower.
+                let (confidence, belief_add) = if need_belief {
+                    let inputs = belief_inputs.get(&hit.id).copied().unwrap_or_default();
+                    let confidence = crate::belief::confidence(&inputs, belief_now);
+                    let add = if belief_weight > 0.0 && !boost_skip.contains(&hit.id) {
+                        Some(belief_weight * confidence)
+                    } else {
+                        None
+                    };
+                    (Some((inputs, confidence)), add)
+                } else {
+                    (None, None)
+                };
+                let factor = match belief_add {
+                    Some(add) => (base + add).clamp(0.55, 1.50),
+                    None => base,
+                };
                 hit.rank = apply_rank_multiplier(hit.rank, factor);
                 // `fused` stays the raw RRF sum; without the multiplier
                 // beside it the explain could not account for the rank it
                 // returns, which is the whole point of the surface.
                 if let Some(details) = explain {
                     details.authority = Some(factor);
+                    if let Some((inputs, confidence)) = confidence {
+                        details.evidence_count = Some(inputs.evidence_count);
+                        details.confidence = Some(confidence);
+                        details.belief_factor = belief_add;
+                    }
                     if session_recall {
                         details.intent = Some("session_recall");
-                        details.intent_boost = Some(factor / authority.factor);
+                        // Report the routing lift over the pre-belief base so
+                        // the two factors stay separable in explain.
+                        details.intent_boost = Some(base / authority.factor);
                     }
                 }
             }
@@ -5569,6 +5689,7 @@ impl ReaderPool {
                 pages_all: count(conn, "SELECT COUNT(*) FROM pages")?,
                 sessions: count(conn, "SELECT COUNT(*) FROM sessions")?,
                 observations: count(conn, "SELECT COUNT(*) FROM observations")?,
+                evidence_rows: count(conn, "SELECT COUNT(*) FROM page_evidence")?,
             };
 
             let activity_7d = window_activity(conn, 7, cutoff_7d)?;
@@ -5744,6 +5865,14 @@ impl ReaderPool {
                 observations: count_project(
                     conn,
                     "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1 AND project_id = ?2",
+                    workspace_id,
+                    project_id,
+                )?,
+                evidence_rows: count_project(
+                    conn,
+                    "SELECT COUNT(*) FROM page_evidence pe \
+                     JOIN pages p ON p.id = pe.page_id \
+                     WHERE p.workspace_id = ?1 AND p.project_id = ?2",
                     workspace_id,
                     project_id,
                 )?,
@@ -6221,6 +6350,13 @@ impl ReaderPool {
                 observations: count_workspace(
                     conn,
                     "SELECT COUNT(*) FROM observations WHERE workspace_id = ?1",
+                    workspace_id,
+                )?,
+                evidence_rows: count_workspace(
+                    conn,
+                    "SELECT COUNT(*) FROM page_evidence pe \
+                     JOIN pages p ON p.id = pe.page_id \
+                     WHERE p.workspace_id = ?1",
                     workspace_id,
                 )?,
             };
@@ -8313,11 +8449,13 @@ impl ReaderPool {
             let pages_all: u64 = count(conn, "SELECT COUNT(*) FROM pages")?;
             let sessions: u64 = count(conn, "SELECT COUNT(*) FROM sessions")?;
             let observations: u64 = count(conn, "SELECT COUNT(*) FROM observations")?;
+            let evidence_rows: u64 = count(conn, "SELECT COUNT(*) FROM page_evidence")?;
             Ok(StatusCounts {
                 pages_latest,
                 pages_all,
                 sessions,
                 observations,
+                evidence_rows,
             })
         })
         .await
@@ -8523,11 +8661,22 @@ impl ReaderPool {
                 workspace_id,
                 project_id,
             )?;
+            // page_evidence carries no scope columns of its own; join through
+            // pages to keep the count per-project (3-tuple identity, #4).
+            let evidence_rows = count_project(
+                conn,
+                "SELECT COUNT(*) FROM page_evidence pe \
+                 JOIN pages p ON p.id = pe.page_id \
+                 WHERE p.workspace_id = ?1 AND p.project_id = ?2",
+                workspace_id,
+                project_id,
+            )?;
             Ok(StatusCounts {
                 pages_latest,
                 pages_all,
                 sessions,
                 observations,
+                evidence_rows,
             })
         })
         .await
