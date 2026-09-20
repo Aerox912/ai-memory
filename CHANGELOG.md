@@ -68,6 +68,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverses what the reader sees; a NUL additionally made the markdown file
   binary, costing it `grep` and git diffs. Tabs, newlines and carriage returns
   are kept. (#800)
+- A page write is refused when another live page in the same project differs
+  from it only by case or Unicode normalization. Such a pair is one file on
+  macOS (APFS) and Windows (NTFS), so creating the second silently overwrote
+  the first page's file while the index kept both rows, so reads for either path
+  then returned the survivor's body, and the wiki watcher superseded the
+  overwritten row, losing the original content from disk and index alike. The
+  refusal names both paths, applies on every platform (the wiki is synced
+  between them), and leaves supersedes of an existing path untouched.
+  `reindex` skips such a pair instead of failing the whole rebuild, reports the
+  count, and logs each one. (#799)
 
 ## [2.3.2] - 2026-09-20
 
