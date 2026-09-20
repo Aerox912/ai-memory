@@ -4,6 +4,7 @@
 
 mod abstract_backfill;
 mod access_breadth_sweep;
+mod compaction_sweep;
 mod embed_backfill;
 mod embeddings;
 mod lifecycle;

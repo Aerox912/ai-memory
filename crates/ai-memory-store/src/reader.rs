@@ -3979,7 +3979,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json, expires_at, salience \
+                        frontmatter_json, expires_at, salience, compacted_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -9060,6 +9060,12 @@ pub struct DecayCandidate {
     /// Per-page salience once explicit feedback has moved it (V37);
     /// `None` means "use `DecayParams::salience_default`".
     pub salience: Option<f64>,
+    /// A2 tier-down marker (V65): microseconds since epoch when this page was
+    /// extractively compacted, or `None` if it has never been compacted. The
+    /// forget sweep and the curator both skip a page whose marker is set so a
+    /// deliberately-short compacted page is never re-compacted or re-classified
+    /// as a fresh cold candidate.
+    pub compacted_at_us: Option<i64>,
 }
 
 /// One forget-sweep tombstone eligible for permanent cleanup.
@@ -9084,6 +9090,7 @@ fn row_to_decay_candidate(
     let frontmatter_json: String = row.get(7)?;
     let expires_at_us: Option<i64> = row.get(8)?;
     let salience: Option<f64> = row.get(9)?;
+    let compacted_at_us: Option<i64> = row.get(10)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -9095,6 +9102,7 @@ fn row_to_decay_candidate(
         frontmatter_json,
         expires_at_us,
         salience,
+        compacted_at_us,
     ))
 }
 
@@ -9110,6 +9118,7 @@ fn materialise_decay_candidate(
     frontmatter_json: String,
     expires_at_us: Option<i64>,
     salience: Option<f64>,
+    compacted_at_us: Option<i64>,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
@@ -9124,6 +9133,7 @@ fn materialise_decay_candidate(
         frontmatter_json,
         expires_at_us,
         salience,
+        compacted_at_us,
     })
 }
 

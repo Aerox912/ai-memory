@@ -670,6 +670,7 @@ mod tests {
             frontmatter_json: r#"{"title": "A session nobody reopened"}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
 
         let default_lambda =
@@ -707,6 +708,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         }];
         let findings = rule_based_findings(&candidates, STALE_DAYS);
         assert_eq!(findings.len(), 1);
@@ -726,6 +728,7 @@ mod tests {
             frontmatter_json: r#"{"title": "Karpathy Wiki"}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let b = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
@@ -752,6 +755,7 @@ mod tests {
             frontmatter_json: r#"{"title": ""}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let blank = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
@@ -781,6 +785,7 @@ mod tests {
                 .into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let findings = rule_based_findings(&[candidate], STALE_DAYS);
         let rules: Vec<_> = findings
@@ -807,6 +812,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let findings = rule_based_findings(&[candidate], STALE_DAYS);
         assert!(
@@ -831,6 +837,7 @@ mod tests {
             frontmatter_json: r#"{"title": "Karpathy Wiki", "kind": "fact"}"#.into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         };
         let findings = rule_based_findings(&[candidate], STALE_DAYS);
         assert!(
@@ -887,6 +894,7 @@ mod tests {
             frontmatter_json: "{}".into(),
             expires_at_us: None,
             salience: None,
+            compacted_at_us: None,
         }];
         // rule_based_findings is the exact code path that `use_llm=false`
         // keeps active. Confirm it still fires.

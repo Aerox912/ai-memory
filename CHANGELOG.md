@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Extractive tier-down of cold episodic pages (design-memory-aging.md bucket
+  A2): instead of evicting a cold episodic page, the forget-sweep can now
+  *compact* it — keeping the L0 frontmatter `abstract:`, an L1 first-paragraph
+  summary, and an L2 regex-mined keep-token set (file paths, URLs, inline-code
+  spans, error codes, `UPPER_SNAKE` constants and long identifiers), and
+  dropping the prose body. Tier-down beats eviction because the durable facts
+  survive while the expensive, low-signal prose does not. It is **opt-in and
+  off by default** via `[decay] compact_cold_episodic` (a `false` default, so an
+  upgrade changes nothing until an operator opts in), fully zero-LLM (regex
+  only), and **reversible and non-destructive**: the rewrite goes through the
+  wiki layer, so the full pre-compaction body stays reachable in git history and
+  the supersession chain and is recoverable with `restore-page`. A new `V65`
+  migration adds a nullable `pages.compacted_at` marker (additive `ADD COLUMN`,
+  no backfill; populated lazily by the sweep from a `compacted: true` frontmatter
+  mirror) so the sweep and the curator tell a deliberately-short compacted page
+  from a cold one — a compacted page is never re-compacted, re-evicted, or
+  re-reported as cold. Only unpinned episodic pages compact; pinned/semantic/
+  procedural pages are never touched. Every run reports what it compacted in the
+  `SweepReport`. Ships opt-in/off; the R2 recall no-regression proof is the gate
+  before any future default-on. No new MCP tool (still 23) (#808).
 - Per-tier retention half-life curves (design-memory-aging.md bucket A1): the
   forget-sweep's decay rate can now be tuned per memory tier via an opt-in
   `[decay.half_life_days]` config table, replacing the single global λ. Each

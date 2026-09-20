@@ -92,6 +92,7 @@ dependencies = [
  "async-trait",
  "git2",
  "jiff",
+ "regex",
  "rusqlite",
  "schemars",
  "serde",
