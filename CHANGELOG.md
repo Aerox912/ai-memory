@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be silently wiped) — hence **no new migration**, and no new MCP tool (still
   23). The scan is bounded: one embeddings load over the already-bounded cold
   set, capped page and finding counts, deterministic ordering (invariant #2)
-  (#813).
+  (#814).
 - Cold-cluster dedup of near-duplicate episodic pages (design-memory-aging.md
   bucket A3): the forget-sweep can now cluster near-duplicate cold episodic
   pages by embedding (cosine-distance DBSCAN with an adaptive k-distance eps,
