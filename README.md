@@ -53,6 +53,26 @@ ai-memory is what's on the other side of those walls.
   uses **zero LLM calls**: capture, search, and handoffs all work with no
   API key at all.
 
+- **It ages gracefully, without an LLM.** Memory decays on a schedule you
+  can tune per tier, and the memory you actually use decays *slower* — open a
+  page, search it, or reach it through a link and it earns its keep. When
+  episodic notes go cold they can be compacted down to their durable facts
+  (file paths, error codes, decisions) instead of dropped, near-duplicates
+  collapse into one, and likely contradictions get flagged — all with **zero
+  API calls**. Nothing is hard-deleted: the original stays in git and the
+  version chain (`restore-page` brings it back). Access-weighted retention is
+  always on because it can only ever keep memory *longer*; the parts that
+  rewrite or drop content (compaction, dedup, per-tier curves) stay off by
+  default until you turn them on.
+
+- **And it can dream, if you let it.** Point it at an LLM and an opt-in
+  background pass will, while you're idle, rewrite whole clusters of cold
+  notes into single coherent pages — cancelling the moment you come back to
+  work. It never deletes a source (the pre-merge versions stay reachable),
+  it's off by default, and it's gated on a recall eval before it could ever
+  become default behavior. The zero-LLM path above is what runs unless you
+  ask for more.
+
 - **It tells you the truth about itself.** One self-contained binary.
   Purge commands that say exactly what "deleted" means. A measured write
   ceiling (~700/s) instead of a guessed one. An audit log of every
@@ -132,16 +152,19 @@ each, and what you gain:
 |---|---|---|
 | **Mem0 / fact extractors** (LangMem) | Automatic per-turn capture | Memory compiles into readable **pages** you own and edit, not opaque fact rows; retrieval fuses FTS + entity + graph (+ optional vectors), not vector-only |
 | **Zep / Graphiti** (temporal KG) | Temporal reasoning, typed relations | Bi-temporal-lite (`as_of`, version-filtered search) and typed edges without standing up a graph database — on one binary |
-| **mcp-memory-service** (closest sibling) | SQLite + local embeddings, hook capture, typed edges, honest numbers | Human-editable markdown **pages** instead of fact-rows, plus cross-agent handoffs as a first-class, claim-once protocol |
+| **mcp-memory-service** (closest sibling) | SQLite + local embeddings, hook capture, typed edges, honest numbers — and, on 2.4, per-tier decay curves, extractive compression, DBSCAN cold-cluster dedup, access reinforcement, and contradiction flagging | Human-editable markdown **pages** instead of fact-rows, cross-agent claim-once handoffs, and the same aging machinery done **zero-LLM by default, reversibly** (supersede-not-delete + `restore-page`), and **off by default** |
 | **basic-memory** (file-first sibling) | Markdown-on-disk as the source of truth | Automatic lifecycle capture and a derived FTS/entity/graph index on top, cross-agent handoffs, and multi-user sharing built in |
 | **Claude Code built-in memory** | "Remember my project" convenience, zero setup | Synced across machines and agents, searchable, team-capable, and captures tool lifecycle — not a per-laptop `MEMORY.md` |
-| **Hindsight / OpenViking** (hosted, LLM-required) | Living pages / document memory with a background consolidation loop | A self-contained binary that runs zero-LLM by default and keeps memory in files you own; per-project team sharing instead of strict per-bank isolation |
+| **Hindsight / OpenViking** (hosted, LLM-required) | Living pages / document memory with a background consolidation loop — and, on 2.4, belief-strength confidence plus an opt-in LLM "dream" rewrite of cold clusters | A self-contained binary that runs zero-LLM by default and keeps memory in files you own; per-project team sharing instead of strict per-bank isolation; the dream/belief features are **opt-in, off by default, and never delete a source** (vs a mandatory LLM loop) |
 | **Supermemory / LiquidLM** (hosted memory API) | A managed second brain with automatic ingestion | Git-versioned markdown you own, no required API spend, offline operation, and per-project team sharing — ai-memory remembers *this repo*, not a general vault |
 
 The consistent theme: **files you own** (git-backed markdown), a **zero-LLM
 default**, **one self-contained binary**, **cross-agent + cross-machine + team**
 sharing, **automatic lifecycle capture**, and **typed, claim-once handoffs**.
-Opt-in features (LLM consolidation, vector search) stay opt-in.
+Opt-in features (LLM consolidation, vector search, the "dream" consolidation
+pass, belief-strength in ranking) stay opt-in — and the zero-LLM aging path
+(per-tier decay, extractive compaction, dedup, contradiction flagging,
+access-weighted retention) works with no API key at all.
 
 **Built on the shoulders of:** the
 [Karpathy LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
