@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
+  provider credentials and host-config env vars as the POSIX wrapper into the
+  helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
+  Copilot token, `OPENCODE_API_KEY`, `CLAUDE_CONFIG_DIR`, or
+  `AI_MEMORY_WORKSTREAM_ID` previously never reached `Config::load`, so
+  `llm-test`, Copilot auth, OpenCode, and a relocated Claude config all
+  reported "not configured" on native Windows Docker Desktop even though the
+  same export worked through `bin/ai-memory`. The POSIX wrapper also now
+  forwards `OPENCODE_API_KEY`.
+
 ## [2.3.2] - 2026-09-20
 
 ### Changed
