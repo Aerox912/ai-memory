@@ -186,6 +186,37 @@ System service installs use `/var/lib/ai-memory` and `/etc/ai-memory/` via the
 packaged unit. Full user-service, system-service, auth, and provider setup is in
 [`docs/install.md#arch-linux-native-packages-aur`](docs/install.md#arch-linux-native-packages-aur).
 
+### macOS (menu bar app)
+
+A self-contained `.app` that bundles the native `ai-memory` binary and
+`hooks/` tree, starts the existing LaunchAgent, and opens `/web`,
+`ai-memory status`, and `config.toml` from the menu bar. Wiki, SQLite,
+config, and models stay in `~/Library/Application Support/ai-memory`, so
+replacing the app is an update — it does not rewrite that tree.
+
+Needs a Rust toolchain and Xcode / Swift 6 (same as a source build):
+
+```bash
+git clone https://github.com/akitaonrails/ai-memory
+cd ai-memory
+./companions/ai-memory-macos/build.sh
+open "companions/ai-memory-macos/dist/AI Memory.app"
+```
+
+Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
+from the menu extra (no Dock icon). When the status item is green, wire an
+agent with the bundled binary:
+
+```bash
+BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
+"$BIN" install-mcp --client claude-code --apply
+"$BIN" install-hooks --agent claude-code --apply
+```
+
+Prebuilt tarball and launchd-without-the-app paths:
+[`docs/macos.md`](docs/macos.md). Companion details:
+[`companions/ai-memory-macos`](companions/ai-memory-macos).
+
 ### Docker
 
 You need: Docker or Podman + an agent CLI from the [Support Matrix](#support-matrix),
@@ -259,8 +290,9 @@ wrapper automatically uses Podman when Docker is not installed. Set
 On Linux/macOS, that's it. Start a Claude Code session as usual - every
 prompt and tool call now lands in ai-memory, and the next session you
 open in this project will see a handoff with where you left off.
-On macOS, the native release binary is also supported and recommended when you
-do not need Docker; see [`docs/macos.md`](docs/macos.md).
+On macOS the native binary is the recommended path when you do not need
+Docker — either the [menu bar app](#macos-menu-bar-app) above or a
+[release tarball / launchd agent](docs/macos.md).
 
 Wiring another agent is the same two commands with a different name —
 `--client codex`, `--agent codex`, and so on for every row of the support
@@ -386,7 +418,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/agent-messaging.md`](docs/agent-messaging.md) | Cross-project agent-to-agent messaging: a directed, claim-once inbox/queue plus the on-start "you have mail" notice. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
-| [`docs/macos.md`](docs/macos.md) | macOS install paths: native release binary (recommended), source build, the Docker wrapper, and current limitations. |
+| [`docs/macos.md`](docs/macos.md) | macOS install paths: menu bar app, native release tarball, source build, Docker wrapper, launchd, and current limitations. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes, handoff-injection limits, and community bridge guidance. |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
