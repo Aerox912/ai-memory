@@ -9,7 +9,7 @@ use std::time::Duration;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint, run_sweep_with_compaction,
+    run_lint,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -1564,11 +1564,23 @@ async fn start_maintenance_scheduler(
     let lint_interval_secs = settings.lint_interval_secs;
     let embedding_backfill_interval_secs = settings.embedding_backfill_interval_secs;
 
+    // A3 cold-cluster dedup targets the running server's configured embedder
+    // coordinate; with no embedder it is `None`, making A3 a clean no-op even
+    // when the flag is set (there are no stored vectors to cluster).
+    let dedup_embedding = embedder
+        .as_ref()
+        .map(|e| ai_memory_consolidate::EmbeddingCoord {
+            provider: e.provider().to_string(),
+            model: e.model().to_string(),
+            dim: e.dim(),
+        });
+
     let mut tasks = Vec::new();
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
+        let dedup_embedding = dedup_embedding.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             run_persisted_maintenance_job(
@@ -1594,6 +1606,7 @@ async fn start_maintenance_scheduler(
                     let writer = writer.clone();
                     let wiki = wiki.clone();
                     let decay = decay;
+                    let dedup_embedding = dedup_embedding.clone();
                     async move {
                         let started = std::time::Instant::now();
                         let outcome = run_scheduled_sweep_tick(
@@ -1604,6 +1617,7 @@ async fn start_maintenance_scheduler(
                             decay.breadth_weight,
                             decay.observation_retention(),
                             decay.compact_cold_episodic,
+                            decay.cold_cluster_dedup(dedup_embedding),
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -1805,6 +1819,7 @@ async fn start_maintenance_scheduler(
                 ai_memory_consolidate::ExperienceConfig {
                     sessions: scheduler.experience_sessions.max(1),
                     min_new_sessions: scheduler.experience_every_sessions,
+                    entropy_filter: scheduler.experience_entropy_filter,
                     ..ai_memory_consolidate::ExperienceConfig::default()
                 }
             }),
@@ -1878,6 +1893,7 @@ struct ScheduledSweepTickOutcome {
     errors: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
@@ -1886,6 +1902,7 @@ async fn run_scheduled_sweep_tick(
     breadth_weight: f64,
     retention: ObservationRetention,
     compact_cold_episodic: bool,
+    dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1894,7 +1911,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_compaction(
+        match ai_memory_consolidate::run_sweep_with_hygiene(
             reader,
             writer,
             Some(wiki),
@@ -1904,6 +1921,7 @@ async fn run_scheduled_sweep_tick(
             breadth_weight,
             retention,
             compact_cold_episodic,
+            dedup.clone(),
             false,
         )
         .await
@@ -3665,6 +3683,7 @@ mod tests {
             0.0,
             ObservationRetention::default(),
             false,
+            ai_memory_consolidate::ColdClusterDedup::default(),
         )
         .await
         .unwrap();

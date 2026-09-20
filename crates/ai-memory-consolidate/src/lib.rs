@@ -12,10 +12,12 @@ pub mod auto_improve;
 pub mod auto_improve_schedule;
 pub mod auto_improve_telemetry;
 pub mod bootstrap;
+pub mod cold_cluster;
 pub mod compaction;
 pub mod consolidator;
 pub mod curator;
 pub mod embed;
+pub mod entropy_filter;
 pub mod experience;
 pub mod keep_tokens;
 pub mod lint;
@@ -54,6 +56,7 @@ pub use bootstrap::{
     derive_project_name, discover_main_repo_root, discover_repo_root, effective_chunk_budget,
     plan_bootstrap_chunks, prune_sources_to_budget,
 };
+pub use cold_cluster::{adaptive_eps, cosine_distance, dbscan};
 pub use compaction::build_compacted_markdown;
 pub use consolidator::{
     BATCH_SYSTEM_PROMPT, Consolidator, ConsolidatorError, ConsolidatorResult,
@@ -67,12 +70,14 @@ pub use curator::{
 pub use embed::{
     EmbedBackfillCounts, EmbedBackfillError, EmbedBackfillOptions, run_embedding_backfill,
 };
+pub use entropy_filter::{EntropyFilterConfig, FilterVerdict, SkipReason, classify};
 pub use experience::{EXPERIENCE_SYSTEM_PROMPT, ExperienceConfig, run_experience_review};
 pub use keep_tokens::mine_keep_tokens;
 pub use lint::{LintError, LintFinding, LintOptions, LintReport, run_lint, stale_days_for};
 pub use sweep::{
-    CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EvictedPage, ObservationRetention, SweepError,
-    SweepReport, run_sweep, run_sweep_with_breadth, run_sweep_with_compaction,
+    ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
+    MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,
+    run_sweep_with_breadth, run_sweep_with_compaction, run_sweep_with_hygiene,
     run_sweep_with_options,
 };
 pub use types::{

@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Cold-cluster dedup of near-duplicate episodic pages (design-memory-aging.md
+  bucket A3): the forget-sweep can now cluster near-duplicate cold episodic
+  pages by embedding (cosine-distance DBSCAN with an adaptive k-distance eps,
+  `minPts = 2`) and collapse each cluster to one survivor — the highest-retention
+  member, its body the *extractive union* of the cluster's keep-tokens, so every
+  member's durable facts survive — superseding the other members with a merge
+  note that points at the survivor. It runs only over the bounded cold-episodic
+  candidate set the sweep already materialises (never O(N²) over the whole
+  corpus), is **opt-in and off by default** via `[decay] dedup_cold_clusters`
+  (a `false` default), and fully **zero generative LLM**: it reads only
+  already-stored embeddings, so with no embedder configured — or no embeddings
+  for the configured `(provider, model, dim)` triple — it is a clean no-op, not
+  an error. The eps is clamped to a conservative ceiling (`[decay] dedup_max_eps`,
+  default cosine distance ≈ 0.15) so it errs toward NOT merging. **Non-destructive
+  and reversible**: no source is ever hard-deleted — every merged-away member
+  stays reachable via the supersession chain and git history and is recoverable
+  with `restore-page` (invariant #16) — and the merge provenance is recorded in
+  `page_evidence`. Every run reports its collapses in the `SweepReport`. Reuses
+  existing tables: **no new migration**, and no new MCP tool (still 23). Ships
+  opt-in/off; the R2 recall no-regression proof is the gate before any future
+  default-on (#809).
+- Entropy / boilerplate pre-filter before consolidation (design-memory-aging.md
+  bucket A4): a pure, zero-LLM Shannon-entropy + boilerplate gate that skips
+  low-information session pages (near-empty, whitespace, single-character, or
+  highly-repetitive boilerplate) from the cross-session experience consolidation
+  pass *before* they reach the LLM prompt, the eval gate, or `apply_batch`.
+  It is **advisory and non-destructive** — a skipped page is not consolidated,
+  never deleted (invariant #16) — and **opt-in / off by default** via
+  `[auto_improve.scheduler.experience_entropy_filter]` (a `false` default with
+  conservative, validated thresholds tuned so a terse-but-informative note with
+  a file path and an error code is KEPT), so an upgrade changes no consolidation
+  output until an operator opts in. Every run surfaces the skip count in the
+  experience report warnings. No schema change and no new MCP tool (still 23)
+  (#809).
 - Extractive tier-down of cold episodic pages (design-memory-aging.md bucket
   A2): instead of evicting a cold episodic page, the forget-sweep can now
   *compact* it — keeping the L0 frontmatter `abstract:`, an L1 first-paragraph
