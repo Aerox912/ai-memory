@@ -1983,6 +1983,10 @@ async fn run_scheduled_lint_tick(
                 dry_run: false,
                 use_llm: false,
                 decay_lambda,
+                // The automatic scheduled lint stays rule-based: the A5
+                // contradiction detector is on for the user-invoked
+                // `memory_lint` / admin lint, not the background sweep.
+                embedding: None,
             },
         )
         .await

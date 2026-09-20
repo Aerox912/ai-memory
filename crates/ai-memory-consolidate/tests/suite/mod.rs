@@ -6,6 +6,7 @@ mod abstract_backfill;
 mod access_breadth_sweep;
 mod cold_cluster_sweep;
 mod compaction_sweep;
+mod contradiction_lint;
 mod embed_backfill;
 mod embeddings;
 mod entropy_experience;

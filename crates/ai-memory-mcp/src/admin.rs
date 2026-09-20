@@ -3442,6 +3442,16 @@ async fn handle_lint(
             dry_run: req.dry_run,
             use_llm: !req.no_llm,
             decay_lambda: state.decay_params.lambda,
+            // Zero-LLM contradiction detection (A5) off the configured
+            // embedder's triple; `None` ⇒ clean no-op.
+            embedding: state
+                .embedder
+                .as_ref()
+                .map(|e| ai_memory_consolidate::EmbeddingCoord {
+                    provider: e.provider().to_string(),
+                    model: e.model().to_string(),
+                    dim: e.dim(),
+                }),
         },
     )
     .await

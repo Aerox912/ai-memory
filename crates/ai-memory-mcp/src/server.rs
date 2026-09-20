@@ -3058,6 +3058,17 @@ impl AiMemoryServer {
                 dry_run: args.dry_run.unwrap_or(false),
                 use_llm: !args.no_llm.unwrap_or(false),
                 decay_lambda: self.decay_params.lambda,
+                // Drive the zero-LLM contradiction detector (A5) off the
+                // configured embedder's triple; `None` when no embedder is
+                // configured makes that pass a clean no-op.
+                embedding: self
+                    .embedder
+                    .as_ref()
+                    .map(|e| ai_memory_consolidate::EmbeddingCoord {
+                        provider: e.provider().to_string(),
+                        model: e.model().to_string(),
+                        dim: e.dim(),
+                    }),
             },
         )
         .await
