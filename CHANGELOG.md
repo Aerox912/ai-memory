@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The privacy strip now redacts Windows credential paths (`C:\Users\…\.ssh`,
+  `.aws`, `.kube`, `.gnupg`, `.config\gcloud`). The previous patterns required
+  a POSIX `/` separator, so a captured tool result that echoed a native
+  Windows path stored the profile directory and key file name verbatim.
+
 ## [2.3.2] - 2026-09-20
 
 ### Changed
