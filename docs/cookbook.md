@@ -1,7 +1,8 @@
 # ai-memory cookbook
 
 A task-oriented cheat sheet: "I want to do X" → how. For the full reference see
-[`ARCHITECTURE.md`](ARCHITECTURE.md); for install see [`install.md`](install.md);
+[`ARCHITECTURE.md`](ARCHITECTURE.md); for install see [`install.md`](install.md)
+(including the [macOS menu bar app](install.md#macos-menu-bar-app));
 for the tool-routing table see [`usage.md`](usage.md).
 
 ## What ai-memory is, in one paragraph
@@ -120,6 +121,30 @@ compacted or merged stays in git and the supersession chain, recoverable with
   project's context here: cross-project messaging — "send project-b a request to
   add the export endpoint" (`memory_message_send`), and over there "check my
   inbox" (`memory_message_pop`). See [`agent-messaging.md`](agent-messaging.md).
+
+## Recipe: run the server on a Mac
+
+Use the menu bar app when you want one `.app` that starts the server and
+opens the existing tools (web UI, `ai-memory status`, config, logs). It does
+not replace those tools with a second dashboard.
+
+```bash
+./companions/ai-memory-macos/build.sh
+open "companions/ai-memory-macos/dist/AI Memory.app"
+```
+
+Drag **AI Memory.app** to `/Applications`, then **Install & Start Server**
+from the menu extra. Wire an agent with the bundled binary:
+
+```bash
+BIN="/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory"
+"$BIN" install-mcp --client claude-code --apply
+"$BIN" install-hooks --agent claude-code --apply
+```
+
+Memory stays in `~/Library/Application Support/ai-memory`. Replacing the
+`.app` does not rewrite it. Full paths (tarball, source, Docker, launchd):
+[`macos.md`](macos.md).
 
 ## From the terminal (CLI)
 
