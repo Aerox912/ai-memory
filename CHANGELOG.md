@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed `Ctrl+C` at the native-session chooser leaving the launcher alive and
+  renewing its workstream lease. Cancelling now releases the acquired run and
+  exits without waiting for Enter or linking a native session (#795).
+
 ## [2.3.2] - 2026-09-20
 
 ### Changed
