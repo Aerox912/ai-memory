@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Access reinforcement on the remaining read paths (design-memory-aging.md
+  bucket C1): `memory_read_page` (a direct by-path/by-query read), its
+  `include_related` link-graph walk (the walked neighbours, not just the seed),
+  and `memory_explore` (the pages it surfaces — rules, slots, recent, pinned,
+  settled) now bump `access_count` + `last_accessed_at` exactly as
+  `memory_query` and `memory_recent` already do. A page a human opens directly,
+  or one the graph surfaces, is *used* and now resists decay like a search hit.
+  Reuses the sanctioned reinforcement path: fire-and-forget on the single-writer
+  actor, throttled to ≤1 per (page, operator) per minute, and FTS-exempt. It is
+  strictly additive — reinforcement only raises retention scores, never blocks,
+  never touches the response payloads, and adds no new MCP tool (still 23)
+  (#798).
 - Reasoning tier on the LLM synthesis paths: an opt-in `reasoning` argument on
   `memory_query` (its `answer` path) and `memory_explore` (borrowed from
   Honcho's reasoning-effort ladder; targets the 2.4 line). The knob is a schema
