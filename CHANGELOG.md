@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The privacy strip now redacts secrets written in JSON. The quote before a
+  value put it outside the value character class, so `{"db_password":"..."}`
+  was stored verbatim while the identical YAML form was redacted, and JSON is
+  the shape most captured tool payloads arrive in. The same rule now also
+  accepts an auth scheme word before the value, so
+  `Authorization: Basic <base64>` (which carries `user:password`) is redacted
+  like the `Bearer` form already was, and covers two unprefixed names the
+  generic env rule missed: Azure `AccountKey=` and npm `_authToken=`.
+- Terminal escape sequences, NUL and bidi override characters are stripped
+  from captured text instead of being stored. Page bodies and observations are
+  replayed to a terminal by `ai-memory read-page` and `ai-memory search`, where
+  an escape rewrites the screen or the window title and a bidi override
+  reverses what the reader sees; a NUL additionally made the markdown file
+  binary, costing it `grep` and git diffs. Tabs, newlines and carriage returns
+  are kept.
+
 ## [2.3.2] - 2026-09-20
 
 ### Changed
