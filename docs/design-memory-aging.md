@@ -412,6 +412,96 @@ progressive-disclosure work in §R7 (which A2's L0/L1/L2 tier-down feeds).
 
 ---
 
+## Migration & upgrade safety (existing stores must not break or lose data)
+
+An upgrade to a 2.4 that ships any of this must open a large, already-migrated
+store cleanly, keep every index consistent, and lose nothing — the bar the
+V62/#776 rollout was held to. This section makes the guarantees explicit, per
+phase, and encodes the lessons from that incident.
+
+### 1. Migrations are additive DDL only; backfills are inert / idempotent / resumable / WAL-bounded
+
+New migrations start at **V65** and are additive. A2's `compacted_at` is an
+`ADD COLUMN` (nullable) — instant, no table rewrite, no lock on a large store.
+No shipped migration's SQL is ever edited in place: doing so trips refinery's
+divergence check, which is exactly why `migrations.rs:33-34` sets
+`set_abort_divergent(false)` (a hash mismatch on an already-applied migration is
+tolerated) while keeping `set_abort_missing(true)` (a store *ahead* of the binary
+fails closed). Any change to a shipped migration must preserve that
+divergence-tolerance handling.
+
+**Any data backfill runs on the boot path, not inside the migration
+transaction** — chunked, resumable, and WAL-checkpointed, mirroring the #776
+precedent for V62: `backfill_page_windows` / `backfill_page_windows_in_batches`
+(`ops.rs:861`, `:867`), which commits in bounded batches
+(`PAGE_WINDOW_BACKFILL_BATCH`, `ops.rs:824`) and checkpoints the WAL after each
+so it never accumulates unbounded WAL on a huge store, and resumes from a cursor
+if interrupted (`ops.rs:830-839`). A backfill is a **fast no-op** on a store that
+doesn't need it (no rows match the predicate). A2 is the only phase here that
+touches page bodies, and it does so lazily through the sweep — there is no
+one-shot body backfill; the marker column is populated as the sweep compacts, not
+in a boot migration.
+
+### 2. No behavior change surprises an existing user on upgrade
+
+- **A1 type/tier retention curves — defaults reproduce current behavior.** The
+  default `half_lives` map is a single ~35-day curve for every tier, byte-identical
+  to today's scalar `λ=0.02` (`decay.rs:38`). An upgrade therefore does **not**
+  mass-evict episodic memory on the first post-upgrade forget-sweep. More
+  aggressive per-tier curves are strictly opt-in via `[decay]` config. (Episodic
+  eviction is already the recoverable cold→tombstone→180-day-grace path, and
+  pinned/semantic/procedural are exempt — but the explicit rule stands regardless:
+  no upgrade mass-evicts.)
+- **A2 extractive tier-down — reversible and non-destructive.** The full body
+  stays in git history and in the supersession chain, so the pre-compaction
+  version is reachable (invariant #16, loser stays reachable; `restore-page`
+  recovers it). Only episodic pages compact, never pinned/semantic/procedural. The
+  `compacted_at` marker (V65) distinguishes a deliberately-short page from a cold
+  one so the sweep never double-processes or re-compacts. Tier-down is opt-in/gated.
+- **A3 cold-cluster dedup + A5 contradiction edges — annotate, never destroy.**
+  A3 collapses via supersession (the merged-away duplicates stay reachable), never
+  a hard delete of a source; A5 only writes an edge and a lint finding
+  (timestamp resolution is advisory). Both use conservative thresholds and are
+  opt-in.
+- **B1 belief-strength → ranking — off by default.** This is the one bucket that
+  changes *retrieval ranking*, so it is OFF by default and gated on an R2 number
+  before it may default on. An existing user sees no ranking change until they opt in.
+- **B2 dream rewrite/merge — never deletes a source.** Originals live in git and
+  the supersession chain; `dry_run` first; R2-gated; opt-in LLM. The zero-LLM
+  default path (#13) is untouched — a provider-less store never runs B2.
+- **C1 access reinforcement on more read paths — strictly non-destructive.** It
+  only raises retention scores (keeps memory a little longer); it can never lower a
+  score or delete anything, and it still cannot block TTL cleanup (the TTL pass
+  runs regardless of how hot a page is). It stays on the throttled/async
+  single-writer path, so there is no hot-path or data-integrity risk.
+
+### 3. Recovery & proof
+
+`serve` startup already writes a **pre-migration safety archive** of the whole
+data directory before applying migrations (#633; `ai-memory-wiki/src/backup.rs`,
+`create_pre_migration_backup` at `:125`, receipt
+`pre-migration-backup.json`, `:21`), and the wiki error path points a stuck user
+at restoring it (`ai-memory-wiki/src/error.rs:51`). Beyond that, every
+state-touching step keeps its source **diffable in git and reachable via
+supersession** until the existing 180-day tombstone grace + hard-delete
+(`DecayParams::hard_delete_after_days`, `decay.rs:43`).
+
+**Proof bar before any release carrying these features** (the #776 / 2.3.2
+model): the full cross-platform CI matrix green on the exact RC SHA, **and** a
+live deploy + verify against the real marvin store — a large, already-migrated
+store opening cleanly, indexes consistent, no data loss — exactly as V62/#776 was
+validated. A green unit suite is not sufficient for anything that mutates stored
+content.
+
+### 4. Downgrade note
+
+Additive columns plus `set_abort_missing(true)` (`migrations.rs:34`) mean an older
+binary opening a newer store **fails closed** with the actionable
+`StoreError::DataSchemaAhead` (`error.rs:36`, raised at `migrations.rs:55`) — it
+names the applied-vs-supported versions and refuses to open, rather than silently
+corrupting a store it doesn't understand. That guarantee must be preserved by
+every new migration.
+
 ## R2 acceptance
 
 R2 is the reproducible LongMemEval-V2 recall-eval harness
