@@ -137,7 +137,12 @@ from hook paths.
    `[decay] breadth_weight` can reward pages reinforced by several distinct
    operators. That bump is throttled to at most once per page per minute, so a
    burst of overlapping searches does not flood the writer actor with
-   redundant reinforcement writes.
+   redundant reinforcement writes. The same reinforcement fires from every
+   read path that surfaces a page, not just search: `memory_read_page` (and its
+   `include_related` walk, which reinforces the walked neighbours too) and
+   `memory_explore` (the pages it surfaces) bump the same counters through the
+   same throttled, FTS-exempt path, so a page a human opens directly or the
+   graph surfaces resists decay like a query hit (design-memory-aging.md C1).
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);

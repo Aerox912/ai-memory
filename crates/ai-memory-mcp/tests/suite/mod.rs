@@ -4,6 +4,7 @@
 
 mod common;
 
+mod access_reinforcement;
 mod admin_audit_log;
 mod admin_backup;
 mod admin_bootstrap;

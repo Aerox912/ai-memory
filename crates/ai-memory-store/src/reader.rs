@@ -1522,6 +1522,13 @@ pub const RELATED_WALK_MAX_NODES: usize = 50;
 /// first reached it.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelatedNode {
+    /// Stable id of the related page's latest version. Carried for access
+    /// reinforcement (C1): `memory_read_page`'s related walk bumps the walked
+    /// pages, not just the seed. `#[serde(skip)]` keeps the wire payload
+    /// byte-identical to a plain `page_links` entry — the id is an internal
+    /// handle, never part of the tool response.
+    #[serde(skip)]
+    pub id: PageId,
     /// Identity of the related page (path/title/kind/workspace/project),
     /// flattened so a node serializes exactly like a `page_links` entry with
     /// two extra fields.
@@ -6811,6 +6818,7 @@ impl ReaderPool {
                                 continue;
                             }
                             results.push(RelatedNode {
+                                id: PageId::from_slice(&id)?,
                                 page,
                                 depth: hop,
                                 direction,
@@ -7404,6 +7412,56 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(id.map(|bytes| PageId::from_slice(&bytes)).transpose()?)
+        })
+        .await
+    }
+
+    /// Resolve the latest-version page ids for a batch of paths within one
+    /// scope, in a single query. Missing/duplicate paths are simply absent from
+    /// the result. Used by `memory_explore` for access reinforcement (C1): it
+    /// surfaces a bounded set of pages by path (rules, slots, recent, pinned,
+    /// settled) and bumps them all through one round-trip rather than a per-page
+    /// N+1 (invariant #2).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_page_ids_by_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        paths: Vec<String>,
+    ) -> StoreResult<Vec<PageId>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            // De-duplicate placeholders and bind (ws, proj) + each distinct path.
+            let mut distinct: Vec<String> = paths;
+            distinct.sort();
+            distinct.dedup();
+            let placeholders = std::iter::repeat_n("?", distinct.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT id FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND path IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let ws_bytes = workspace_id.as_bytes();
+            let proj_bytes = project_id.as_bytes();
+            let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(distinct.len() + 2);
+            binds.push(ws_bytes as &dyn rusqlite::ToSql);
+            binds.push(proj_bytes as &dyn rusqlite::ToSql);
+            for p in &distinct {
+                binds.push(p as &dyn rusqlite::ToSql);
+            }
+            let rows = stmt.query_map(binds.as_slice(), |row| row.get::<_, Vec<u8>>(0))?;
+            let mut ids = Vec::new();
+            for r in rows {
+                ids.push(PageId::from_slice(&r?)?);
+            }
+            Ok(ids)
         })
         .await
     }

@@ -3702,7 +3702,27 @@ impl AiMemoryServer {
             value
         };
 
-        match wiki.read_page(ws, proj, &page_path) {
+        // Access reinforcement (C1): a page opened directly by path/query, and
+        // any page the graph surfaces via the related walk, is *used* and should
+        // resist decay exactly as a `memory_query`/`memory_recent` hit does.
+        // Resolve the seed id and the walked ids up front; the fire-and-forget,
+        // per-(page,operator)-throttled, FTS-exempt `spawn_access_bump` is fired
+        // only on the success paths below, so an error read reinforces nothing.
+        let bump_actor = Self::bump_actor_from_parts(&parts);
+        let mut bump_ids: Vec<PageId> = Vec::new();
+        if let Some(seed_id) = self
+            .reader
+            .latest_page_id_by_ids(ws, proj, page_path.to_string())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        {
+            bump_ids.push(seed_id);
+        }
+        if let Some(nodes) = &related {
+            bump_ids.extend(nodes.iter().map(|n| n.id));
+        }
+
+        let result = match wiki.read_page(ws, proj, &page_path) {
             Ok(md) => {
                 // Derive the title so an empty/absent frontmatter `title`
                 // falls back to the body's H1 (then the path stem), instead
@@ -3766,7 +3786,11 @@ impl AiMemoryServer {
                 }
             }
             Err(disk_err) => Err(McpError::internal_error(disk_err.to_string(), None)),
+        };
+        if result.is_ok() {
+            self.spawn_access_bump(bump_ids, bump_actor.as_ref());
         }
+        result
     }
 
     /// Read one session's raw lifecycle observations, in scope, paged and
@@ -4726,6 +4750,31 @@ impl AiMemoryServer {
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        // Access reinforcement (C1): `memory_explore` surfaces a bounded set of
+        // pages (rules, slots, recent, pinned, settled) — those pages are used
+        // and should resist decay like a `memory_query`/`memory_recent` hit.
+        // The snapshot carries paths, not ids; resolve them in one batched read
+        // (no per-page N+1, invariant #2), then fire the sanctioned throttled,
+        // FTS-exempt, fire-and-forget bump. Same set whether or not an LLM digest
+        // runs — the pages were read either way.
+        let surfaced_paths: Vec<String> = snapshot
+            .rules
+            .iter()
+            .chain(snapshot.slots.iter())
+            .chain(snapshot.recent_pages.iter())
+            .chain(snapshot.pinned.iter())
+            .map(|p| p.path.clone())
+            .chain(snapshot.settled.iter().map(|p| p.path.clone()))
+            .collect();
+        if !surfaced_paths.is_empty() {
+            let ids = self
+                .reader
+                .latest_page_ids_by_paths(ws, proj, surfaced_paths)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            self.spawn_access_bump(ids, Self::bump_actor_from_parts(&parts).as_ref());
+        }
 
         let Some(llm) = &self.consolidator else {
             // No LLM configured — return the structured snapshot.
