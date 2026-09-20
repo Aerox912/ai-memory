@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Bumped `rmcp` to 2.x (2.2.0), resolving three MCP transport advisories:
+  GHSA-9pj6-vhgr-3mwh (unauthenticated Streamable-HTTP session-table leak /
+  DoS), GHSA-33f5-2c5q-wgwj (missing OAuth resource-field validation), and
+  GHSA-9g45-5xwm-f3wc (custom headers leaking to cross-origin redirect
+  targets). Behavior-preserving: the only source change is the
+  `rmcp::model::Content` → `ContentBlock` rename (imported under the prior
+  name), the feature set is unchanged, and the 23-tool MCP surface is
+  unaffected. (#794)
+
 ## [2.3.2] - 2026-09-20
 
 ### Changed
