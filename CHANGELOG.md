@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actor, throttled to ≤1 per (page, operator) per minute, and FTS-exempt. It is
   strictly additive — reinforcement only raises retention scores, never blocks,
   never touches the response payloads, and adds no new MCP tool (still 23)
-  (#NNN).
+  (#798).
 - Reasoning tier on the LLM synthesis paths: an opt-in `reasoning` argument on
   `memory_query` (its `answer` path) and `memory_explore` (borrowed from
   Honcho's reasoning-effort ladder; targets the 2.4 line). The knob is a schema
