@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows often has no `HOME`, so the #103 catch-all guard — skip a stored
   `repo_path` equal to the user profile so it cannot prefix-match every
   project beneath it — was inert there and a home-directory project could
-  swallow unrelated cwds.
+  swallow unrelated cwds. (#804)
 
 ## [2.3.2] - 2026-09-20
 
