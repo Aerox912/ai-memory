@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the first attempt, since retrying them only burns another call.
 
 ### Fixed
+- `backfill --dry-run` recorded a completed attempt and suppressed the next
+  automatic import. Planning now leaves the backfill sentinel untouched, even
+  for populated projects or an opted-out automatic invocation (#785).
 - `ai-memory serve` no longer hard-fails to take its single-instance lock on a
   transient error under load. Acquiring the serve lock now retries `open` and
   `try_lock_exclusive` a few times with a short (~25ms) backoff when they hit a
