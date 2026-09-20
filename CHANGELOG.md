@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `llm-test`, Copilot auth, OpenCode, and a relocated Claude config all
   reported "not configured" on native Windows Docker Desktop even though the
   same export worked through `bin/ai-memory`. The POSIX wrapper also now
-  forwards `OPENCODE_API_KEY`.
+  forwards `OPENCODE_API_KEY`. (#803)
 
 ## [2.3.2] - 2026-09-20
 
