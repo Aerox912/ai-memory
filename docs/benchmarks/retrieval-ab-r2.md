@@ -78,6 +78,17 @@ opt-in / off by default, so default retrieval is unchanged from 2.3.x: overall
 FTS `hit@5` 0.668 → 0.666 and local `hit@5` 0.823 → 0.815 versus the
 2026-09-01 snapshot (commit `0ac0dcf`) — identical within run-to-run noise.
 
+**Cross-run variance (read the numbers accordingly).** The harness is
+deterministic *within* a run (the `--candidate` determinism check is exactly
+`0.000`), but *across* independent runs it varies: two full local-embeddings
+runs on this same 2.4 commit gave overall `hit@5` 0.815 and 0.821, and per-slice
+wobble up to ~0.02–0.03 on the small-n slices in **both directions** (e.g.
+knowledge-update 0.875 then 0.903; single-session-user 0.734 then 0.750). Treat
+overall `hit@5` as ≈ 0.82 ± 0.005 and don't over-read a single small-n slice
+from one run. Both 2.4 runs are statistically identical to the 2.3.x 0.823
+baseline — a genuine per-slice regression is a drop that persists across a
+confirmation re-run, not a one-run dip.
+
 Reproduce:
 
 ```bash
