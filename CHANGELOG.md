@@ -32,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- Auto-improve proposal staging no longer discards an entire run when one
+  proposal is a create/update misclassification. A `Create` whose target page
+  already exists, or an `Update`/patch whose target is missing, previously
+  aborted the staging transaction, dropping every sibling proposal and the run
+  row over one probabilistic LLM mislabel. Those two cases now skip just the
+  offending proposal (reported as `skipped`, like a pending-target collision)
+  and keep the rest of the run. Two proposals in one run targeting the same
+  path remain a hard error, and a create-on-existing is never coerced to an
+  update (the page could be pinned). (#832)
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,

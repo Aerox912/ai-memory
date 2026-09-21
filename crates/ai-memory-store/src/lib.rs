@@ -795,20 +795,26 @@ mod tests {
         assert_eq!(update.target_body_sha256_at_stage, Some(latest_hash));
         assert_eq!(update.target_updated_at_at_stage, Some(latest_updated));
 
+        // A Create whose target already exists is a create/update
+        // misclassification (ordinary LLM error), not corrupt state: it is
+        // skipped, not fatal, so the run still records. See
+        // `a_create_on_an_existing_page_is_skipped_not_fatal`.
+        let misclassified = store
+            .writer
+            .stage_auto_improve_run(stage_input(
+                ws,
+                proj,
+                vec![proposal(
+                    "notes/update.md",
+                    AutoImproveProposalOperation::Create,
+                    "bad",
+                )],
+            ))
+            .await
+            .unwrap();
         assert!(
-            store
-                .writer
-                .stage_auto_improve_run(stage_input(
-                    ws,
-                    proj,
-                    vec![proposal(
-                        "notes/update.md",
-                        AutoImproveProposalOperation::Create,
-                        "bad"
-                    )],
-                ))
-                .await
-                .is_err()
+            misclassified.proposal_ids.is_empty(),
+            "the misclassified create is skipped, not staged"
         );
 
         let out_of_scope_session = SessionId::new();
