@@ -559,10 +559,24 @@ pub fn mark_experience_pass_run(
     Ok(())
 }
 
+/// Maximum scheduled review attempts for one session before its claim parks.
+///
+/// A parked claim stops being a candidate and keeps `last_error` so an operator
+/// can see why, rather than the session silently vanishing from the queue (#833).
+/// Three is enough to ride out a flaky provider and few enough that a
+/// deterministic failure — a proposal the reviewer cannot stage, say — stops
+/// costing a review every tick.
+pub const AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS: u32 = 3;
+
 /// Atomically claim one ended session for background review. Returns `true`
 /// only for the first claimer: the insert requires the session to be past
 /// the scope's watermark and not already covered by a run, so concurrent
 /// schedulers and restarts cannot double-review a session.
+///
+/// A claim left by a *failed* review is re-armed rather than skipped, so the
+/// session is retried while it still has attempts left (#833). A claim that is
+/// in flight (`last_failed_at IS NULL`) or parked (`attempts` exhausted) does
+/// not conflict-update, so this still returns `false` for both.
 ///
 /// # Errors
 /// Returns an error when the underlying SQLite statements fail.
@@ -576,7 +590,7 @@ pub fn claim_scheduler_session(
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     let inserted = tx.execute(
-        "INSERT OR IGNORE INTO auto_improve_scheduler_claims \
+        "INSERT INTO auto_improve_scheduler_claims \
          (workspace_id, project_id, session_id, claimed_at) \
          SELECT ?1, ?2, ?3, ?4 \
          WHERE EXISTS ( \
@@ -595,13 +609,19 @@ pub fn claim_scheduler_session(
                WHERE r.workspace_id = ?1 \
                  AND r.project_id = ?2 \
                  AND r.session_id = ?3 \
-           )",
+           ) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+             claimed_at = excluded.claimed_at, \
+             last_failed_at = NULL \
+           WHERE auto_improve_scheduler_claims.last_failed_at IS NOT NULL \
+             AND auto_improve_scheduler_claims.attempts < ?6",
         params![
             workspace_id.as_bytes(),
             project_id.as_bytes(),
             session_id.as_bytes(),
             now,
             ended_at,
+            AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
         ],
     )?;
     if inserted == 1 {
@@ -614,6 +634,58 @@ pub fn claim_scheduler_session(
     }
     tx.commit()?;
     Ok(inserted == 1)
+}
+
+/// Record that a scheduled review of `session_id` failed, releasing its claim
+/// for another attempt and returning the new attempt count.
+///
+/// The claim is the scheduler's only in-flight marker and nothing used to clear
+/// it, so a failed review excluded its session from every later tick with no
+/// run row and no operator-visible state (#833). Recording the failure here
+/// keeps the row — it is the memory of how many attempts have been spent, and
+/// carries `last_error` once the session parks — while making the session a
+/// candidate again until `AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS` is reached.
+///
+/// Returns `0` when no claim exists, which is the manual path: `ai-memory
+/// auto-improve --session-id` does not claim, so a failure there has no claim
+/// to release.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statement fails.
+pub fn record_claim_failure(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    error: &str,
+) -> StoreResult<u32> {
+    let now = Timestamp::now().as_microsecond();
+    let updated = conn.execute(
+        "UPDATE auto_improve_scheduler_claims \
+         SET attempts = attempts + 1, last_error = ?4, last_failed_at = ?5 \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes(),
+            error,
+            now,
+        ],
+    )?;
+    if updated == 0 {
+        return Ok(0);
+    }
+    let attempts: u32 = conn.query_row(
+        "SELECT attempts FROM auto_improve_scheduler_claims \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes(),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(attempts)
 }
 
 /// Persist one review run and stage its proposals as `pending`, all in one

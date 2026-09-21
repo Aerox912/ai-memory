@@ -36,12 +36,13 @@ pub use fts_query::prepare_fts5_query;
 
 pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{
-    ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS, ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
+    AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalOperation,
+    AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
+    AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, FailAutoImproveProposal,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, RejectAutoImproveProposal,
+    SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport,
+    artifact_path_for,
 };
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
@@ -60,15 +61,15 @@ pub use ops::{
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
-    BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity, ContaminationFinding,
-    ContaminationReport, ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone,
-    DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage,
-    ObservationHit, ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord,
-    OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
-    SearchExplain, SessionDependentRows, SessionEndDisposition, SessionSummary, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
+    ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
+    DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
+    GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
+    PageLinks, PageMeta, PageSummary, ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage,
+    RrfContributions, ScopeRow, SearchExplain, SessionDependentRows, SessionEndDisposition,
+    SessionSummary, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -4077,6 +4078,149 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].session_id, candidates[0].session_id);
         assert_eq!(remaining[0].ended_at, same_ended_at);
+    }
+
+    // #833: a claim is the scheduler's in-flight marker, but the only writer was
+    // `INSERT OR IGNORE` — nothing ever removed or expired a row. A review that
+    // failed left the claim behind with no `auto_improve_runs` row, and the
+    // candidate query excludes on the claim alone, so the session was dropped
+    // from every future tick with no operator-visible state.
+    #[tokio::test]
+    async fn auto_improve_failed_claim_is_retried_then_parked() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session, None).await.unwrap();
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        // Every attempt but the last releases the session back to the queue.
+        for attempt in 1..AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS {
+            let candidates = store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(
+                candidates.len(),
+                1,
+                "session should still be a candidate before attempt {attempt}"
+            );
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(
+                        ws,
+                        proj,
+                        candidates[0].session_id,
+                        candidates[0].ended_at,
+                    )
+                    .await
+                    .unwrap()
+            );
+            // In flight: not a candidate while the review is running.
+            assert!(
+                store
+                    .reader
+                    .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "an in-flight claim must not be handed out twice"
+            );
+            let attempts = store
+                .writer
+                .record_auto_improve_claim_failure(
+                    ws,
+                    proj,
+                    session,
+                    "error decoding response body",
+                )
+                .await
+                .unwrap();
+            assert_eq!(attempts, attempt);
+        }
+
+        // The final failure parks the session instead of looping forever.
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        store
+            .writer
+            .claim_auto_improve_scheduler_session(ws, proj, session, candidates[0].ended_at)
+            .await
+            .unwrap();
+        let attempts = store
+            .writer
+            .record_auto_improve_claim_failure(
+                ws,
+                proj,
+                session,
+                "create proposal target already exists",
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert!(
+            store
+                .reader
+                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an exhausted claim stays parked rather than spinning every tick"
+        );
+
+        // ...and it is visible, which a bare claim never was.
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, session);
+        assert_eq!(parked[0].attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some("create proposal target already exists")
+        );
     }
 
     #[tokio::test]
