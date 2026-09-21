@@ -313,7 +313,7 @@ if command -v git >/dev/null 2>&1; then
     if [ -n "$PSH" ]; then
         PS_LIB=$(host_path "$PWD/hooks/lib/ai-memory-hook.ps1")
         PS_CWD=$(host_path "$REPO/crates/cli")
-        PS_REPO=$($PSH -NoProfile -ExecutionPolicy Bypass -Command \
+        PS_REPO=$("$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
             ". '$PS_LIB'; Get-AiMemoryRepoRootProject -Cwd '$PS_CWD'")
         assert_eq "powershell repo-root helper resolves repo basename" "acme-api" "$PS_REPO"
     else
