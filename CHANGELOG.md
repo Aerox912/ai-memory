@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model ids, and which model goes through the Responses endpoint (#763).
 
 ### Fixed
+- A failed scheduled `auto_improve` review no longer removes its session from
+  the queue permanently. The scheduler claims a session before reviewing it,
+  and the candidate query excludes any session that holds a claim — but nothing
+  ever released one, so a review that failed (a hung provider call, or a
+  proposal the reviewer could not stage) left a claim with no run row and that
+  session was skipped by every later tick. The state was silent: the tick
+  reported `errors=1` once and clean runs from then on, and the only exit was a
+  hand-written `DELETE`. A claim now records the failure and releases, so the
+  next tick retries it, and parks after 3 attempts with the last error kept so a
+  deterministic failure stops costing a review every tick instead of vanishing.
+  The tick summary counts `parked` separately from `errors`. (#833)
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
   provider credentials and host-config env vars as the POSIX wrapper into the
   helper container. A host-exported `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
