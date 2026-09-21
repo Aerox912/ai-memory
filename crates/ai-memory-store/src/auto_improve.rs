@@ -815,10 +815,17 @@ fn stage_run_impl(
         ) = match (proposal.operation, target_snapshot) {
             (AutoImproveProposalOperation::Create, None) => (None, None, None),
             (AutoImproveProposalOperation::Create, Some(_)) => {
-                return Err(StoreError::InvalidState(format!(
-                    "create proposal target already exists: {}",
-                    proposal.target_path
-                )));
+                // A create/update misclassification is an ordinary LLM error, not
+                // corrupt state. Skip just this proposal so the rest of the run
+                // still stages and a run row is recorded, rather than discarding
+                // every sibling. Do NOT coerce Create->Update: the existing page
+                // can be pinned, and auto-applying would rewrite it (Safety
+                // Invariant #10). Skip is the conservative fix.
+                skipped.push(SkippedProposal {
+                    target_path: proposal.target_path.to_string(),
+                    reason: "create proposal target already exists".into(),
+                });
+                continue;
             }
             (AutoImproveProposalOperation::Update, Some(snapshot)) => (
                 Some(snapshot.page_id),
@@ -826,10 +833,13 @@ fn stage_run_impl(
                 Some(snapshot.updated_at),
             ),
             (AutoImproveProposalOperation::Update, None) => {
-                return Err(StoreError::InvalidState(format!(
-                    "update proposal target does not exist: {}",
-                    proposal.target_path
-                )));
+                // Symmetric misclassification: an update aimed at a page that does
+                // not exist. Skip this proposal, keep the run and its siblings.
+                skipped.push(SkippedProposal {
+                    target_path: proposal.target_path.to_string(),
+                    reason: "update proposal target does not exist".into(),
+                });
+                continue;
             }
         };
         if edit_mode == "patch" {

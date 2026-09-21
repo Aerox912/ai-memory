@@ -316,7 +316,10 @@ no tiers.
   is what holds PR feedback near the eight minutes the gating jobs take.
   **Add the `windows` label** to a PR touching path handling, file
   locking, or git plumbing, so the check runs before the merge rather
-  than after it.
+  than after it. Its `hooks` job is the one exception: `tests/hooks/test_lib.sh`
+  drives `hooks/lib/ai-memory-hook.ps1`, which only executes where PowerShell
+  is native, so that job runs on every pull request. It needs no toolchain and
+  costs seconds, so it does not move PR feedback time.
 
 ## Code style guidelines
 
