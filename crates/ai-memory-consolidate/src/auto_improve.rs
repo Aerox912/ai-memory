@@ -1969,7 +1969,10 @@ mod tests {
         AutoImproveEvalConfig {
             enabled: true,
             command,
-            timeout_secs: 2,
+            // Windows PowerShell cold-start is slower than 2s, and these gate
+            // tests run in parallel — timeouts here are for the eval command
+            // itself, not for interpreter startup.
+            timeout_secs: if cfg!(windows) { 8 } else { 2 },
             targets: default_auto_improve_eval_targets(),
             min_delta: 0.01,
         }
@@ -2012,7 +2015,9 @@ mod tests {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('not-json')\n".into()
             }
             "#!/bin/sh\ncat >/dev/null\nsleep 3\n" => {
-                "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 3\n".into()
+                // Must exceed the Windows eval timeout (8s, see `eval_cfg`)
+                // so the timeout case still times out instead of completing.
+                "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 12\n".into()
             }
             "#!/bin/sh\nsleep 5\n" => "Start-Sleep -Seconds 20\n".into(),
             "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
@@ -2116,7 +2121,7 @@ mod tests {
         ];
         for (command, expected_reason) in cases {
             let mut cfg = eval_cfg(command);
-            cfg.timeout_secs = 1;
+            cfg.timeout_secs = if cfg!(windows) { 8 } else { 1 };
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
             let mut rejected = Vec::new();
             let mut warnings = Vec::new();
