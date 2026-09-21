@@ -1771,13 +1771,13 @@ Use `ai-memory auth status` to check whether a token is present and
 `ai-memory auth logout openai-oauth` to remove it.
 
 > [!TIP]
-> **Pick a small, fast model.** Consolidation / lint / explore are
-> summarisation tasks, not hard reasoning — a mini-class model is plenty and
-> is much easier on subscription rate limits. Set e.g.
-> `AI_MEMORY_LLM_MODEL=gpt-5-mini` (the `gpt-5.5` default works but is
-> overkill for this workload). If you stay on a reasoning model, set
-> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` so hidden thought tokens
-> do not eat the JSON budget. Reserve high-effort reasoning for your
+> **Leave the model at the provider default (`gpt-5.5`).** The Codex/ChatGPT
+> backend behind `openai-oauth` only accepts a small server-defined set of model
+> ids and rejects others — including `gpt-5-mini` — with a deterministic 400, so
+> do not set `AI_MEMORY_LLM_MODEL` for this backend. Consolidation / lint /
+> explore are summarisation tasks, so if the default reasoning is too heavy set
+> `AI_MEMORY_LLM_REASONING_EFFORT=none` or `low` instead, so hidden thought
+> tokens do not eat the JSON budget. Reserve high-effort reasoning for your
 > coding agent.
 
 ### Codex credential reuse

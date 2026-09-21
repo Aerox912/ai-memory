@@ -704,6 +704,23 @@ pub struct AutoImproveCandidateSession {
     pub ended_at: i64,
 }
 
+/// A scheduler claim that has spent every review attempt (#833).
+///
+/// The session is no longer a candidate, so this is the only place its state is
+/// visible: without it a failed review removed a session from the queue with
+/// nothing but a single `errors=1` in one tick's log to show for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoImproveParkedClaim {
+    /// Session whose scheduled review kept failing.
+    pub session_id: SessionId,
+    /// How many attempts were spent.
+    pub attempts: u32,
+    /// The last failure, verbatim, as the scheduler saw it.
+    pub last_error: Option<String>,
+    /// When the last attempt failed, in Unix microseconds.
+    pub last_failed_at: Option<i64>,
+}
+
 /// Open session selected for manual finalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSession {
@@ -3487,6 +3504,10 @@ impl ReaderPool {
                        WHERE c.workspace_id = s.workspace_id \
                          AND c.project_id = s.project_id \
                          AND c.session_id = s.id \
+                         AND NOT ( \
+                             c.last_failed_at IS NOT NULL \
+                             AND c.attempts < ?6 \
+                         ) \
                    ) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM auto_improve_runs r \
@@ -3504,6 +3525,7 @@ impl ReaderPool {
                     watermark,
                     cutoff,
                     limit.min(i64::MAX as usize) as i64,
+                    crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
                 ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
@@ -3516,6 +3538,58 @@ impl ReaderPool {
                 out.push(AutoImproveCandidateSession {
                     session_id: SessionId::from_slice(&id_bytes)?,
                     ended_at,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Scheduler claims that have spent every attempt and no longer produce a
+    /// candidate, newest failure first.
+    ///
+    /// A parked claim is a session the scheduler has given up on. It is excluded
+    /// from `auto_improve_candidate_sessions` exactly like an in-flight claim,
+    /// so without this listing the two are indistinguishable from outside the
+    /// database — which is what made the original leak silent (#833).
+    ///
+    /// # Errors
+    /// Returns an error when the underlying SQLite statement fails.
+    pub async fn auto_improve_parked_claims(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<AutoImproveParkedClaim>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT session_id, attempts, last_error, last_failed_at \
+                 FROM auto_improve_scheduler_claims \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND attempts >= ?3 \
+                 ORDER BY last_failed_at DESC",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, attempts, last_error, last_failed_at) = row?;
+                out.push(AutoImproveParkedClaim {
+                    session_id: SessionId::from_slice(&id_bytes)?,
+                    attempts,
+                    last_error,
+                    last_failed_at,
                 });
             }
             Ok(out)
