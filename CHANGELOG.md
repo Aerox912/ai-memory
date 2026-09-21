@@ -246,6 +246,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OPENCODE_API_KEY` as the only credential, Go as the default endpoint, Zen
   via `AI_MEMORY_LLM_BASE_URL`, the built-in default model, per-catalogue
   model ids, and which model goes through the Responses endpoint (#763).
+- Refreshed the LongMemEval-S retrieval benchmarks on the 2.4 tree and
+  populated the full-dataset R2 A/B (`docs/benchmarks/`): local embeddings add
+  +0.149 hit@5 / +0.254 recall@10 over zero-LLM FTS, with a clean
+  baseline-vs-baseline determinism check and **no default-ranking regression**
+  vs 2.3.x (the 2.4 features are opt-in / off by default).
 
 ### Fixed
 - The Windows Docker wrapper (`bin/ai-memory.ps1`) now forwards the same
