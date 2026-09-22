@@ -846,6 +846,59 @@ async fn run_session_consolidation_worker(
     }
 }
 
+/// Wraps [`tokio::net::TcpListener`] to enable TCP keepalive on every
+/// accepted connection.
+///
+/// Without this, a hook client whose peer dies without sending FIN (laptop
+/// sleep, a VPN/Tailscale flap, an abrupt kill) leaves its socket
+/// `ESTABLISHED` forever: the OS default is keepalive off, so the fd is
+/// never reclaimed. Over days that leaks one fd per dead peer until
+/// `accept()` starts failing with `EMFILE` and the healthcheck breaks (#792).
+/// Keepalive makes the kernel probe idle connections and close ones whose
+/// peer no longer answers.
+///
+/// This is built on axum's own [`axum::serve::ListenerExt::tap_io`] rather
+/// than a hand-rolled `impl axum::serve::Listener`. A hand-rolled newtype
+/// was tried first: it compiles as a `Listener`, but
+/// `into_make_service_with_connect_info::<SocketAddr>()` additionally needs
+/// `SocketAddr: Connected<IncomingStream<'_, L>>`, and axum only ships that
+/// impl for its own `TcpListener` and for `TapIo<L, F>` (generically, for any
+/// `L: Listener`) — never for an arbitrary third-party `L`. Implementing
+/// `Connected` ourselves is blocked by the orphan rule: neither `Connected`,
+/// `SocketAddr`, nor `IncomingStream` (a plain, non-fundamental axum type) is
+/// local to this crate. `tap_io` is the extension point axum actually
+/// provides for exactly this "touch every accepted `Io`" case, and it keeps
+/// `ConnectInfo` (real peer `SocketAddr`) working for free.
+fn keepalive_listener(
+    listener: tokio::net::TcpListener,
+    keepalive_secs: u64,
+) -> axum::serve::TapIo<
+    tokio::net::TcpListener,
+    impl FnMut(&mut tokio::net::TcpStream) + Send + 'static,
+> {
+    // `None` when `tcp_keepalive_secs = 0` (keepalive disabled) — pass
+    // accepted sockets through unmodified.
+    let keepalive = (keepalive_secs > 0).then(|| {
+        let idle = Duration::from_secs(keepalive_secs);
+        socket2::TcpKeepalive::new()
+            .with_time(idle)
+            .with_interval(idle)
+    });
+    axum::serve::ListenerExt::tap_io(listener, move |stream: &mut tokio::net::TcpStream| {
+        let Some(keepalive) = keepalive.as_ref() else {
+            return;
+        };
+        let sock_ref = socket2::SockRef::from(&*stream);
+        if let Err(error) = sock_ref.set_tcp_keepalive(keepalive) {
+            // Guard, don't panic (runtime paths never unwrap/expect): a
+            // platform or socket-state quirk here should not take down the
+            // connection, just leave it without the reaping this wrapper
+            // exists to provide.
+            tracing::warn!(%error, "failed to set TCP keepalive on accepted connection");
+        }
+    })
+}
+
 /// Run the `serve` subcommand.
 ///
 /// # Errors
@@ -1492,6 +1545,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
+            let listener = keepalive_listener(listener, config.tcp_keepalive_secs);
             let shutdown_cancel = cancel.clone();
             let serve_result = {
                 let serve = axum::serve(
@@ -4791,6 +4845,44 @@ mod tests {
                 "https://b.example.com",
                 "https://c.example.com"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_enables_socket_keepalive_when_configured() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 60);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must be enabled when tcp_keepalive_secs > 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_disables_socket_keepalive_when_idle_is_zero() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 0);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            !sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must stay off when tcp_keepalive_secs = 0"
         );
     }
 }
