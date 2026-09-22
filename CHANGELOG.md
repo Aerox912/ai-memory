@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `ai-memory serve` no longer leaked file descriptors from half-open HTTP
+  connections until `EMFILE`, breaking the healthcheck (an unauthenticated
+  availability/DoS). A hook or MCP client whose peer died without sending FIN
+  (laptop sleep, a VPN/Tailscale flap, an abrupt kill) left its accepted
+  socket `ESTABLISHED` forever, since the OS default has TCP keepalive off —
+  each dead peer leaked one fd, exhausting the 1024-fd default in roughly 2-3
+  days of normal churn. Accepted connections now get TCP keepalive via
+  `socket2`, tunable with the new `tcp_keepalive_secs` config key (default
+  60s; `AI_MEMORY_TCP_KEEPALIVE_SECS=0` disables keepalive). This closes the
+  half-open-socket half of the fd leak; the rmcp session-table half was
+  already fixed in 2.4.0 by the rmcp 2.x bump. (#792)
 - `ai-memory bootstrap` no longer returns a 500 when the LLM emits a page
   path containing a Windows-illegal character (e.g. a `:` copied verbatim
   from a conventional-commit subject like `build(sandbox): orchestrate`).

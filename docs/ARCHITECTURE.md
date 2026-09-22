@@ -600,6 +600,11 @@ prefixed `AI_MEMORY_*`.
 ```toml
 bind = "127.0.0.1:49374"
 log_level = "info"
+tcp_keepalive_secs = 60            # idle time before TCP keepalive probes an accepted `serve`
+                                   # connection; reaps sockets left half-open by a dead peer
+                                   # (laptop sleep, VPN flap) that would otherwise leak fds
+                                   # until EMFILE (#792). 0 disables keepalive. Env:
+                                   # AI_MEMORY_TCP_KEEPALIVE_SECS
 
 # Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
 # override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
