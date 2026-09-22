@@ -96,7 +96,18 @@ tracker repeats patterns from our own history - v11.10.0 fixed
 consolidation time horizons that *silently ignored their configured
 window*, the same class of quiet-lifecycle bug our `#526`/`#528` work
 addressed with observable outcomes. Published honest numbers: 80.4% R@5
-on LongMemEval turn-level, 86.0% session-level.
+on LongMemEval turn-level, 86.0% session-level. **Where we now stand
+(2.4):** its consolidation set — type-dependent TTL (365/180/90/30),
+extractive compression, DBSCAN adaptive-eps clustering, access/connection
+boosts, and 0.4–0.75-band contradiction detection — is the direct
+grounding for the 2.4 memory-aging program
+([`design-memory-aging.md`](design-memory-aging.md)), which now ships each
+at parity but **zero-LLM by default, reversible** (supersede-not-delete +
+`restore-page`), and **off by default** (per-tier `[decay.half_life_days]`,
+extractive tier-down, cold-cluster dedup, access reinforcement on all read
+paths, and a `memory_lint` contradiction finding). The difference is
+posture, not mechanism: theirs runs autonomously; ours preserves the
+zero-LLM default path and evicts nothing on upgrade.
 
 **Platform development: Claude Code native "auto memory"** shipped
 default-on (v2.1.59): the agent keeps its own `MEMORY.md` plus topic
@@ -137,8 +148,23 @@ are Virginia Tech Sanghani faculty; the Post is a named collaborator), it
 is a preprint, and it reports accuracy rather than the R@5 others quote -
 still the most credible benchmark claim here (a paper with per-category
 sub-scores, gains concentrated where structured temporal memory should
-help), and a reminder the serious players now publish numbers. Full
-analysis in [`research-hindsight.md`](research-hindsight.md).
+help), and a reminder the serious players now publish numbers. **Where we
+now stand (2.4):** the two ideas flagged to carry forward — belief-strength
+over binary supersession, and the background rewrite loop — now ship, as
+opt-in layers over the zero-LLM core, per
+[`design-hindsight-borrowings.md`](design-hindsight-borrowings.md) §3 and
+[`design-memory-aging.md`](design-memory-aging.md) B1–B4. Belief-strength is
+a read-time, zero-LLM `confidence` (distinct-session breadth + recency +
+live `contradicts`, capped) exposed inertly in `explain`/`status` and
+foldable into ranking behind a **default-0.0, R2-gated** weight; the
+"dream" pass is an idle-scheduled, cancel-on-activity, surprisal-first LLM
+rewrite of cold clusters that is **off by default and never deletes a
+source**. We designed *against* Hindsight's own documented failure —
+belief *entrenchment* (raw proof-count pins a wrong page) — with
+breadth-not-count weighting, a confidence cap, and supersession always
+winning over evidence. Honest caveat: no R2 delta has been run, so this is
+parity of *mechanism*, not a measured accuracy win. Full analysis in
+[`research-hindsight.md`](research-hindsight.md).
 
 **Biggest-backed new entrant: `volcengine/OpenViking`** (~37.5K stars,
 ByteDance/Volcano-Engine, AGPLv3 core + Apache-2.0 CLI/examples, three
@@ -157,7 +183,11 @@ at **L0 (one-sentence abstract, for relevance checks)**, **L1 (overview, for
 planning)**, or **L2 (full original, read only when needed)** — the reported
 34-91% input-token reduction (LoCoMo) is almost entirely this deferral, and
 it maps directly onto work we already have (V61 abstract embeddings, the
-session brief) rather than a new architecture. Second, **directory-scoped
+session brief) rather than a new architecture — and 2.4's **extractive
+tier-down** (A2, [`design-memory-aging.md`](design-memory-aging.md)) now
+persists exactly this shape for cold episodic pages: an L0 abstract, an L1
+summary, and an L2 keep-token set, with the full prose one supersession-
+restore away. Second, **directory-scoped
 retrieval** (a "TrieHI" prefix-tree vector index that narrows a query to a
 path subtree before ranking) — a cheaper cousin of our per-project scoping,
 one level down at the `_rules/` / `norms/` path prefix. Read the numbers
@@ -274,7 +304,13 @@ carrying forward as *optional LLM layers over* our zero-LLM core, never
 requirements: the **dialectic/oracle query** (ask-a-question → synthesized
 answer, which maps onto our retrieval as an opt-in LLM step) and the
 **reasoning-tier ladder** (minimal→max reasoning per query as a clean
-cost/quality knob). Deliberately **reject** the rest as off-mission: LLM-mandatory
+cost/quality knob). **Both now ship on 2.4** as opt-in, off-by-default LLM
+layers (`memory_query answer=true` #782; `reasoning: {minimal..max}` #783),
+and the Dreamer's *scheduling shape* — surprisal-first ordering, idle
+trigger, cancel-on-activity — is the grounding for 2.4's opt-in "dream"
+consolidation pass (#816, [`design-memory-aging.md`](design-memory-aging.md)
+B3/B4), which stays off by default and never deletes a source. Deliberately
+**reject** the rest as off-mission: LLM-mandatory
 ingestion, opaque-Postgres-as-truth, the Postgres+Redis+worker operational
 weight, and the heavy theory-of-mind engine itself — a coding agent needs project
 facts, decisions, and conventions, not a psychological model of the developer
@@ -401,7 +437,12 @@ ships a *paper* with per-category LongMemEval sub-scores (91.4%), so the
 bar is no longer "publish a number" but "publish a harness and a metric
 someone else can re-run" - fix the split and the metric (theirs is
 accuracy, agentmemory/mcp-memory-service quote R@5; pick one and state
-it) so our result is comparable, not just present.
+it) so our result is comparable, not just present. **Now load-bearing on
+2.4:** the two aging features that can move quality — belief-strength folded
+into ranking (#815) and the LLM "dream" pass (#816) — ship **off by default
+and gated on this harness before they may default on**; no R2 delta has been
+run yet, so both remain opt-in and unproven (see
+[`design-memory-aging.md`](design-memory-aging.md) R2 acceptance).
 
 **R3 - Typed relation edges (small-medium).** `causes` / `fixes` /
 `contradicts` on our existing `links`/`entities` model, from the
@@ -449,7 +490,12 @@ storage: reuse the abstract already embedded at V61. Worth a design doc
 that decides where the L1 overview comes from (frontmatter summary,
 first-paragraph extraction, or the existing abstract) before any code;
 it composes with R5 (the cross-session abstraction pass produces good
-L1 summaries) rather than competing with it. Directory-scoped retrieval
+L1 summaries) rather than competing with it. **Partly realized on 2.4:**
+extractive tier-down (A2, #808) already persists the L0 abstract + L1
+summary + L2 keep-token shape for cold episodic pages
+([`design-memory-aging.md`](design-memory-aging.md)); the remaining R7 work
+is the *tiered on-start brief* that leads with abstracts, still a design
+doc before code. Directory-scoped retrieval
 (OpenViking's TrieHI) is the lower-priority half — a path-prefix filter
 on `memory_query` within a project — worth noting but not scheduling
 until R7's tiering lands.
@@ -561,3 +607,11 @@ benchmark number before R2 exists; chasing agentmemory's tool-count
 - Landscape comparisons: cognee.ai, vectorize.io, atlan.com,
   particula.tech, mnemoverse.com 2026 roundups (read as marketing;
   cross-checked against the projects' own repos where load-bearing).
+- In-repo design of record for the 2.4 memory-aging borrowings (per-tier
+  decay, extractive tier-down, cold-cluster dedup, contradiction band,
+  belief-strength, the dream pass, access-weighting):
+  [`design-memory-aging.md`](design-memory-aging.md) (with a sourced
+  competitor-grounding table) and
+  [`design-hindsight-borrowings.md`](design-hindsight-borrowings.md) §3
+  (belief-strength). Migration verdicts:
+  [`competitive-parity.md`](competitive-parity.md).

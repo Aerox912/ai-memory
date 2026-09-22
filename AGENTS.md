@@ -197,6 +197,9 @@ evals/                     live A/B harness; workspace member, not shipped.
 companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
+companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace member —
+                           `swift test --package-path companions/ai-memory-macos`
+                           and `./companions/ai-memory-macos/build.sh`.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
 docker/                    Dockerfile, compose files, TLS proxy templates.
@@ -272,6 +275,10 @@ no tiers.
   `cargo test --manifest-path companions/ai-memory-importer/Cargo.toml`
   (plus fmt/clippy on the same manifest). Root `--workspace` commands do
   not cover it.
+- Run the macOS menu bar companion separately:
+  `swift test --package-path companions/ai-memory-macos`
+  (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
+  Root `--workspace` commands do not cover it.
 
 ### Platform notes
 
