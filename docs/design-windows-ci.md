@@ -414,27 +414,31 @@ the `#[cfg(windows)]` tests executing on native Windows (PowerShell transport, N
 writes, libgit2 path fallback). Measured, GNU toolchain (rustc 1.95 + MinGW gcc 16.1),
 8 vCPU / 8 GB:
 
-| Run | Time | Notes |
-|---|---|---|
-| Cold full (`test --workspace --all-targets`, first compile) | **2408s (~40m)** | 400 crates, all tests ok |
-| Warm full (nothing changed, test execution only) | **1600s (~27m)** | 0 recompiled — this is *test-execution* time |
-| Warm single crate (`test -p ai-memory-hooks`) | **73s** | the realistic focused-iteration cost |
-| GitHub `windows-latest` full run (from the study) | **~1000s** | warm cache |
+| Run | Time (CoW on) | Time (CoW off) | Notes |
+|---|---|---|---|
+| Cold full (`test --workspace --all-targets`, first compile) | **2408s (~40m)** | **3146s (~52m)** | 400 crates, all tests ok; cold is compile-bound, CoW makes no reliable difference (run variance) |
+| Warm full (nothing changed, test execution only) | **1600s (~27m)** | **1193s (~20m)** | 0 recompiled — pure *test-execution*; CoW-off is ~25% faster here |
+| Warm single crate (`test -p ai-memory-hooks`) | **73s** | — | the realistic focused-iteration cost |
+| GitHub `windows-latest` full run (from the study) | **~1000s** | — | warm cache |
 
-The decisive, unwelcome result: **the warm full suite (1600s) is slower than
-`windows-latest` (~1000s)**, and it is dominated by *test execution*, not compilation
-(0 crates recompiled). The suite is I/O-bound — SQLite, `git2`/libgit2, and fsync-heavy
-atomic-write tests — and marvin's `/var` is **btrfs**, so the QEMU raw disk image pays
-copy-on-write fragmentation on every fsync. So the "iteration measured in tens of seconds"
+The decisive, unwelcome result: **the warm full suite is slower than `windows-latest`
+(~1000s)** whether or not CoW is disabled, and it is dominated by *test execution*, not
+compilation (0 crates recompiled). The suite is I/O-bound — SQLite, `git2`/libgit2, and
+fsync-heavy atomic-write tests — and marvin's `/var` is **btrfs**, so the QEMU raw disk
+image pays copy-on-write cost on every fsync. So the "iteration measured in tens of seconds"
 premise does **not** hold for a full-suite run on this box; the local VM's honest value is
 (a) **on-demand focused iteration** (one crate in ~1 min, no ~17-min GitHub round trip and
 no fork-approval friction) and (b) full local Windows coverage before a push. It is not a
 faster full gate.
 
-Untried optimisation that could change this verdict: disable btrfs CoW on the storage dir
-(`chattr +C` before the image is created) and re-measure the I/O-bound execution; that is
-the single most likely lever and should be tried before either committing to Phase 2
-automation or concluding the VM is too slow.
+The CoW optimisation was tried (fresh install onto a `chattr +C` storage dir, so the raw
+image is created nodatacow): it cut the I/O-bound warm run by **~25% (1600s → 1193s)**,
+confirming fsync-on-CoW was the execution bottleneck — but not enough to beat
+`windows-latest`. Cold got slightly *worse* (compile-bound; within run-to-run variance).
+Verdict unchanged: keep Phase 0 + `windows.yml`; the VM is a **focused-iteration / full
+local coverage** tool, not a faster full gate, and does not justify Phase 2 full-suite
+automation on this hardware. Measured 2026-09-22 on marvin (Server 2025 Eval, GNU
+toolchain, 8 vCPU / 8 GB, Defender disabled).
 
 ### Host-specific accommodations dockur needs on marvin (none anticipated by the study)
 
