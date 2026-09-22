@@ -821,6 +821,140 @@ pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfil
     Ok(summary)
 }
 
+/// Default batch size for [`backfill_page_windows`]: rows updated (and WAL
+/// pages accumulated) per transaction before the checkpoint truncates the
+/// log. Bounds peak `-wal` to a small multiple of this many two-column
+/// updates regardless of total store size.
+pub const PAGE_WINDOW_BACKFILL_BATCH: usize = 5_000;
+
+/// What a [`backfill_page_windows`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PageWindowBackfillSummary {
+    /// Page versions whose `valid_from`/`valid_to` window was written.
+    pub pages_backfilled: u64,
+    /// Batched transactions committed (each followed by a WAL checkpoint).
+    pub batches: u64,
+}
+
+/// Chunked, resumable, WAL-bounded backfill of page ingestion windows
+/// (`valid_from`/`valid_to`) — the reshaped V62 (issue #776).
+///
+/// V62 adds the two columns and their index as cheap DDL; this reconstructs
+/// the windows the original in-migration `UPDATE`s produced, but in bounded
+/// batches instead of one multi-hour transaction that grew the WAL to the
+/// size of the database. End state is byte-identical to the original V62:
+///   * `valid_from` = the version's own `created_at`.
+///   * `valid_to` = the earliest successor's `created_at` when one exists.
+///   * else, for a superseded (`is_latest = 0`) version with no successor,
+///     `COALESCE(superseded_at, MIN(entity_page_links.superseded_at),
+///     updated_at)`.
+///   * else NULL (a latest version with no successor stays open).
+///
+/// The window is derived purely from immutable columns this pass never
+/// mutates (`created_at`, `supersedes`, `superseded_at`, `updated_at`,
+/// `is_latest`, `entity_page_links.superseded_at`), so batching cannot
+/// change the result and interruption is safe: the cursor is simply "pages
+/// whose `valid_from` is still NULL", which shrinks monotonically as
+/// batches commit and re-running converges. A store already backfilled
+/// (every page has a non-NULL `valid_from` — the state after the original
+/// V62) finds no candidates and returns immediately without writing.
+pub fn backfill_page_windows(conn: &mut Connection) -> StoreResult<PageWindowBackfillSummary> {
+    backfill_page_windows_in_batches(conn, PAGE_WINDOW_BACKFILL_BATCH)
+}
+
+/// [`backfill_page_windows`] with an explicit batch size (tests use a tiny
+/// batch to exercise the resume cursor and checkpoint cadence at scale).
+pub fn backfill_page_windows_in_batches(
+    conn: &mut Connection,
+    batch: usize,
+) -> StoreResult<PageWindowBackfillSummary> {
+    let batch = batch.max(1);
+    let mut summary = PageWindowBackfillSummary::default();
+
+    // Cheap up-front cursor size. On an already-migrated store this is 0 and
+    // the loop below exits on its first empty batch without any write.
+    let remaining: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pages WHERE valid_from IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if remaining == 0 {
+        return Ok(summary);
+    }
+    tracing::info!(
+        pages = remaining,
+        batch,
+        "page ingestion-window backfill starting (V62, #776)"
+    );
+
+    loop {
+        let tx = conn.transaction()?;
+        // Batch by `rowid`, not `id`: `pages.id` is a BLOB, and rowid is a
+        // stable INTEGER handle that also lets synthetic fixtures use integer
+        // keys. The cursor ("valid_from IS NULL") shrinks as batches commit.
+        let rowids: Vec<i64> = {
+            let mut stmt =
+                tx.prepare("SELECT rowid FROM pages WHERE valid_from IS NULL LIMIT ?1")?;
+            stmt.query_map(params![batch as i64], |row| row.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        if rowids.is_empty() {
+            tx.commit()?;
+            break;
+        }
+
+        let placeholders = std::iter::repeat_n("?", rowids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // One statement sets both columns for the batch, folding the original
+        // V62's three sequential `UPDATE`s into an equivalent CASE (see the
+        // rule list on `backfill_page_windows`). Scoped to this batch's rows;
+        // the correlated subqueries still read the full `pages` table, so a
+        // successor in another batch is accounted for regardless of order.
+        let sql = format!(
+            "UPDATE pages SET \
+                 valid_from = created_at, \
+                 valid_to = CASE \
+                     WHEN EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id) \
+                         THEN (SELECT MIN(s.created_at) FROM pages s WHERE s.supersedes = pages.id) \
+                     WHEN is_latest = 0 \
+                         THEN COALESCE( \
+                             superseded_at, \
+                             (SELECT MIN(l.superseded_at) FROM entity_page_links l \
+                              WHERE l.page_id = pages.id), \
+                             updated_at) \
+                     ELSE NULL \
+                 END \
+             WHERE rowid IN ({placeholders})"
+        );
+        let updated = {
+            let mut stmt = tx.prepare(&sql)?;
+            stmt.execute(rusqlite::params_from_iter(rowids.iter()))?
+        };
+        tx.commit()?;
+
+        // Truncate the WAL between batches so it never grows past one batch's
+        // worth of pages, the whole point of the reshape.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+
+        summary.pages_backfilled += updated as u64;
+        summary.batches += 1;
+        tracing::info!(
+            done = summary.pages_backfilled,
+            remaining = remaining.saturating_sub(summary.pages_backfilled as i64),
+            batches = summary.batches,
+            "page ingestion-window backfill progress"
+        );
+    }
+
+    tracing::info!(
+        pages = summary.pages_backfilled,
+        batches = summary.batches,
+        "page ingestion-window backfill complete"
+    );
+    Ok(summary)
+}
+
 pub(crate) fn upsert_page_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page: &NewPage,
@@ -839,6 +973,17 @@ pub(crate) fn upsert_page_in_tx(
     let mut conformed = page.frontmatter_json.clone();
     ai_memory_core::okf::conform_frontmatter(page.path.as_str(), &mut conformed);
     let tier_str = page.tier.as_str();
+    // A2 tier-down marker (V65). The `compacted: true` frontmatter mirror is
+    // the single source of truth an A2 compaction rewrite carries in through
+    // the wiki layer; the `compacted_at` column is derived from it here, at the
+    // one write choke point, so the marker and the compacted body always land
+    // in the same transaction (invariant: indexes commit with the data). A
+    // normal write has no `compacted` key, so the column stays NULL and every
+    // pre-A2 code path behaves exactly as before.
+    let compacted_at: Option<i64> = conformed
+        .get("compacted")
+        .and_then(serde_json::Value::as_bool)
+        .and_then(|flag| flag.then_some(now));
 
     let existing: Option<ExistingPageVersion> = tx
         .query_row(
@@ -899,8 +1044,8 @@ pub(crate) fn upsert_page_in_tx(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at, valid_from) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14)",
+              created_at, updated_at, expires_at, valid_from, compacted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -917,6 +1062,7 @@ pub(crate) fn upsert_page_in_tx(
                 page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
                 page.expires_at.map(|ts| ts.as_microsecond()),
+                compacted_at,
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
@@ -936,13 +1082,19 @@ pub(crate) fn upsert_page_in_tx(
         )?;
         return Ok(new_id);
     }
+    if let Some(existing) = colliding_live_path(tx, page)? {
+        return Err(StoreError::PagePathCollides {
+            requested: page.path.as_str().to_owned(),
+            existing,
+        });
+    }
     let frontmatter_str = stamped_frontmatter(conformed, now)?;
     let new_id = PageId::new();
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at, valid_from, compacted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14, ?13, ?15)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -958,6 +1110,7 @@ pub(crate) fn upsert_page_in_tx(
             page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
             page.expires_at.map(|ts| ts.as_microsecond()),
+            compacted_at,
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
@@ -976,6 +1129,36 @@ pub(crate) fn upsert_page_in_tx(
         now,
     )?;
     Ok(new_id)
+}
+
+/// The live page this create would share a file with on a case-folding or
+/// normalizing filesystem, if any.
+///
+/// Runs on creates only: a supersede targets a path that already has its own
+/// row, so it cannot introduce a pair that did not exist before. That keeps
+/// the scan off the rewrite-heavy path, where it would repeat for every
+/// consolidation pass over the same page.
+fn colliding_live_path(
+    tx: &rusqlite::Transaction<'_>,
+    page: &NewPage,
+) -> StoreResult<Option<String>> {
+    let key = ai_memory_core::portable_page_key(page.path.as_str());
+    let mut stmt = tx.prepare_cached(
+        "SELECT path FROM pages \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path <> ?3",
+    )?;
+    let mut rows = stmt.query(params![
+        page.workspace_id.as_bytes(),
+        page.project_id.as_bytes(),
+        page.path.as_str(),
+    ])?;
+    while let Some(row) = rows.next()? {
+        let candidate: String = row.get(0)?;
+        if ai_memory_core::portable_page_key(&candidate) == key {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// Attach the normalized entity set to a new page version (V38). Entity
@@ -6596,6 +6779,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// The V65 A2 marker is derived from the `compacted: true` frontmatter
+    /// mirror at the single write choke point, in the same transaction as the
+    /// body — a normal write leaves it NULL, so every pre-A2 path is unchanged.
+    #[test]
+    fn upsert_derives_compacted_at_from_frontmatter_mirror() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+
+        // A normal write has no `compacted` key → marker stays NULL.
+        let plain = upsert_page(&mut conn, &page(ws, proj, "notes/plain.md", "body")).unwrap();
+        let plain_marker: Option<i64> = conn
+            .query_row(
+                "SELECT compacted_at FROM pages WHERE id = ?1",
+                rusqlite::params![plain.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(plain_marker, None, "an ordinary write is never marked");
+
+        // A write carrying the frontmatter mirror sets the marker.
+        let mut compacted = page(ws, proj, "notes/compacted.md", "residue");
+        compacted.frontmatter_json = serde_json::json!({"compacted": true});
+        let compacted_id = upsert_page(&mut conn, &compacted).unwrap();
+        let marker: Option<i64> = conn
+            .query_row(
+                "SELECT compacted_at FROM pages WHERE id = ?1",
+                rusqlite::params![compacted_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker.is_some(), "the frontmatter mirror sets compacted_at");
+    }
+
     /// A page written before entity extraction — tags in frontmatter but
     /// no entity links — is backfilled from those tags, with the link's
     /// window opening at the page version's creation. A page written with
@@ -6669,6 +6884,208 @@ pub(crate) mod tests {
             links_after,
             links_before + 2,
             "the pre-existing entity page kept its single link; only the stale page gained two"
+        );
+    }
+
+    /// The exact backfill the original V62 ran in-migration, kept here as
+    /// the golden reference the chunked boot step must reproduce byte for
+    /// byte. (The shipped V62 is now DDL-only; #776.)
+    const ORIGINAL_V62_BACKFILL: &str = "\
+        UPDATE pages SET valid_from = created_at; \
+        UPDATE pages SET valid_to = ( \
+            SELECT MIN(s.created_at) FROM pages s WHERE s.supersedes = pages.id \
+        ) WHERE EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id); \
+        UPDATE pages SET valid_to = COALESCE( \
+            superseded_at, \
+            (SELECT MIN(l.superseded_at) FROM entity_page_links l WHERE l.page_id = pages.id), \
+            updated_at) \
+        WHERE is_latest = 0 AND valid_to IS NULL \
+          AND NOT EXISTS (SELECT 1 FROM pages s WHERE s.supersedes = pages.id);";
+
+    /// Seed a pre-backfill `pages` fixture (windows still NULL) exercising
+    /// every branch of the two supersession rules: a three-version chain, a
+    /// decay tombstone, a reorg retirement recorded only at link grain, an
+    /// `updated_at`-fallback retirement, and a latest open version.
+    fn seed_page_window_fixture(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE pages (
+                 id INTEGER PRIMARY KEY, created_at INTEGER, updated_at INTEGER,
+                 superseded_at INTEGER, supersedes INTEGER, is_latest INTEGER,
+                 valid_from INTEGER, valid_to INTEGER);
+             CREATE TABLE entity_page_links (page_id INTEGER, superseded_at INTEGER);
+             INSERT INTO pages
+                 (id, created_at, updated_at, superseded_at, supersedes, is_latest) VALUES
+                 (1, 100, 100, NULL, NULL, 0),   -- chain v1, superseded by 2
+                 (2, 200, 200, NULL, 1,    0),   -- chain v2, superseded by 3
+                 (3, 300, 300, NULL, 2,    1),   -- chain v3, latest/open
+                 (4, 100, 100, 450,  NULL, 0),   -- decay tombstone
+                 (5, 100, 100, NULL, NULL, 0),   -- reorg: retired at link grain
+                 (6, 100, 600, NULL, NULL, 0),   -- successor-less: updated_at fallback
+                 (7, 100, 100, NULL, NULL, 1);   -- latest open, no successor
+             INSERT INTO entity_page_links (page_id, superseded_at) VALUES (5, 500);",
+        )
+        .unwrap();
+    }
+
+    fn read_windows(conn: &Connection) -> Vec<(i64, Option<i64>, Option<i64>)> {
+        conn.prepare("SELECT id, valid_from, valid_to FROM pages ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Golden equivalence: the chunked boot backfill produces exactly the
+    /// windows the original single-transaction V62 SQL produced.
+    #[test]
+    fn page_window_backfill_matches_original_v62_sql() {
+        let reference = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&reference);
+        reference.execute_batch(ORIGINAL_V62_BACKFILL).unwrap();
+        let expected = read_windows(&reference);
+
+        let mut chunked = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&chunked);
+        // A tiny batch forces several batches over the seven-row fixture.
+        let summary = backfill_page_windows_in_batches(&mut chunked, 2).unwrap();
+        assert_eq!(summary.pages_backfilled, 7);
+        assert!(summary.batches >= 4, "batch=2 over 7 rows: {summary:?}");
+
+        assert_eq!(read_windows(&chunked), expected);
+        // Spell out the intent so a rule regression is legible, not just a diff.
+        assert_eq!(
+            expected,
+            vec![
+                (1, Some(100), Some(200)), // closed at successor v2's birth
+                (2, Some(200), Some(300)), // closed at successor v3's birth
+                (3, Some(300), None),      // latest stays open
+                (4, Some(100), Some(450)), // decay marker wins
+                (5, Some(100), Some(500)), // link-grain retirement
+                (6, Some(100), Some(600)), // updated_at fallback
+                (7, Some(100), None),      // latest open, no successor
+            ],
+        );
+    }
+
+    /// Idempotency / resume: an interrupted run (some rows committed, the
+    /// rest still NULL) resumes from the cursor, does no double work, and
+    /// converges to the correct final state.
+    #[test]
+    fn page_window_backfill_resumes_after_interruption() {
+        let reference = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&reference);
+        reference.execute_batch(ORIGINAL_V62_BACKFILL).unwrap();
+        let expected = read_windows(&reference);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_page_window_fixture(&conn);
+        // Simulate a prior run that committed the windows for a subset before
+        // being interrupted: copy the correct values for ids 1..=3 only.
+        for (id, from, to) in expected.iter().filter(|(id, _, _)| *id <= 3) {
+            conn.execute(
+                "UPDATE pages SET valid_from = ?2, valid_to = ?3 WHERE id = ?1",
+                params![id, from, to],
+            )
+            .unwrap();
+        }
+
+        // Resume: only the four still-NULL rows are touched — no double work.
+        let summary = backfill_page_windows_in_batches(&mut conn, 2).unwrap();
+        assert_eq!(
+            summary.pages_backfilled, 4,
+            "resume skips the already-committed rows: {summary:?}"
+        );
+        assert_eq!(read_windows(&conn), expected, "final state converges");
+
+        // Running once more is a pure no-op (cursor is empty).
+        let again = backfill_page_windows(&mut conn).unwrap();
+        assert_eq!(again, PageWindowBackfillSummary::default());
+        assert_eq!(read_windows(&conn), expected);
+    }
+
+    /// Inert on an already-migrated store: every page written through the
+    /// live path already has its window, so the boot step finds no candidate
+    /// and returns immediately without writing.
+    #[test]
+    fn page_window_backfill_is_inert_on_migrated_store() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        for body in ["one", "two"] {
+            upsert_page(&mut conn, &page(ws, proj, "notes/x.md", body)).unwrap();
+        }
+        // The live write path stamps valid_from on every version.
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pages WHERE valid_from IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 0, "write path already populated the windows");
+
+        let read = |conn: &Connection| -> Vec<(Option<i64>, Option<i64>)> {
+            conn.prepare("SELECT valid_from, valid_to FROM pages ORDER BY created_at, valid_from")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = read(&conn);
+        let summary = backfill_page_windows(&mut conn).unwrap();
+        assert_eq!(
+            summary,
+            PageWindowBackfillSummary::default(),
+            "no candidates: fast no-op with no writes"
+        );
+        assert_eq!(read(&conn), before, "state untouched");
+    }
+
+    /// WAL-bound: with a checkpoint after every batch, the `-wal` file stays
+    /// a small multiple of one batch's writes rather than growing with the
+    /// row count — the whole point of the reshape (#776).
+    #[test]
+    fn page_window_backfill_keeps_wal_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("wal.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pages (
+                 id INTEGER PRIMARY KEY, created_at INTEGER, updated_at INTEGER,
+                 superseded_at INTEGER, supersedes INTEGER, is_latest INTEGER,
+                 valid_from INTEGER, valid_to INTEGER);
+             CREATE TABLE entity_page_links (page_id INTEGER, superseded_at INTEGER);",
+        )
+        .unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            for id in 1..=2_000 {
+                tx.execute(
+                    "INSERT INTO pages (id, created_at, updated_at, is_latest) \
+                     VALUES (?1, 100, 100, 1)",
+                    params![id],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+
+        let batch = 50;
+        let summary = backfill_page_windows_in_batches(&mut conn, batch).unwrap();
+        assert_eq!(summary.pages_backfilled, 2_000);
+        assert_eq!(summary.batches, 40, "2000 rows / batch of 50");
+
+        // The per-batch TRUNCATE keeps the log near-empty; it must not have
+        // grown to hold all 2000 updates as one un-checkpointed transaction.
+        let wal_len = std::fs::metadata(db_path.with_extension("sqlite-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            wal_len < 256 * 1024,
+            "WAL not bounded by the between-batch checkpoint: {wal_len} bytes"
         );
     }
 

@@ -197,6 +197,9 @@ evals/                     live A/B harness; workspace member, not shipped.
 companions/ai-memory-importer/  standalone OMC + external-conversation importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
+companions/ai-memory-macos/     Swift menu bar wrapper; NOT a root workspace member —
+                           `swift test --package-path companions/ai-memory-macos`
+                           and `./companions/ai-memory-macos/build.sh`.
 hooks/                     per-agent lifecycle hook bundles (shell/native).
 bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release`).
 docker/                    Dockerfile, compose files, TLS proxy templates.
@@ -272,6 +275,10 @@ no tiers.
   `cargo test --manifest-path companions/ai-memory-importer/Cargo.toml`
   (plus fmt/clippy on the same manifest). Root `--workspace` commands do
   not cover it.
+- Run the macOS menu bar companion separately:
+  `swift test --package-path companions/ai-memory-macos`
+  (plus `./companions/ai-memory-macos/build.sh` to stage `AI Memory.app`).
+  Root `--workspace` commands do not cover it.
 
 ### Platform notes
 
@@ -316,7 +323,10 @@ no tiers.
   is what holds PR feedback near the eight minutes the gating jobs take.
   **Add the `windows` label** to a PR touching path handling, file
   locking, or git plumbing, so the check runs before the merge rather
-  than after it.
+  than after it. Its `hooks` job is the one exception: `tests/hooks/test_lib.sh`
+  drives `hooks/lib/ai-memory-hook.ps1`, which only executes where PowerShell
+  is native, so that job runs on every pull request. It needs no toolchain and
+  costs seconds, so it does not move PR feedback time.
 
 ## Code style guidelines
 
