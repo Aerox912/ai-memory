@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `ai-memory bootstrap` no longer returns a 500 when the LLM emits a page
+  path containing a Windows-illegal character (e.g. a `:` copied verbatim
+  from a conventional-commit subject like `build(sandbox): orchestrate`).
+  Such a path passed the deliberately tolerant `PagePath::new` and only
+  failed later at `ensure_portable` inside the atomic wiki write batch,
+  which aborted every page in the run, not just the offending one. Bad
+  paths are now sanitized (illegal characters replaced with `-`, directory
+  shape preserved) before validation, so the run and its other pages
+  survive; a path `ensure_portable` still rejects after sanitizing is
+  skipped with a warning instead of failing the batch. (#847)
 - The Windows release checksum (`ai-memory-windows-x86_64.zip.sha256`) is now
   written with a LF terminator instead of CRLF. `Out-File`'s Windows line
   ending made `sha256sum -c` fail with `No such file or directory` — the CR
