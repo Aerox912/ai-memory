@@ -322,11 +322,10 @@ no tiers.
   Linux — keeping it out of `ci.yml`
   is what holds PR feedback near the eight minutes the gating jobs take.
   **Add the `windows` label** to a PR touching path handling, file
-  locking, or git plumbing, so the check runs before the merge rather
-  than after it. Its `hooks` job is the one exception: `tests/hooks/test_lib.sh`
-  drives `hooks/lib/ai-memory-hook.ps1`, which only executes where PowerShell
-  is native, so that job runs on every pull request. It needs no toolchain and
-  costs seconds, so it does not move PR feedback time.
+  locking, git plumbing, or the hook bundle, so the corresponding Windows
+  jobs run before the merge rather than only on the nightly schedule. Both
+  the Rust test job and the hook-bundle job use this label gate on pull
+  requests; they also run on manual dispatch.
 
 ## Code style guidelines
 

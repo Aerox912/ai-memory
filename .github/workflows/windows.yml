@@ -31,9 +31,9 @@ name: windows
 # nightly, on demand, and MANDATORILY right before a release (dispatch it
 # on the release-candidate SHA and wait for green — see AGENTS.md).
 #
-# The `hooks` job is the exception and runs on every pull request. It is a
-# checkout plus seconds of `sh`, so the cost argument above — which is about
-# the Rust job's toolchain, linking and cache restore — does not apply to it.
+# The `hooks` job is separate so a Rust failure cannot stop the hook suite from
+# reporting, but it follows the same `windows` label gate on pull requests.
+# Both jobs also run nightly and on manual dispatch.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
