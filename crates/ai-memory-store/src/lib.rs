@@ -54,13 +54,13 @@ pub use decay::{
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DeleteWorkspaceSummary,
-    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission,
-    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
-    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
-    PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode, PurgeSessionSummary,
-    PurgeSummary, ReorgSummary, backfill_entity_index, backfill_page_windows,
-    backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, DateOnlyTtlPage,
+    DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
+    HookSessionAdmission, IngestObservationOutcome, LifecycleOnlyEndOutcome,
+    MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
+    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PageWindowBackfillSummary, PagesMode,
+    PurgeSessionSummary, PurgeSummary, ReorgSummary, StaleAfterRepair, backfill_entity_index,
+    backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
@@ -827,6 +827,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: out_of_scope_session,
                 workspace_id: ws,
                 project_id: other,
@@ -1727,6 +1728,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: claimed_session,
                 workspace_id: src_ws,
                 project_id: proj,
@@ -2082,6 +2084,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id: ws,
                 project_id: proj,
@@ -3206,6 +3209,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -3219,6 +3223,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -3266,6 +3271,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -3279,6 +3285,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -3340,6 +3347,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id: ws,
                     project_id,
@@ -3351,6 +3359,7 @@ mod tests {
                 .unwrap();
         }
         let obs = |session_id, project_id| NewObservation {
+            occurred_at: None,
             session_id,
             workspace_id: ws,
             project_id,
@@ -3454,6 +3463,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: ws,
                     project_id: proj,
@@ -3499,6 +3509,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -3609,6 +3620,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -3643,6 +3655,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -3686,6 +3699,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -3747,6 +3761,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: historical,
                 workspace_id: ws,
                 project_id: proj,
@@ -3778,6 +3793,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: ws,
                     project_id: proj,
@@ -3853,6 +3869,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: reviewed_after_watermark,
                 workspace_id: ws,
                 project_id: proj,
@@ -3928,6 +3945,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: historical,
                     workspace_id: ws,
                     project_id,
@@ -3955,6 +3973,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id: ws,
                     project_id,
@@ -3998,6 +4017,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: first_session,
                 workspace_id: ws,
                 project_id: proj,
@@ -4045,6 +4065,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: ws,
                     project_id: proj,
@@ -4124,6 +4145,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session,
                 workspace_id: ws,
                 project_id: proj,
@@ -4262,6 +4284,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -4344,6 +4367,7 @@ mod tests {
             super::ops::insert_observation(
                 &mut conn,
                 &NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -4913,6 +4937,150 @@ mod tests {
             .await
             .unwrap();
         assert!(mismatch.is_empty());
+    }
+
+    /// A run starts with the workstream's current session, which is no
+    /// evidence that its child used it; a link during the run is, even one
+    /// that repeats that session. A link refused after the context packet
+    /// went out marks nothing, and a finish that names another session drops
+    /// the mark, which belonged to the one before.
+    #[tokio::test]
+    async fn managed_run_status_reports_a_link_made_during_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "managed", None)
+            .await
+            .unwrap();
+        let prepare = PrepareWorkstreamRun {
+            workspace_id: ws,
+            project_id: project,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test:1".into(),
+        };
+        let status = async |run_id| {
+            let status = store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            (status.native_session_id, status.native_session_linked)
+        };
+
+        let first = store
+            .writer
+            .prepare_workstream_run(prepare.clone())
+            .await
+            .unwrap();
+        assert_eq!(status(first.run_id).await, (None, false));
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(first.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(status(first.run_id).await, (Some("native-1".into()), true));
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: first.run_id,
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let second = store.writer.prepare_workstream_run(prepare).await.unwrap();
+        assert_eq!(second.native_session_id.as_deref(), Some("native-1"));
+        assert_eq!(
+            status(second.run_id).await,
+            (Some("native-1".into()), false)
+        );
+        assert!(
+            store
+                .writer
+                .accept_managed_run_context(second.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .writer
+                .link_managed_run_session(second.run_id, AgentKind::Codex, "native-2")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            status(second.run_id).await,
+            (Some("native-1".into()), false)
+        );
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(second.run_id, AgentKind::Codex, "native-1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(status(second.run_id).await, (Some("native-1".into()), true));
+        let finish = |native: &str, complete: bool| FinishWorkstreamRun {
+            run_id: second.run_id,
+            native_session_id: Some(native.into()),
+            source_cursor: None,
+            events: Vec::new(),
+            complete,
+            segment_path: None,
+            exit_code: None,
+        };
+        store
+            .writer
+            .finish_workstream_run(finish("native-1", false))
+            .await
+            .unwrap();
+        assert_eq!(status(second.run_id).await, (Some("native-1".into()), true));
+        store
+            .writer
+            .finish_workstream_run(finish("native-3", false))
+            .await
+            .unwrap();
+        assert_eq!(
+            status(second.run_id).await,
+            (Some("native-3".into()), false)
+        );
+        assert!(
+            store
+                .writer
+                .link_managed_run_session(second.run_id, AgentKind::Codex, "native-3")
+                .await
+                .unwrap()
+        );
+        assert_eq!(status(second.run_id).await, (Some("native-3".into()), true));
+        store
+            .writer
+            .finish_workstream_run(finish("native-4", true))
+            .await
+            .unwrap();
+        assert_eq!(
+            status(second.run_id).await,
+            (Some("native-4".into()), false)
+        );
     }
 
     #[tokio::test]
@@ -5973,6 +6141,7 @@ mod tests {
             store
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id,
                     project_id,

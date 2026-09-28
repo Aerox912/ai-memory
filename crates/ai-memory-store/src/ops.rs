@@ -711,6 +711,92 @@ pub fn okf_migrate_latest_pages(conn: &mut Connection) -> StoreResult<Vec<OkfMig
     Ok(migrated)
 }
 
+/// A latest page whose `expires_at` is a bare `YYYY-MM-DD`, returned by
+/// [`repair_date_only_stale_after`] so the wiki layer can check its file.
+#[derive(Debug, Clone)]
+pub struct DateOnlyTtlPage {
+    /// Owning workspace.
+    pub workspace_id: ai_memory_core::WorkspaceId,
+    /// Owning project.
+    pub project_id: ai_memory_core::ProjectId,
+    /// Wiki-relative page path.
+    pub path: String,
+}
+
+/// What a [`repair_date_only_stale_after`] pass did.
+#[derive(Debug, Default, Clone)]
+pub struct StaleAfterRepair {
+    /// Latest rows whose `stale_after` was rewritten in place.
+    pub rows_repaired: u64,
+    /// Every latest page with a date-only `expires_at`, repaired or not.
+    pub date_only_pages: Vec<DateOnlyTtlPage>,
+}
+
+/// Idempotent startup repair of the OKF `stale_after` that builds before
+/// [`ai_memory_core::okf::repair_date_only_stale_after`] copied verbatim
+/// from a date-only `expires_at`. Same in-place rules as
+/// [`okf_migrate_latest_pages`]: same id, same version row, `updated_at`
+/// and `generated.at` untouched, historical versions left as they were.
+/// A repaired store rewrites nothing on the next run.
+///
+/// Every date-only page is returned, not only the rows rewritten here, so
+/// the wiki's file pass still finds a file whose row an earlier, interrupted
+/// run already repaired. The set is small: pages with a date-only TTL.
+pub fn repair_date_only_stale_after(conn: &mut Connection) -> StoreResult<StaleAfterRepair> {
+    type LatestPageRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, String);
+    let tx = conn.transaction()?;
+    let mut repair = StaleAfterRepair::default();
+    {
+        // The LIKE only narrows the scan; the TTL is checked on the parsed
+        // frontmatter below.
+        let mut stmt = tx.prepare(
+            "SELECT id, workspace_id, project_id, path, frontmatter_json FROM pages \
+             WHERE is_latest = 1 AND frontmatter_json LIKE '%\"expires_at\"%'",
+        )?;
+        let rows: Vec<LatestPageRow> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        for (id, ws, proj, path, fm_str) in rows {
+            let Ok(mut fm) = serde_json::from_str::<serde_json::Value>(&fm_str) else {
+                continue;
+            };
+            let date_only = fm
+                .get("expires_at")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|raw| {
+                    raw.trim().parse::<jiff::Timestamp>().is_err()
+                        && ai_memory_core::parse_expires_at_instant(raw).is_some()
+                });
+            if !date_only {
+                continue;
+            }
+            if ai_memory_core::okf::repair_date_only_stale_after(&mut fm) {
+                tx.execute(
+                    "UPDATE pages SET frontmatter_json = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&fm)?, id],
+                )?;
+                repair.rows_repaired += 1;
+            }
+            repair.date_only_pages.push(DateOnlyTtlPage {
+                workspace_id: ai_memory_core::WorkspaceId::from_slice(&ws)?,
+                project_id: ai_memory_core::ProjectId::from_slice(&proj)?,
+                path,
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(repair)
+}
+
 /// Stamp the per-version `generated.at` (write time, UTC) onto conformed
 /// frontmatter and serialize it. Runs only on the paths that create a new
 /// version row — the idempotent short-circuit above never reaches it, so
@@ -1462,7 +1548,9 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
     if session_is_purged(conn, session)? {
         return Err(StoreError::SessionPurged(session.id.to_string()));
     }
-    let now = Timestamp::now().as_microsecond();
+    let now = session
+        .occurred_at
+        .unwrap_or_else(|| Timestamp::now().as_microsecond());
     let agent = session.agent_kind.as_str();
     let cwd: Option<String> = session
         .cwd
@@ -1493,7 +1581,7 @@ pub fn end_session(
     session_id: &SessionId,
     summary_page_id: Option<&PageId>,
 ) -> StoreResult<()> {
-    end_session_row(conn, session_id, summary_page_id)
+    end_session_row(conn, session_id, summary_page_id, None)
 }
 
 /// Atomically end a lifecycle-only session and return its startup handoff to
@@ -1508,7 +1596,7 @@ pub fn end_lifecycle_only_session(
     session_id: &SessionId,
 ) -> StoreResult<LifecycleOnlyEndOutcome> {
     let tx = conn.transaction()?;
-    let outcome = end_lifecycle_only_session_in_tx(&tx, session_id)?;
+    let outcome = end_lifecycle_only_session_in_tx(&tx, session_id, None)?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -1516,6 +1604,7 @@ pub fn end_lifecycle_only_session(
 fn end_lifecycle_only_session_in_tx(
     tx: &Transaction<'_>,
     session_id: &SessionId,
+    occurred_at: Option<i64>,
 ) -> StoreResult<LifecycleOnlyEndOutcome> {
     // Substantive is defined POSITIVELY: at least one observation that is
     // real work (a user prompt or a tool use). This MUST stay in sync with
@@ -1536,7 +1625,7 @@ fn end_lifecycle_only_session_in_tx(
     if has_substantive_observation {
         return Ok(LifecycleOnlyEndOutcome::Substantive);
     }
-    end_session_row(tx, session_id, None)?;
+    end_session_row(tx, session_id, None, occurred_at)?;
     let reopened: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = tx
         .query_row(
             "UPDATE handoffs \
@@ -1578,8 +1667,9 @@ fn end_session_row(
     conn: &Connection,
     session_id: &SessionId,
     summary_page_id: Option<&PageId>,
+    occurred_at: Option<i64>,
 ) -> StoreResult<()> {
-    let now = Timestamp::now().as_microsecond();
+    let now = occurred_at.unwrap_or_else(|| Timestamp::now().as_microsecond());
     let page_blob: Option<&[u8]> = summary_page_id.map(|p| &p.as_bytes()[..]);
     conn.execute(
         "UPDATE sessions \
@@ -1724,9 +1814,13 @@ pub fn admit_hook_session_event(
             if !owner_filter.admits(session.actor_user.as_deref()) {
                 return Err(StoreError::SessionCollision);
             }
+            // `now` is also the ingest-key TTL clock above; started_at honors
+            // the caller's original event time (backfill) and only falls
+            // back to it when absent (live capture).
+            let started_at = session.occurred_at.unwrap_or(now);
             tx.execute(
                 "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), now, session.actor_user.as_deref()],
+                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref()],
             )?;
             (session.actor_user.clone(), None, 0)
         }
@@ -1817,10 +1911,11 @@ pub fn end_admitted_session(
     conn: &mut Connection,
     admitted: &AdmittedSession,
     page: Option<&PageId>,
+    occurred_at: Option<i64>,
 ) -> StoreResult<()> {
     let tx = conn.transaction()?;
     validate_admitted_session(&tx, admitted)?;
-    end_session_row(&tx, &admitted.session_id, page)?;
+    end_session_row(&tx, &admitted.session_id, page, occurred_at)?;
     tx.commit()?;
     Ok(())
 }
@@ -1829,10 +1924,11 @@ pub fn end_admitted_session(
 pub fn end_admitted_lifecycle_only_session(
     conn: &mut Connection,
     admitted: &AdmittedSession,
+    occurred_at: Option<i64>,
 ) -> StoreResult<LifecycleOnlyEndOutcome> {
     let tx = conn.transaction()?;
     validate_admitted_session(&tx, admitted)?;
-    let outcome = end_lifecycle_only_session_in_tx(&tx, &admitted.session_id)?;
+    let outcome = end_lifecycle_only_session_in_tx(&tx, &admitted.session_id, occurred_at)?;
     tx.commit()?;
     Ok(outcome)
 }
@@ -1843,6 +1939,7 @@ pub fn end_admitted_session_with_handoff(
     admitted: &AdmittedSession,
     page: Option<&PageId>,
     handoff: &NewHandoff,
+    occurred_at: Option<i64>,
 ) -> StoreResult<HandoffId> {
     if handoff.from_session_id != Some(admitted.session_id)
         || handoff.workspace_id != admitted.workspace_id
@@ -1853,7 +1950,7 @@ pub fn end_admitted_session_with_handoff(
     }
     let tx = conn.transaction()?;
     validate_admitted_session(&tx, admitted)?;
-    end_session_row(&tx, &admitted.session_id, page)?;
+    end_session_row(&tx, &admitted.session_id, page, occurred_at)?;
     let id = insert_handoff_row(&tx, handoff)?;
     tx.commit()?;
     Ok(id)
@@ -1899,7 +1996,9 @@ pub fn complete_observation_ingest_if_claimed(
 /// (`&Connection` so it also runs inside a [`rusqlite::Transaction`]).
 fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResult<ObservationId> {
     let id = ObservationId::new();
-    let now = Timestamp::now().as_microsecond();
+    let now = obs
+        .occurred_at
+        .unwrap_or_else(|| Timestamp::now().as_microsecond());
     let kind = observation_kind_as_str(obs.kind);
     let importance: i64 = i64::from(obs.importance.clamp(1, 10));
     let (extension, source_event) = match (&obs.extension, &obs.source_event) {
@@ -2740,7 +2839,7 @@ pub fn end_session_with_handoff(
             "automatic handoff owner does not match the ended session".into(),
         ));
     }
-    end_session_row(&tx, session_id, summary_page_id)?;
+    end_session_row(&tx, session_id, summary_page_id, None)?;
     let id = insert_handoff_row(&tx, handoff)?;
     tx.commit()?;
     Ok(id)
@@ -3923,7 +4022,7 @@ pub struct PurgeSessionSummary {
     pub observations_deleted: u64,
     /// `handoffs` rows removed — only those this session *authored*.
     pub handoffs_deleted: u64,
-    /// `pages` rows removed, counting every version in the supersession chain.
+    /// `pages` rows removed, counting every version the session wrote.
     pub pages_deleted: u64,
     /// `auto_improve_runs` rows removed.
     pub auto_improve_runs_deleted: u64,
@@ -3947,9 +4046,10 @@ pub struct PurgeSessionSummary {
 ///   `project_id` wherever the table carries them, so even a mismatched id
 ///   cannot reach a row in another workspace or project;
 /// - derived pages are deleted by **id**, from a set collected and
-///   scope-checked first — never by path. Two projects may hold the same
-///   `sessions/<uuid>.md` path, and a hand-written page can occupy the path a
-///   session later claims; deleting by path would take those with it.
+///   scope-checked first — never by path alone. Two projects may hold the
+///   same `sessions/<uuid>.md` path, and hand-written versions can share the
+///   path with the session's own; only the recorded summary and versions
+///   whose frontmatter `session_id` names this session are collected.
 ///
 /// # Ordering
 ///
@@ -3996,22 +4096,27 @@ pub fn purge_session(
 
     // ---- collect, before anything is cut ----
 
-    // The derived page and every version of it. Walk from the recorded
-    // summary page across the supersession chain, staying inside the scope.
+    // The recorded summary, plus every version at the session's page path
+    // whose frontmatter names this session — the key each session-page
+    // writer stamps, and the one OKF derives `sources` from. Manual edits at
+    // that path, before, after or between summaries, carry no such key.
     let page_ids: Vec<Vec<u8>> = {
         let mut stmt = tx.prepare(
-            "WITH RECURSIVE chain(id) AS ( \
-                 SELECT summary_page_id FROM sessions \
-                  WHERE id = ?1 AND summary_page_id IS NOT NULL \
-                 UNION \
-                 SELECT p.id FROM pages p JOIN chain c ON p.supersedes = c.id \
-             ) \
-             SELECT p.id FROM pages p JOIN chain c ON p.id = c.id \
-              WHERE p.workspace_id = ?2 AND p.project_id = ?3",
+            "SELECT id FROM pages \
+              WHERE workspace_id = ?2 AND project_id = ?3 \
+                AND (id = (SELECT summary_page_id FROM sessions WHERE id = ?1) \
+                     OR (path = ?4 AND json_extract(frontmatter_json, '$.session_id') = ?5))",
         )?;
-        stmt.query_map(rusqlite::params![&sid[..], &wid[..], &pid[..]], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?
+        stmt.query_map(
+            rusqlite::params![
+                &sid[..],
+                &wid[..],
+                &pid[..],
+                format!("sessions/{session_id}.md"),
+                session_id.to_string()
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
@@ -4080,6 +4185,24 @@ pub fn purge_session(
             rusqlite::params![&id[..], &wid[..], &pid[..]],
         )? as u64;
     }
+    // A later manual rewrite at this path is still the live wiki file.
+    let removed_paths = {
+        let mut stmt = tx.prepare(
+            "SELECT EXISTS(SELECT 1 FROM pages WHERE workspace_id = ?1 AND project_id = ?2 \
+             AND path = ?3 AND is_latest = 1)",
+        )?;
+        let mut paths_to_remove = Vec::new();
+        for path in removed_paths {
+            let has_live_page: bool = stmt.query_row(
+                rusqlite::params![&wid[..], &pid[..], path.as_str()],
+                |row| row.get(0),
+            )?;
+            if !has_live_page {
+                paths_to_remove.push(path);
+            }
+        }
+        paths_to_remove
+    };
 
     // Deleted explicitly rather than left to the cascade so the row count is
     // known and can be reported. Measured: this does *not* change what the
@@ -5426,6 +5549,7 @@ pub(crate) mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         for kind in ai_memory_core::AgentKind::ALL {
             let session = NewSession {
+                occurred_at: None,
                 id: ai_memory_core::SessionId::new(),
                 workspace_id: ws,
                 project_id: proj,
@@ -5672,6 +5796,7 @@ pub(crate) mod tests {
         owner: Option<&str>,
     ) -> NewSession {
         NewSession {
+            occurred_at: None,
             id,
             workspace_id: ws,
             project_id: proj,
@@ -5683,6 +5808,7 @@ pub(crate) mod tests {
 
     fn hook_observation(session: &NewSession) -> NewObservation {
         NewObservation {
+            occurred_at: None,
             session_id: session.id,
             workspace_id: session.workspace_id,
             project_id: session.project_id,
@@ -6097,6 +6223,114 @@ pub(crate) mod tests {
             summary.removed_paths,
             vec![PagePath::new("sessions/target.md").unwrap()]
         );
+    }
+
+    /// A session page as its writers stamp it (synth, consolidator): the
+    /// frontmatter names the session, and OKF derives `sources` from that.
+    fn session_page(ws: WorkspaceId, proj: ProjectId, sid: SessionId, body: &str) -> NewPage {
+        let mut generated = page(ws, proj, &format!("sessions/{sid}.md"), body);
+        generated.frontmatter_json = serde_json::json!({"session_id": sid.to_string()});
+        generated
+    }
+
+    #[test]
+    fn purge_session_removes_older_summary_versions_without_deleting_prior_manual_page() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let path = format!("sessions/{sid}.md");
+        let manual = upsert_page(&mut conn, &page(ws, proj, &path, "manual")).unwrap();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+
+        let mut latest = None;
+        for version in 1..=3 {
+            let generated = session_page(ws, proj, sid, &format!("summary {version}"));
+            latest = Some(upsert_page(&mut conn, &generated).unwrap());
+        }
+        end_session(&mut conn, &sid, latest.as_ref()).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 3);
+        // The manual version survives, but as history: nothing is latest at
+        // the path any more, so its wiki file is unlinked with the summary.
+        assert_eq!(summary.removed_paths, vec![PagePath::new(path).unwrap()]);
+        let survivor: (Vec<u8>, bool) = conn
+            .query_row("SELECT id, is_latest FROM pages", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(survivor, (manual.as_bytes().to_vec(), false));
+    }
+
+    #[test]
+    fn purge_session_keeps_later_manual_page_and_its_wiki_path() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let path = format!("sessions/{sid}.md");
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        let first = upsert_page(&mut conn, &session_page(ws, proj, sid, "summary")).unwrap();
+        let middle_manual =
+            upsert_page(&mut conn, &page(ws, proj, &path, "manual interim")).unwrap();
+        let latest =
+            upsert_page(&mut conn, &session_page(ws, proj, sid, "updated summary")).unwrap();
+        end_session(&mut conn, &sid, Some(&latest)).unwrap();
+        let manual = upsert_page(&mut conn, &page(ws, proj, &path, "manual rewrite")).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 2);
+        assert!(summary.removed_paths.is_empty());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 2);
+        let survivor: (Vec<u8>, bool) = conn
+            .query_row(
+                "SELECT id, is_latest FROM pages WHERE is_latest = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(survivor, (manual.as_bytes().to_vec(), true));
+        assert_ne!(first, manual);
+        assert_ne!(middle_manual, manual);
+    }
+
+    /// A session page can exist while `summary_page_id` is NULL: the session
+    /// has not ended, or a move cleared the link. Its pages are still the
+    /// session's and must go with it.
+    #[test]
+    fn purge_session_removes_pages_of_a_session_without_a_recorded_summary() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        upsert_page(&mut conn, &session_page(ws, proj, sid, "checkpoint 1")).unwrap();
+        upsert_page(&mut conn, &session_page(ws, proj, sid, "checkpoint 2")).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0);
+        assert_eq!(
+            summary.removed_paths,
+            vec![PagePath::new(format!("sessions/{sid}.md")).unwrap()]
+        );
+    }
+
+    /// The OKF migration conformed only latest rows, so a version superseded
+    /// before it ran carries `session_id` but no derived `sources`.
+    #[test]
+    fn purge_session_removes_summary_versions_written_before_okf_sources() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid, ws, proj, None)).unwrap();
+        let old = upsert_page(&mut conn, &session_page(ws, proj, sid, "old summary")).unwrap();
+        conn.execute(
+            "UPDATE pages SET frontmatter_json = json_remove(frontmatter_json, '$.sources') \
+             WHERE id = ?1",
+            params![old.as_bytes()],
+        )
+        .unwrap();
+        let latest = upsert_page(&mut conn, &session_page(ws, proj, sid, "new summary")).unwrap();
+        end_session(&mut conn, &sid, Some(&latest)).unwrap();
+
+        let summary = purge_session(&mut conn, ws, proj, sid, None, Compaction::Skip).unwrap();
+        assert_eq!(summary.pages_deleted, 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pages"), 0);
     }
 
     /// The blast radius must stop at the session. A sibling session in the
@@ -7879,6 +8113,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: receiver,
                 workspace_id: ws,
                 project_id: proj,
@@ -7978,6 +8213,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: receiver,
                 workspace_id: ws,
                 project_id: proj,
@@ -8010,6 +8246,7 @@ pub(crate) mod tests {
         insert_observation(
             &mut conn,
             &NewObservation {
+                occurred_at: None,
                 session_id: receiver,
                 workspace_id: ws,
                 project_id: proj,
@@ -8057,6 +8294,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: receiver,
                 workspace_id: ws,
                 project_id: proj,
@@ -8069,6 +8307,7 @@ pub(crate) mod tests {
         insert_observation(
             &mut conn,
             &NewObservation {
+                occurred_at: None,
                 session_id: receiver,
                 workspace_id: ws,
                 project_id: proj,
@@ -8102,6 +8341,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: receiver,
                 workspace_id: ws,
                 project_id: proj,
@@ -8114,6 +8354,7 @@ pub(crate) mod tests {
         insert_observation(
             &mut conn,
             &NewObservation {
+                occurred_at: None,
                 session_id: receiver,
                 workspace_id: ws,
                 project_id: proj,
@@ -8140,6 +8381,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: first_session,
                 workspace_id: ws,
                 project_id: proj,
@@ -8345,6 +8587,7 @@ pub(crate) mod tests {
             begin_session(
                 &mut conn,
                 &NewSession {
+                    occurred_at: None,
                     id: sid,
                     workspace_id: ws,
                     project_id: proj,
@@ -8375,6 +8618,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: proj,
@@ -8418,6 +8662,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: proj,
@@ -8436,6 +8681,197 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert!(summary.is_none());
+    }
+
+    /// `occurred_at` lets a caller (backfill) stamp a session with the
+    /// transcript's own original start time instead of import time.
+    #[test]
+    fn begin_session_with_occurred_at_stamps_started_at_from_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let original: i64 = 1_757_505_600_000_000; // 2025-09-10T12:00:00Z
+        begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: Some(original),
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let started_at: i64 = conn
+            .query_row(
+                "SELECT started_at FROM sessions WHERE id = ?1",
+                params![&sid.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(started_at, original);
+    }
+
+    /// Without `occurred_at`, `begin_session` keeps stamping "now" — the
+    /// live-capture behaviour must not regress.
+    #[test]
+    fn begin_session_without_occurred_at_stamps_now() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        let before = Timestamp::now().as_microsecond();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let after = Timestamp::now().as_microsecond();
+        let started_at: i64 = conn
+            .query_row(
+                "SELECT started_at FROM sessions WHERE id = ?1",
+                params![&sid.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (before..=after).contains(&started_at),
+            "started_at {started_at} must fall within [{before}, {after}]"
+        );
+    }
+
+    /// `end_session`'s `occurred_at` param stamps `ended_at` with the
+    /// original event time (e.g. backfill's last transcript event) rather
+    /// than import time.
+    #[test]
+    fn end_session_with_occurred_at_stamps_ended_at_from_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let original: i64 = 1_757_505_900_000_000; // 2025-09-10T12:05:00Z
+        end_session_row(&conn, &sid, None, Some(original)).unwrap();
+        let ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![&sid.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended_at, original);
+    }
+
+    /// `insert_observation`'s `occurred_at` stamps `created_at` with the
+    /// original event time instead of import time.
+    #[test]
+    fn insert_observation_with_occurred_at_stamps_created_at_from_it() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let original: i64 = 1_757_505_660_000_000; // 2025-09-10T12:01:00Z
+        let obs_id = insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: Some(original),
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "hook".into(),
+                body: "observation".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+        let created_at: i64 = conn
+            .query_row(
+                "SELECT created_at FROM observations WHERE id = ?1",
+                params![&obs_id.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_at, original);
+    }
+
+    /// Without `occurred_at`, `insert_observation` keeps stamping "now".
+    #[test]
+    fn insert_observation_without_occurred_at_stamps_now() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let before = Timestamp::now().as_microsecond();
+        let obs_id = insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "hook".into(),
+                body: "observation".into(),
+                importance: 5,
+            },
+        )
+        .unwrap();
+        let after = Timestamp::now().as_microsecond();
+        let created_at: i64 = conn
+            .query_row(
+                "SELECT created_at FROM observations WHERE id = ?1",
+                params![&obs_id.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (before..=after).contains(&created_at),
+            "created_at {created_at} must fall within [{before}, {after}]"
+        );
     }
 
     /// Embeddings are keyed by page_id (PK). Re-storing for the same
@@ -8704,6 +9140,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: src_ws,
                 project_id: proj,
@@ -8716,6 +9153,7 @@ pub(crate) mod tests {
         insert_observation(
             &mut conn,
             &NewObservation {
+                occurred_at: None,
                 session_id: sid,
                 workspace_id: src_ws,
                 project_id: proj,
@@ -8855,6 +9293,7 @@ pub(crate) mod tests {
         begin_session(
             conn,
             &NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: proj,
@@ -8868,6 +9307,7 @@ pub(crate) mod tests {
             insert_observation(
                 conn,
                 &NewObservation {
+                    occurred_at: None,
                     session_id: sid,
                     workspace_id: ws,
                     project_id: proj,
@@ -9346,6 +9786,7 @@ pub(crate) mod tests {
             insert_observation(
                 conn,
                 &NewObservation {
+                    occurred_at: None,
                     session_id: sid,
                     workspace_id: ws,
                     project_id: proj,
@@ -9658,6 +10099,7 @@ pub(crate) mod tests {
             insert_observation(
                 &mut conn,
                 &NewObservation {
+                    occurred_at: None,
                     session_id: sid,
                     workspace_id: ws,
                     project_id: fragment,
@@ -9742,6 +10184,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: SessionId::new(),
                 workspace_id: ws,
                 project_id: with_data,
@@ -9863,6 +10306,7 @@ pub(crate) mod tests {
             insert_observation(
                 &mut conn,
                 &NewObservation {
+                    occurred_at: None,
                     session_id: sid,
                     workspace_id: ws,
                     project_id: fragment,
@@ -9954,6 +10398,7 @@ pub(crate) mod tests {
             insert_observation(
                 &mut conn,
                 &NewObservation {
+                    occurred_at: None,
                     session_id: existing_sid,
                     workspace_id: ws,
                     project_id: proj,
@@ -10452,6 +10897,7 @@ pub(crate) mod tests {
             begin_session(
                 &mut conn,
                 &NewSession {
+                    occurred_at: None,
                     id: bad_sid,
                     workspace_id: other_ws,
                     project_id: proj,
@@ -10468,6 +10914,7 @@ pub(crate) mod tests {
         begin_session(
             &mut conn,
             &NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: ws,
                 project_id: proj,
@@ -10481,6 +10928,7 @@ pub(crate) mod tests {
         // The split-brain case the maintainer flagged: a hook writes an
         // observation with a stale workspace id for a moved project.
         let mismatched_obs = NewObservation {
+            occurred_at: None,
             session_id: sid,
             workspace_id: other_ws,
             project_id: proj,
@@ -11528,7 +11976,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(matches!(
-            end_admitted_session(&mut conn, &guard, None),
+            end_admitted_session(&mut conn, &guard, None, None),
             Err(StoreError::SessionCollision)
         ));
         begin_session(&mut conn, &session).unwrap();
@@ -11538,7 +11986,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(matches!(
-            end_admitted_lifecycle_only_session(&mut conn, &guard),
+            end_admitted_lifecycle_only_session(&mut conn, &guard, None),
             Err(StoreError::SessionCollision)
         ));
         let handoff = NewHandoff {
@@ -11555,7 +12003,7 @@ pub(crate) mod tests {
             owner_user: Some("user:alice".into()),
         };
         assert!(matches!(
-            end_admitted_session_with_handoff(&mut conn, &guard, None, &handoff),
+            end_admitted_session_with_handoff(&mut conn, &guard, None, &handoff, None),
             Err(StoreError::SessionCollision)
         ));
 
@@ -11590,7 +12038,7 @@ pub(crate) mod tests {
         acceptance.accepting_session = Some(receiver.id);
         assert!(accept_handoff(&mut conn, &acceptance).unwrap());
         assert_eq!(
-            end_admitted_lifecycle_only_session(&mut conn, &receiver_guard).unwrap(),
+            end_admitted_lifecycle_only_session(&mut conn, &receiver_guard, None).unwrap(),
             LifecycleOnlyEndOutcome::Ended {
                 reopened_handoff: Some(handoff_id)
             }
