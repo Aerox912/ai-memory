@@ -10,8 +10,9 @@ To keep recognized file-tool events under private paths out of ai-memory before
 they are spooled or sent, configure `[capture] ignore_paths` in the nearest
 `.ai-memory.toml`. The canonical grammar, limitations, support matrix, refresh
 requirements, and safe local `--check-capture` command are in
-[the marker-file reference](marker-file.md#capture-exclusions). This is not a
-general prompt/output DLP filter.
+[the marker-file reference](marker-file.md#capture-exclusions). Shell commands
+are matched by their path arguments too (`cat docs/adr/*.md`), lexically. This
+is not a general prompt/output DLP filter.
 
 ## Cross-agent handoff
 
@@ -522,7 +523,9 @@ pull requests). Three facts frame how such a record and ai-memory interact:
    ```
 
    The repo owns that record; a compiled copy goes stale the moment the
-   repo moves. Details and bounds in [`docs/marker-file.md`](marker-file.md).
+   repo moves. Details and bounds in [`docs/marker-file.md`](marker-file.md),
+   including what shell matching cannot see and how to exclude large tool
+   results an agent saves and re-reads from another path.
 
 3. **Wiki pages marked `pinned: true` are immutable to automation.**
    Retention decay and curation skip them, multi-page consolidation

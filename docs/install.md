@@ -1899,6 +1899,23 @@ Replace the model with another current OrcaRouter model id (same
 `provider/model` format as OpenRouter, e.g. `anthropic/claude-sonnet-4.6` or
 `deepseek/deepseek-v4-flash`) when needed.
 
+[Cheaper Inference](https://cheaperinference.com) is an OpenAI-compatible LLM
+gateway that advertises models below each lab's list price. It uses
+the same provider; no dedicated ai-memory provider is needed.
+Pass its API key through the generic compatibility credential:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.cheaperinference.com/v1
+-e AI_MEMORY_LLM_MODEL=gpt-5.4-mini
+-e LLM_API_KEY=ci_live_...
+```
+
+Model ids are bare, without a `provider/` prefix. Replace the model with
+another current Cheaper Inference model id (e.g. `claude-haiku-4.5` or
+`deepseek-v4-flash`) when needed. Cheaper Inference serves chat models only
+and has no embeddings endpoint; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
