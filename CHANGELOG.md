@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.2-aerox.1] - 2026-09-29
+
 ### Changed
 - Integrated canonical v2.4.2 through `a0ca8d1a`, retaining the maintained Aerox MCP session profiles, file-backed authentication, and native Windows/Linux packaging. This includes the v2.4.1 managed-run and restore fixes plus capture-policy, title-sanitization, wiki indexing, and OKF export fixes. (#973, #982)
 
