@@ -88,6 +88,15 @@ pub struct SpoolEntry {
     /// (with `created_ms`) to drop a permanently-undeliverable event.
     #[serde(default)]
     pub attempts: u32,
+    /// Server profile this event was routed to by its repository's marker
+    /// (#992), `None` for the install default. Absent from the file when
+    /// `None`, so entries without a profile are byte-identical to before.
+    ///
+    /// Marks the entry as bound to exactly one server: the drain never
+    /// retries it with another server's credential, and never re-points it
+    /// at the configured default address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// `<data_dir>/hook-spool` — the spool directory.
@@ -230,36 +239,9 @@ pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
 /// Create the spool directory `0700` on Unix so the excerpt bodies that reside
 /// there (up to `MAX_AGE_MS`) — and even the timestamp+pid metadata in the file
 /// names — are only reachable by the owner (#196). The spool holds private
-/// capture until it drains; a world-readable directory would leak that. On
-/// non-Unix the mode is a no-op (falls back to `create_dir_all`). Idempotent:
-/// an existing directory's mode is left untouched (never widened, never
-/// narrowed) to avoid churning a path an operator may have set deliberately.
+/// capture until it drains; a world-readable directory would leak that.
 fn create_spool_dir(spool: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        if spool.is_dir() {
-            return Ok(());
-        }
-        match std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(spool)
-        {
-            Ok(()) => Ok(()),
-            // A concurrent drainer/enqueue may have created it between the check
-            // and the call; treat an existing directory as success.
-            Err(e) if spool.is_dir() => {
-                let _ = e;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(spool)
-    }
+    super::path_util::create_private_dir(spool)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -312,6 +294,16 @@ pub fn entry_for_pool(
         auth_mode,
         pool_id: pool_id.map(str::to_owned),
         attempts: 0,
+        profile: None,
+    }
+}
+
+impl SpoolEntry {
+    /// Tag the entry with the server profile its marker routed it to (#992).
+    #[must_use]
+    pub fn routed_to(mut self, profile: Option<&str>) -> Self {
+        self.profile = profile.map(str::to_owned);
+        self
     }
 }
 
@@ -832,6 +824,7 @@ async fn drain_with_runtime(
     let client = build_client();
     let started = Instant::now();
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
+    let mut profile_tokens = ProfileTokens::new(data_dir);
     let mut result = DrainResult::default();
 
     let mut idx = 0;
@@ -881,18 +874,21 @@ async fn drain_with_runtime(
             continue;
         }
 
-        if entry.auth_mode == AuthMode::Static && runtime.static_bearer.is_none() {
-            result.remaining += 1 + files.len().saturating_sub(idx);
-            break;
-        }
         let bearer = entry_bearer(
             &entry,
             &client,
             data_dir,
             &mut oidc_cache,
             runtime.static_bearer,
+            &mut profile_tokens,
         )
         .await;
+        if bearer.is_none() && (entry.auth_mode == AuthMode::Static || entry.profile.is_some()) {
+            // A missing/reassigned profile must never borrow the install token
+            // or send anonymously. Other routes may still be deliverable.
+            result.remaining += 1;
+            continue;
+        }
 
         if batch_supported {
             // Extend the chunk over consecutive entries sharing the same batch
@@ -924,11 +920,12 @@ async fn drain_with_runtime(
                     bump_or_drop(&next_path, &next_entry, &mut result);
                     continue;
                 }
-                if batch_endpoint(&next_entry.url) != base {
-                    idx -= 1;
-                    break;
-                }
-                if next_entry.auth_mode == AuthMode::Static && runtime.static_bearer.is_none() {
+                // A profile entry never shares a request with another route,
+                // even at the same address: the retry and reroot decisions
+                // below are made once per chunk, from its first entry.
+                if batch_endpoint(&next_entry.url) != base
+                    || next_entry.profile != chunk[0].1.profile
+                {
                     idx -= 1;
                     break;
                 }
@@ -938,6 +935,7 @@ async fn drain_with_runtime(
                     data_dir,
                     &mut oidc_cache,
                     runtime.static_bearer,
+                    &mut profile_tokens,
                 )
                 .await;
                 if next_bearer != bearer {
@@ -1035,6 +1033,7 @@ async fn drain_with_runtime(
                             data_dir,
                             &mut oidc_cache,
                             runtime.static_bearer,
+                            &mut profile_tokens,
                         )
                         .await;
                         match post_hook(
@@ -1056,6 +1055,13 @@ async fn drain_with_runtime(
                             PostOutcome::Failed => {
                                 bump_or_drop(path, entry, &mut result);
                             }
+                            PostOutcome::Refused => {
+                                // Never retried: see `PostOutcome::Refused`.
+                                // Dropped rather than charged an attempt, so
+                                // it cannot sit in the spool being re-sent.
+                                let _ = std::fs::remove_file(path);
+                                result.dropped += 1;
+                            }
                             PostOutcome::Unreachable => {
                                 // Same reasoning as the batch arm: the address
                                 // is dead, not the entry. Charge it once, then
@@ -1066,15 +1072,19 @@ async fn drain_with_runtime(
                             PostOutcome::Unauthorized => {
                                 // Credential rejected, not the entry. Retry once
                                 // with this drain's live token (#542).
-                                let retry =
-                                    static_retry_token(entry, item_bearer.as_deref(), live_token);
+                                let retry = static_retry_token(
+                                    entry,
+                                    item_bearer.as_deref(),
+                                    live_token,
+                                    &mut profile_tokens,
+                                );
                                 let recovered = match retry {
                                     Some(token) => matches!(
                                         post_hook(
                                             &client,
                                             &entry.url,
                                             &entry.body,
-                                            Some(token),
+                                            Some(&token),
                                             per_event_timeout,
                                         )
                                         .await,
@@ -1111,8 +1121,12 @@ async fn drain_with_runtime(
                     let configured = configured_server
                         .get_or_insert_with(|| configured_server_url(data_dir))
                         .clone();
+                    // A profile entry is left alone too: `config.toml`'s
+                    // address is the install default, and re-pointing a
+                    // profile's capture there is the cross-server delivery
+                    // profiles exist to prevent (#992).
                     let retry = configured.as_deref().and_then(|server| {
-                        if !is_loopback_url(&chunk[0].1.url) {
+                        if chunk[0].1.profile.is_some() || !is_loopback_url(&chunk[0].1.url) {
                             return None;
                         }
                         let rerooted = batch_endpoint(&reroot_url(&chunk[0].1.url, server)?);
@@ -1168,9 +1182,15 @@ async fn drain_with_runtime(
                     // current by construction. Runs only for a batch that has
                     // already been rejected, so a healthy drain never pays for
                     // it.
-                    let retry = static_retry_token(&chunk[0].1, bearer.as_deref(), live_token);
+                    let retry = static_retry_token(
+                        &chunk[0].1,
+                        bearer.as_deref(),
+                        live_token,
+                        &mut profile_tokens,
+                    );
                     if let Some(token) = retry {
-                        match post_batch(&client, &base, &payload, Some(token), batch_timeout).await
+                        match post_batch(&client, &base, &payload, Some(&token), batch_timeout)
+                            .await
                         {
                             BatchOutcome::Accepted(k) => {
                                 let k = k.min(chunk.len());
@@ -1234,6 +1254,11 @@ async fn drain_with_runtime(
                 PostOutcome::Saturated => {
                     result.remaining += 1;
                 }
+                PostOutcome::Refused => {
+                    // Terminal; see `PostOutcome::Refused`.
+                    let _ = std::fs::remove_file(path);
+                    result.dropped += 1;
+                }
                 PostOutcome::Failed => {
                     bump_or_drop(&path, &entry, &mut result);
                 }
@@ -1244,14 +1269,19 @@ async fn drain_with_runtime(
                 PostOutcome::Unauthorized => {
                     // Credential rejected, not the entry. Retry once with this
                     // drain's live token (#542).
-                    let retry = static_retry_token(&entry, bearer.as_deref(), live_token);
+                    let retry = static_retry_token(
+                        &entry,
+                        bearer.as_deref(),
+                        live_token,
+                        &mut profile_tokens,
+                    );
                     let recovered = match retry {
                         Some(token) => matches!(
                             post_hook(
                                 &client,
                                 &entry.url,
                                 &entry.body,
-                                Some(token),
+                                Some(&token),
                                 per_event_timeout,
                             )
                             .await,
@@ -1358,7 +1388,9 @@ fn load_live_entry(
     // (`/hook/batch` chunk or the per-event fallback). Loading is the single
     // choke point both paths pass through, so one strip here covers both.
     strip_assistant_from_entry(&mut entry);
-    if trusted_hook_url.is_some_and(|url| !bind_entry_to_server(&mut entry, url)) {
+    if entry.profile.is_none()
+        && trusted_hook_url.is_some_and(|url| !bind_entry_to_server(&mut entry, url))
+    {
         let _ = std::fs::remove_file(path);
         result.dropped += 1;
         return None;
@@ -1386,7 +1418,7 @@ fn body_is_malformed(entry: &SpoolEntry) -> bool {
 }
 
 /// Resolve the bearer for a spooled entry at drain time: a `Static` token comes
-/// only from the live drainer; an `Oidc` entry resolves (and refreshes) the
+/// only from the live drainer or its own registered server profile; an `Oidc` entry resolves (and refreshes) the
 /// stored token once per drain via `oidc_cache`; `Anonymous` is None.
 async fn entry_bearer(
     entry: &SpoolEntry,
@@ -1394,7 +1426,11 @@ async fn entry_bearer(
     data_dir: &Path,
     oidc_cache: &mut Option<Option<String>>,
     static_bearer: Option<&str>,
+    profile_tokens: &mut ProfileTokens<'_>,
 ) -> Option<String> {
+    if let Some(profile) = entry.profile.as_deref() {
+        return profile_tokens.current(profile, &entry.url);
+    }
     match entry.auth_mode {
         AuthMode::Static => static_bearer.map(str::to_owned),
         AuthMode::Anonymous => None,
@@ -1441,15 +1477,61 @@ fn live_static_token() -> Option<String> {
 /// refreshed once per pass, so a 401 there is a real rejection — and the live
 /// token must actually differ from the one that just failed. Retrying an
 /// identical credential would only repeat the failure at double the cost.
-fn static_retry_token<'a>(
+///
+/// A profile-routed entry (#992) never sees the live token, which belongs to
+/// whichever install-default hook spawned this drain: presenting it to the
+/// entry's server would hand one server's credential to another. It retries
+/// with its own profile's current token instead, re-read from the data dir,
+/// and a profile that has since been removed means no retry at all.
+fn static_retry_token(
     entry: &SpoolEntry,
     rejected: Option<&str>,
-    live: Option<&'a str>,
-) -> Option<&'a str> {
+    live: Option<&str>,
+    profile_tokens: &mut ProfileTokens<'_>,
+) -> Option<String> {
     if entry.auth_mode != AuthMode::Static {
         return None;
     }
-    live.filter(|t| Some(*t) != rejected)
+    let current = match entry.profile.as_deref() {
+        Some(raw) => profile_tokens.current(raw, &entry.url)?,
+        None => live?.to_owned(),
+    };
+    (Some(current.as_str()) != rejected).then_some(current)
+}
+
+/// Each profile's current URL and token, read at most once per drain pass so
+/// a backlog of rejected entries costs one registry read per profile, not per
+/// entry.
+struct ProfileTokens<'a> {
+    data_dir: &'a Path,
+    cache: std::collections::HashMap<String, Option<crate::server_profiles::ResolvedServer>>,
+}
+
+impl<'a> ProfileTokens<'a> {
+    fn new(data_dir: &'a Path) -> Self {
+        Self {
+            data_dir,
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The profile's current token, only while the profile still points at
+    /// the server `entry_url` was captured against. After a URL change the
+    /// current token belongs to the *new* server, and replaying it to the old
+    /// address would hand it to a server it was never issued for.
+    fn current(&mut self, raw: &str, entry_url: &str) -> Option<String> {
+        let data_dir = self.data_dir;
+        let resolved = self
+            .cache
+            .entry(raw.to_owned())
+            .or_insert_with(|| {
+                let name = crate::server_profiles::ProfileName::parse(raw)?;
+                crate::server_profiles::lookup(data_dir, &name).ok()
+            })
+            .as_ref()?;
+        let rest = entry_url.strip_prefix(resolved.url.as_str())?;
+        rest.starts_with('/').then(|| resolved.token.clone())
+    }
 }
 
 /// Is this URL's host a loopback address?
@@ -2327,6 +2409,100 @@ mod tests {
         );
     }
 
+    /// #992, adversarial: the same shape as the test above, but the entry
+    /// was routed to a profile. `config.toml`'s address is the install
+    /// default, so the reroot must not fire — the live default server gets
+    /// nothing even though it would accept the batch.
+    #[tokio::test]
+    async fn a_profile_entry_on_a_dead_loopback_port_is_not_rerouted_to_the_default() {
+        let default_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = serve_counting_hook(default_hits.clone(), "200 OK").await;
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            format!("server_url = \"http://{live}\"\n"),
+        )
+        .unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue(
+            &spool,
+            &entry_for(
+                format!("http://{dead}/hook?event=x"),
+                "{}".into(),
+                Some("b-token"),
+                false,
+            )
+            .routed_to(Some("team-b")),
+        )
+        .unwrap();
+
+        let r = drain(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(
+            default_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the install-default server must never receive a profile's capture"
+        );
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 1);
+    }
+
+    /// A profile entry and an install-default entry never share a batch, even
+    /// when they share an address and a bearer: the retry and reroot
+    /// decisions are taken once per chunk.
+    #[tokio::test]
+    async fn profile_and_default_entries_at_one_address_ride_separate_batches() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(hits.clone(), "200 OK").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        crate::server_profiles::add(
+            tmp.path(),
+            &crate::server_profiles::ProfileName::parse("team-b").unwrap(),
+            &format!("http://{addr}"),
+            &[],
+            Some("same"),
+        )
+        .unwrap();
+        for profile in [None, Some("team-b"), None] {
+            enqueue(
+                &spool,
+                &entry_for(
+                    format!("http://{addr}/hook?event=x"),
+                    "{}".into(),
+                    Some("same"),
+                    false,
+                )
+                .routed_to(profile),
+            )
+            .unwrap();
+        }
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("same"),
+        )
+        .await;
+
+        assert_eq!(r.sent, 3);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
     /// The retry must not re-point a spool captured against another host on
     /// purpose. Only a loopback authority is unambiguous.
     #[tokio::test]
@@ -2630,41 +2806,248 @@ mod tests {
         assert_eq!(list_entries(&spool).unwrap().0.len(), 1, "entry survives");
     }
 
+    /// #992, adversarial: server B accepts exactly the install default's live
+    /// token. Had the drain presented it to B, the entry would deliver; it
+    /// must stay queued instead, because that token belongs to another server.
+    #[tokio::test]
+    async fn a_profile_entry_is_never_retried_with_the_install_live_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_b = serve_token_gated_hook("A-LIVE", count.clone()).await;
+
+        let entry = entry_for(
+            format!("http://{server_b}/hook?event=e0"),
+            "{}".into(),
+            Some("b-old"),
+            false,
+        )
+        .routed_to(Some("team-b"));
+        enqueue(&spool, &entry).unwrap();
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("A-LIVE"),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0, "server B must never see the install's token");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an unregistered profile must make no network request"
+        );
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 1, "entry survives");
+    }
+
+    /// The control: a rotated *profile* token is recovered, from the profile
+    /// store rather than the drain's environment.
+    #[tokio::test]
+    async fn a_profile_entry_recovers_with_its_own_rotated_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_b = serve_token_gated_hook("b-new", count.clone()).await;
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(
+            tmp.path(),
+            &name,
+            &format!("http://{server_b}"),
+            &[],
+            Some("b-new"),
+        )
+        .unwrap();
+
+        let entry = entry_for(
+            format!("http://{server_b}/hook?event=e0"),
+            "{}".into(),
+            Some("b-old"),
+            false,
+        )
+        .routed_to(Some("team-b"));
+        enqueue(&spool, &entry).unwrap();
+
+        let r = drain_with_live_token(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_millis(500),
+            Some("A-LIVE"),
+        )
+        .await;
+
+        assert_eq!(r.sent, 1);
+        assert_eq!(list_entries(&spool).unwrap().0.len(), 0);
+    }
+
     /// An identical token is not worth a second request, and a non-static
     /// entry is not this mechanism's business: an OIDC bearer is already
     /// resolved and refreshed once per pass, so a 401 there is a real
     /// rejection rather than a stale freeze.
     #[test]
     fn static_retry_token_only_fires_when_it_can_change_the_outcome() {
+        let dd = tempfile::tempdir().unwrap();
         let static_entry = entry_for("http://x/hook".into(), "{}".into(), Some("old"), false);
         let oidc_entry = entry_for("http://x/hook".into(), "{}".into(), None, true);
         let anon_entry = entry_for("http://x/hook".into(), "{}".into(), None, false);
 
         assert_eq!(
-            static_retry_token(&static_entry, Some("old"), Some("new")),
+            static_retry_token(
+                &static_entry,
+                Some("old"),
+                Some("new"),
+                &mut ProfileTokens::new(dd.path())
+            )
+            .as_deref(),
             Some("new"),
             "a rotated token is worth one retry"
         );
         assert_eq!(
-            static_retry_token(&static_entry, Some("old"), Some("old")),
+            static_retry_token(
+                &static_entry,
+                Some("old"),
+                Some("old"),
+                &mut ProfileTokens::new(dd.path())
+            ),
             None,
             "an identical token would only repeat the failure"
         );
         assert_eq!(
-            static_retry_token(&static_entry, Some("old"), None),
+            static_retry_token(
+                &static_entry,
+                Some("old"),
+                None,
+                &mut ProfileTokens::new(dd.path())
+            ),
             None,
             "no live token, nothing to retry with"
         );
         assert_eq!(
-            static_retry_token(&oidc_entry, Some("resolved"), Some("new")),
+            static_retry_token(
+                &oidc_entry,
+                Some("resolved"),
+                Some("new"),
+                &mut ProfileTokens::new(dd.path())
+            ),
             None,
             "OIDC is already re-resolved per pass; a 401 there is genuine"
         );
         assert_eq!(
-            static_retry_token(&anon_entry, None, Some("new")),
+            static_retry_token(
+                &anon_entry,
+                None,
+                Some("new"),
+                &mut ProfileTokens::new(dd.path())
+            ),
             None,
             "an anonymous entry was never authenticated"
         );
+    }
+
+    /// #992: a profile entry retries only with its own profile's current
+    /// token. The live token belongs to the install default; handing it to a
+    /// profile's server would leak one server's credential to another.
+    #[test]
+    fn a_profile_entry_never_retries_with_the_live_token() {
+        let dd = tempfile::tempdir().unwrap();
+        let entry = entry_for("http://b/hook".into(), "{}".into(), Some("b-old"), false)
+            .routed_to(Some("team-b"));
+
+        assert_eq!(
+            static_retry_token(
+                &entry,
+                Some("b-old"),
+                Some("A-LIVE"),
+                &mut ProfileTokens::new(dd.path())
+            ),
+            None,
+            "an unregistered profile has nothing to retry with"
+        );
+
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(dd.path(), &name, "http://b", &[], Some("b-new")).unwrap();
+        assert_eq!(
+            static_retry_token(
+                &entry,
+                Some("b-old"),
+                Some("A-LIVE"),
+                &mut ProfileTokens::new(dd.path())
+            )
+            .as_deref(),
+            Some("b-new"),
+            "a rotated profile token is re-read from the store"
+        );
+        assert_eq!(
+            static_retry_token(
+                &entry,
+                Some("b-new"),
+                Some("A-LIVE"),
+                &mut ProfileTokens::new(dd.path())
+            ),
+            None,
+            "the profile's current token already failed"
+        );
+    }
+
+    /// After the profile moves to another server, its current token belongs
+    /// to that server: an entry still addressed to the old one must not be
+    /// retried with it.
+    #[test]
+    fn a_profile_entry_is_not_retried_with_a_token_issued_for_a_new_url() {
+        let dd = tempfile::tempdir().unwrap();
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(dd.path(), &name, "https://new.example", &[], Some("NEW"))
+            .unwrap();
+        let stale = entry_for(
+            "https://old.example/hook?event=e".into(),
+            "{}".into(),
+            Some("OLD"),
+            false,
+        )
+        .routed_to(Some("team-b"));
+        let lookalike = entry_for(
+            "https://new.example.evil/hook?event=e".into(),
+            "{}".into(),
+            Some("OLD"),
+            false,
+        )
+        .routed_to(Some("team-b"));
+        let current = entry_for(
+            "https://new.example/hook?event=e".into(),
+            "{}".into(),
+            Some("OLD"),
+            false,
+        )
+        .routed_to(Some("team-b"));
+
+        let mut tokens = ProfileTokens::new(dd.path());
+        assert_eq!(
+            static_retry_token(&stale, Some("OLD"), None, &mut tokens),
+            None
+        );
+        assert_eq!(
+            static_retry_token(&lookalike, Some("OLD"), None, &mut tokens),
+            None
+        );
+        assert_eq!(
+            static_retry_token(&current, Some("OLD"), None, &mut tokens).as_deref(),
+            Some("NEW"),
+            "control: the same server still gets its rotated token"
+        );
+    }
+
+    /// Entries without a profile serialize exactly as they did before #992,
+    /// so an older binary draining a mixed spool reads them unchanged.
+    #[test]
+    fn an_install_default_entry_serializes_without_a_profile_field() {
+        let entry = entry_for("http://a/hook".into(), "{}".into(), Some("t"), false);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(json.get("profile").is_none(), "{json}");
+        let routed = serde_json::to_value(entry.routed_to(Some("team-b"))).unwrap();
+        assert_eq!(routed["profile"], "team-b");
     }
 
     /// A `401` must be distinguishable from any other refusal, or the drain
@@ -3180,6 +3563,63 @@ mod tests {
         );
         assert!(request.contains(&trusted_addr));
         assert!(!request.contains(&attacker_addr));
+    }
+
+    #[tokio::test]
+    async fn trusted_pool_drain_preserves_profile_destination_and_credential_isolation() {
+        let default_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let default_addr = serve_counting_hook(default_hits.clone(), "200 OK").await;
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let profile_addr = serve_recording_hook(requests.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let profile_url = format!("http://{profile_addr}");
+        crate::server_profiles::add(
+            tmp.path(),
+            &crate::server_profiles::ProfileName::parse("team-b").unwrap(),
+            &profile_url,
+            &[],
+            Some("profile-secret"),
+        )
+        .unwrap();
+        for pool in ["personal", "rws"] {
+            let entry = entry_for_pool(
+                format!("{profile_url}/hook?event=prompt"),
+                "{}".into(),
+                Some("runtime-only"),
+                false,
+                Some(pool),
+            )
+            .routed_to(Some("team-b"));
+            let serialized = serde_json::to_string(&entry).unwrap();
+            assert!(!serialized.contains("profile-secret"));
+            assert!(!serialized.contains("install-secret"));
+            enqueue(&spool, &entry).unwrap();
+        }
+        let default_url = format!("http://{default_addr}");
+        let result = drain_with_runtime(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            DrainRuntime {
+                trusted_server_url: Some(&default_url),
+                static_bearer: Some("install-secret"),
+                expected_pool_id: Some("personal"),
+            },
+        )
+        .await;
+        assert_eq!(result.sent, 1);
+        assert_eq!(result.remaining, 1);
+        assert_eq!(default_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer profile-secret")
+        );
+        assert!(!captured[0].contains("install-secret"));
     }
 
     #[tokio::test]
