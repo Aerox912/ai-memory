@@ -2317,7 +2317,12 @@ mod tests {
         ];
         for (command, expected_reason) in cases {
             let mut cfg = eval_cfg(command);
-            cfg.timeout_secs = if cfg!(windows) { 8 } else { 1 };
+            // Only the deliberately sleeping fixture needs the short deadline.
+            // Error/invalid-JSON cases keep the normal interpreter-start budget
+            // so a busy runner does not turn their expected error into a timeout.
+            if expected_reason == "eval_gate_timeout" && !cfg!(windows) {
+                cfg.timeout_secs = 1;
+            }
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
             let mut rejected = Vec::new();
             let mut warnings = Vec::new();
