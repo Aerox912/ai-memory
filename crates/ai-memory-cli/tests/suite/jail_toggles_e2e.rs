@@ -6,7 +6,8 @@
 //! `PATH`, runs the real `ai-memory run` in a temp git repository with a temp
 //! `HOME`, and points it at a local mock server that records every request.
 //! The fake `ai-jail` answers `--help` with a chosen help text (so support
-//! detection sees either a 2.4.1- or a 2.5.0-style binary) and otherwise
+//! detection sees either a 2.4.1- or a 2.5.0-style binary), accepts the
+//! side-effect-free `--dry-run` preflight, and otherwise
 //! writes its argv, one argument per line, to a file — the exact invocation
 //! `ai-memory` exec'd. Unix-only: the fakes are shebang scripts and the
 //! re-exec is a real `exec`.
@@ -106,7 +107,7 @@ impl Fixture {
         write_script(
             &bin.join("ai-jail"),
             &format!(
-                "if [ \"$1\" = --help ]; then cat '{}'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                "if [ \"$1\" = --help ]; then cat '{}'; exit 0; fi\nif [ \"$1\" = --dry-run ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\n",
                 help_file.display(),
                 jail_argv.display()
             ),
@@ -471,6 +472,40 @@ async fn jail_fails_closed_when_ai_jail_is_not_usable() {
         return;
     }
     let fixture = Fixture::new(HELP_2_4_1, false, None);
+    let (server, requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &["run", "--jail", "--no-autowire", "claude"],
+    )
+    .await;
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("ai-jail is not usable on this host"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(fixture.jail_argv().is_none());
+    assert!(!fixture.claude_ran.exists(), "never runs unjailed");
+    assert!(requests.lock().unwrap().is_empty());
+    handle.abort();
+}
+
+/// A discovered backend is insufficient when ai-jail rejects its trust boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jail_fails_closed_when_ai_jail_preflight_rejects_the_host() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    let jail = fixture.bin.join("ai-jail");
+    let script = fs::read_to_string(&jail).unwrap();
+    assert!(script.contains("--dry-run ]; then exit 0"));
+    fs::write(
+        &jail,
+        script.replace("--dry-run ]; then exit 0", "--dry-run ]; then exit 1"),
+    )
+    .unwrap();
     let (server, requests, handle) = mock_server().await;
     let output = run(
         &fixture,
