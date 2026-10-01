@@ -19,7 +19,7 @@
 //! lives here is only the *data* both consume.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -219,21 +219,35 @@ const CAPTURE_MAX_CALL_ID_CHARS = 128;
 type CaptureDisposition = "keep" | "drop" | "metadata-only";
 type CaptureProtocol = { version: 1; disposition: CaptureDisposition; policy_state: "inactive" | "active" | "invalid"; tool_family: "file" | "search-list" | "non-file" | "unknown"; path_count: number; extraction_state: "not-applicable" | "extracted" | "missing-or-malformed" | "unsupported-schema" };
 
-type CaptureConfig = { state: "inactive" | "active" | "invalid"; patterns: { path: string; windows: boolean; directory?: string; prefix: string }[]; base: string };
+type CaptureConfig = { state: "inactive" | "active" | "invalid"; patterns: { path: string; windows: boolean; directory?: string; prefix: string }[]; base: string; windowsHost: boolean };
 function readFileSync(path: string, encoding?: "utf8"): any { if (encoding) return readMarkerText(path, encoding); const fd = openSync(path, "r"); try { const bytes = Buffer.allocUnsafe(CAPTURE_MARKER_MAX_BYTES + 1); const count = readSync(fd, bytes, 0, bytes.length, 0); if (count > CAPTURE_MARKER_MAX_BYTES) throw new Error("marker too large"); const result = bytes.subarray(0, count); new TextDecoder("utf-8", { fatal: true }).decode(result); return result; } finally { closeSync(fd); } }
 function captureTrimComment(line: string): string { let quote = ""; let escaped = false; for (let i = 0; i < line.length; i++) { const c = line[i]; if (escaped) { escaped = false; continue; } if (c === "\\" && quote === '"') { escaped = true; continue; } if ((c === '"' || c === "'") && (!quote || quote === c)) quote = quote ? "" : c; else if (c === "#" && !quote) { line = line.slice(0, i); break; } } if (line.trimStart().startsWith("[") && !/^\s*\[[^\]]+\]\s*$/.test(line)) throw new Error("invalid table header"); if (quote) throw new Error("unterminated string"); return line; }
-function captureNormalize(path: string): { path: string; windows: boolean } | undefined { const p = path.replace(/\\/g, "/"); let root: string; let tail: string[]; if (p.startsWith("//")) { const x = p.slice(2).split("/").filter(Boolean); if (x.length < 2) return undefined; root = `//${x.shift()}/${x.shift()}`; tail = x; } else if (/^[A-Za-z]:\//.test(p)) { root = `${p[0].toUpperCase()}:/`; tail = p.slice(3).split("/"); } else if (p.startsWith("/")) { root = "/"; tail = p.slice(1).split("/"); } else return undefined; const out: string[] = []; for (const x of tail) { if (!x || x === ".") continue; if (x === "..") out.pop(); else out.push(x); } return { path: root + (out.length ? (root.endsWith("/") ? "" : "/") + out.join("/") : ""), windows: root !== "/" }; }
+// `windowsHost` is omitted for self-determining callers (the cwd/marker base,
+// and ignore_paths patterns, which are allowed an explicit UNC/drive form
+// regardless of host). It is passed explicitly, from the already-resolved
+// host base, only when normalizing an untrusted tool-argument candidate: on a
+// POSIX host a leading `//` there is an ordinary doubled separator, not a UNC
+// root, and must collapse before flavor detection or it escapes every POSIX
+// `ignore_paths` pattern via a flavor mismatch (GHSA-vh98).
+function captureNormalize(path: string, windowsHost?: boolean): { path: string; windows: boolean } | undefined { const raw = windowsHost === false && path.startsWith("//") ? `/${path.replace(/^\/+/, "")}` : path; const p = raw.replace(/\\/g, "/"); let root: string; let tail: string[]; if (p.startsWith("//")) { const x = p.slice(2).split("/").filter(Boolean); if (x.length < 2) return undefined; root = `//${x.shift()}/${x.shift()}`; tail = x; } else if (/^[A-Za-z]:\//.test(p)) { root = `${p[0].toUpperCase()}:/`; tail = p.slice(3).split("/"); } else if (p.startsWith("/")) { root = "/"; tail = p.slice(1).split("/"); } else return undefined; const out: string[] = []; for (const x of tail) { if (!x || x === ".") continue; if (x === "..") out.pop(); else out.push(x); } return { path: root + (out.length ? (root.endsWith("/") ? "" : "/") + out.join("/") : ""), windows: root !== "/" }; }
 function captureJoin(base: string, child: string): string { if (/^[^A-Za-z]?:|^[A-Za-z]:[^/\\]/.test(child)) return child; return `${base.replace(/[\\/]+$/, "")}/${child}`; }
 function captureValidGlob(p: string): boolean { return !!p && [...p].length <= CAPTURE_MAX_PATTERN_CHARS && !/[!{}\[\]()|^$%]/.test(p) && !p.includes("${") && !p.includes("***") && !p.replace(/\\/g, "/").split("/").includes("..") && (!p.startsWith("~") || p.startsWith("~/")) && !/^[^A-Za-z]?:/.test(p) && !/^[A-Za-z]:[^/\\]/.test(p); }
 function captureParseArray(value: string): string[] | undefined { let i = 0; const out: string[] = []; const ws = () => { while (/\s/.test(value[i] ?? "")) i++; }; const basic = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" } as Record<string, string>; ws(); if (value[i++] !== "[") return undefined; for (;;) { ws(); if (value[i] === "]") { i++; ws(); return i === value.length ? out : undefined; } const quote = value[i++]; if (quote !== '"' && quote !== "'") return undefined; let s = ""; for (;;) { if (i >= value.length) return undefined; const c = value[i++]; if (c === quote) break; if (c === "\\" && quote === '"') { const e = value[i++]; if (e in basic) s += basic[e]; else if (e === "u" || e === "U") { const count = e === "u" ? 4 : 8; const hex = value.slice(i, i + count); if (!new RegExp(`^[0-9A-Fa-f]{${count}}$`).test(hex)) return undefined; const n = Number.parseInt(hex, 16); if (n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)) return undefined; s += String.fromCodePoint(n); i += count; } else return undefined; } else if (c === "\n" || c === "\r") return undefined; else s += c; } out.push(s); ws(); if (value[i] === ",") { i++; continue; } if (value[i] === "]") continue; return undefined; } }
+function captureHostWindows(path: string): boolean { return path.startsWith("\\\\") || path.startsWith("//") || /^[A-Za-z]:/.test(path); }
 function captureConfig(cwd: string | undefined): CaptureConfig {
   const marker = findMarker(cwd);
   const candidateBase = captureNormalize(cwd ? resolve(cwd) : "")?.path ?? "";
-  if (!marker) return { state: "inactive", patterns: [], base: candidateBase };
+  // Host flavor comes from the cwd STRING itself, never from `resolve(cwd)`:
+  // `resolve` re-roots a drive/UNC-shaped cwd through the real OS's own path
+  // module, which only agrees on the OS that actually owns that path. The
+  // cwd the hook reports is already absolute and already names its own host,
+  // exactly like the native hook's pure-string `flavor_of(cwd)`.
+  const windowsHost = captureHostWindows(cwd ?? "");
+  if (!marker) return { state: "inactive", patterns: [], base: candidateBase, windowsHost };
   try {
     const bytes = readFileSync(marker);
     const markerBase = captureNormalize(dirname(marker))?.path ?? candidateBase;
-    if (bytes.byteLength > CAPTURE_MARKER_MAX_BYTES) return { state: "invalid", patterns: [], base: candidateBase };
+    if (bytes.byteLength > CAPTURE_MARKER_MAX_BYTES) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
     let section = "";
     let value = "";
     let collecting = false;
@@ -243,26 +257,26 @@ function captureConfig(cwd: string | undefined): CaptureConfig {
       if (!line) continue;
       const table = /^\[([^\]]+)\]$/.exec(line);
       if (table) {
-        if (collecting) return { state: "invalid", patterns: [], base: candidateBase };
+        if (collecting) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
         section = table[1];
         continue;
       }
       if (section !== "capture") continue;
       if (!seen) {
         const kv = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line);
-        if (!kv || kv[1] !== "ignore_paths") return { state: "invalid", patterns: [], base: candidateBase };
+        if (!kv || kv[1] !== "ignore_paths") return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
         seen = true;
         value = kv[2];
         collecting = !value.includes("]");
       } else if (collecting) {
         value += ` ${line}`;
         collecting = !value.includes("]");
-      } else return { state: "invalid", patterns: [], base: candidateBase };
+      } else return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
     }
-    if (collecting) return { state: "invalid", patterns: [], base: candidateBase };
-    if (!seen) return { state: "inactive", patterns: [], base: candidateBase };
+    if (collecting) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
+    if (!seen) return { state: "inactive", patterns: [], base: candidateBase, windowsHost };
     const strings = captureParseArray(value);
-    if (!strings || strings.length > CAPTURE_MAX_PATTERNS) return { state: "invalid", patterns: [], base: candidateBase };
+    if (!strings || strings.length > CAPTURE_MAX_PATTERNS) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
     const home = homedir();
     const patterns = strings.map((source) => {
       if (!captureValidGlob(source)) return undefined;
@@ -275,12 +289,12 @@ function captureConfig(cwd: string | undefined): CaptureConfig {
       if (!normalized) return undefined;
       return { path: normalized.path, windows: normalized.windows, directory: normalized.path.endsWith("/**") ? (normalized.path.slice(0, -3) || "/") : undefined, prefix: captureLiteralPrefix(normalized.path) };
     });
-    if (patterns.some((p) => !p)) return { state: "invalid", patterns: [], base: candidateBase };
+    if (patterns.some((p) => !p)) return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
     return patterns.length
-      ? { state: "active", patterns: patterns as CaptureConfig["patterns"], base: candidateBase }
-      : { state: "inactive", patterns: [], base: candidateBase };
+      ? { state: "active", patterns: patterns as CaptureConfig["patterns"], base: candidateBase, windowsHost }
+      : { state: "inactive", patterns: [], base: candidateBase, windowsHost };
   } catch (_e) {
-    return { state: "invalid", patterns: [], base: candidateBase };
+    return { state: "invalid", patterns: [], base: candidateBase, windowsHost };
   }
 }
 function captureGlob(pattern: string, candidate: string, insensitive: boolean, budget: { work: number }): boolean | undefined { const p = [...pattern]; const c = [...candidate]; const previous = new Array<boolean>(p.length + 1).fill(false); previous[0] = true; for (let j = 1; j <= p.length; j++) previous[j] = p[j - 1] === "*" && p[j] !== "*" && previous[j - 1]; for (const ch of c) { const current = new Array<boolean>(p.length + 1).fill(false); for (let j = 1; j <= p.length; j++) { if (++budget.work > CAPTURE_MAX_WORK) return undefined; const x = p[j - 1]; current[j] = x === "*" && p[j] === "*" ? false : x === "*" && j >= 2 && p[j - 2] === "*" ? current[j - 2] || previous[j] : x === "*" ? current[j - 1] || (ch !== "/" && previous[j]) : x === "?" ? ch !== "/" && previous[j - 1] : captureCharEq(x, ch, insensitive) && previous[j - 1]; } for (let j = 0; j <= p.length; j++) previous[j] = current[j]; } return previous[p.length]; }
@@ -299,7 +313,7 @@ function captureShellArguments(word: string): string[] { const out = word.starts
 // Lexical only, like the native hook: nothing is expanded or executed, so
 // variables, command substitution, and `cd` state are not followed. A tool's
 // own `workdir` replaces the event cwd for relative arguments.
-function captureMatchCommand(command: string | string[], config: CaptureConfig, workdir?: string): boolean | undefined { const budget = { work: 0 }; const home = homedir(); const base = workdir === undefined ? config.base : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(workdir) ? workdir : config.base && captureJoin(config.base, workdir); for (const word of captureShellWordList(command)) for (const argument of captureShellArguments(word)) { const expanded = argument.startsWith("~/") ? captureJoin(home, argument.slice(2)) : argument; if ([...expanded].length > CAPTURE_MAX_PATH_CHARS) continue; const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(expanded); if (!absolute && !base) continue; const candidate = captureNormalize(absolute ? expanded : captureJoin(base, expanded)); if (!candidate) continue; const glob = /[*?]/.test(candidate.path); for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const under = captureStartsWith(candidate.path, pattern.prefix, pattern.windows); if (!under && !glob) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, pattern.windows, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobReaches(candidate.path, pattern.prefix, pattern.windows, budget); if (reaches !== false) return reaches; } } } return false; }
+function captureMatchCommand(command: string | string[], config: CaptureConfig, workdir?: string): boolean | undefined { const budget = { work: 0 }; const home = homedir(); const base = workdir === undefined ? config.base : /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(workdir) ? workdir : config.base && captureJoin(config.base, workdir); for (const word of captureShellWordList(command)) for (const argument of captureShellArguments(word)) { const expanded = argument.startsWith("~/") ? captureJoin(home, argument.slice(2)) : argument; if ([...expanded].length > CAPTURE_MAX_PATH_CHARS) continue; const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(expanded); if (!absolute && !base) continue; const candidate = captureNormalize(absolute ? expanded : captureJoin(base, expanded), config.windowsHost); if (!candidate) continue; const glob = /[*?]/.test(candidate.path); for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; const under = captureStartsWith(candidate.path, pattern.prefix, pattern.windows); if (!under && !glob) continue; if (under) { const directory = pattern.directory ? captureGlob(pattern.directory, candidate.path, pattern.windows, budget) : false; if (directory !== false) return directory; const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match !== false) return match; } if (glob) { const reaches = captureGlobReaches(candidate.path, pattern.prefix, pattern.windows, budget); if (reaches !== false) return reaches; } } } return false; }
 function captureTool(payload: Record<string, unknown>): { family: CaptureProtocol["tool_family"]; paths?: string[]; extraction: CaptureProtocol["extraction_state"]; callID?: string; command?: string | string[]; shell?: boolean; workdir?: string } { const name = typeof payload.tool === "string" ? payload.tool.toLowerCase() : ""; const args = payload.args as Record<string, unknown> | undefined; const call = ["tool_use_id","toolUseId","tool_call_id","toolCallId","call_id","callId","callID"].map((k) => payload[k]).find((v): v is string => typeof v === "string" && /^[A-Za-z0-9_.-]{1,128}$/.test(v)); if (["search","grep","glob","find","list","ls","list_files","read_dir","list_dir","grep_search","search_files","find_by_name"].includes(name)) return { family: "search-list", extraction: "not-applicable", callID: call }; if (["bash","shell","shell_command","exec","execute","run_command","web_search","search_web","manage_task","manage_subagents","terminal","execute_bash","execute_cmd"].includes(name)) return { family: "non-file", extraction: "extracted", callID: call, command: captureShellCommand(args), shell: name !== "web_search", workdir: typeof args?.workdir === "string" && args.workdir.trim() ? args.workdir : undefined }; if (!["read","write","edit","apply_patch","notebookedit","notebook_edit","create_file","delete_file","rename_file","move_file","multi_edit","multiedit","replace","replace_all"].includes(name)) return { family: "unknown", extraction: "extracted", callID: call }; const direct = (o: any): string[] | undefined => { if (!o || typeof o !== "object") return undefined; const r: string[] = []; for (const k of ["file_path","filePath","path","absolute_path","AbsolutePath","notebook_path","TargetFile"]) if (k in o) { if (typeof o[k] !== "string") return undefined; r.push(o[k]); } if ("paths" in o) { if (!Array.isArray(o.paths) || o.paths.some((x: unknown) => typeof x !== "string")) return undefined; r.push(...o.paths); } return r.length && r.length <= CAPTURE_MAX_CANDIDATES ? r : undefined; }; let paths = direct(args); if (["multi_edit","multiedit","replace_all"].includes(name)) { const entries = args?.edits ?? args?.replacements; if (!Array.isArray(entries) || !entries.length || entries.length > CAPTURE_MAX_CANDIDATES) paths = undefined; else { paths = paths ?? []; for (const entry of entries) { const more = direct(entry); if (!more || paths.length + more.length > CAPTURE_MAX_CANDIDATES) { paths = undefined; break; } paths.push(...more); } } } if (!paths || paths.some((p) => !p.trim() || [...p].length > CAPTURE_MAX_PATH_CHARS)) return { family: "file", extraction: "missing-or-malformed", callID: call }; return { family: "file", paths, extraction: "extracted", callID: call }; }
 // An external lifecycle owner (`AI_MEMORY_CAPTURE_OWNER`, any value that is
 // non-empty after trimming) takes over capture for this process: the gate runs
@@ -316,7 +330,7 @@ function captureOwnedExternally(): boolean { const owner = typeof process === "u
 // home the walk stops at home, outside it continues past the checkout root to an
 // organisation-level marker; an unreadable marker counts as a selection.
 function captureServerRouted(cwd: string | undefined): boolean { let dir = resolve(cwd ?? process.cwd()); const home = homedir(); let boundary: string | undefined; for (let probe = dir; ; probe = dirname(probe)) { if (probe === home) { boundary = home; break; } if (probe === dirname(probe)) break; } for (;;) { try { if (/^\s*server\s*=/m.test(readFileSync(join(dir, ".ai-memory.toml"), "utf8"))) return true; } catch (e) { if (!["ENOENT", "ENOTDIR", "EISDIR"].includes((e as { code?: string })?.code ?? "")) return true; } if (dir === boundary || dir === dirname(dir)) return false; dir = dirname(dir); } }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && (tool.family === "file" || tool.shell)) disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p))); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } else if (config.state === "active" && tool.family === "non-file" && tool.command !== undefined && captureMatchCommand(tool.command, config, tool.workdir) !== false) disposition = "drop"; if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const config = captureConfig(cwd); const tool = captureTool(payload); let disposition: CaptureDisposition = "keep"; if (config.state === "invalid" && (tool.family === "file" || tool.shell)) disposition = "metadata-only"; else if (config.state === "active" && tool.family === "search-list") disposition = "drop"; else if (config.state === "active" && tool.family === "file") { if (!tool.paths) disposition = "metadata-only"; else { const candidates = tool.paths.map((p) => captureNormalize(/^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(p) ? p : captureJoin(config.base, p), config.windowsHost)); if (candidates.some((p) => !p)) disposition = "metadata-only"; else { const budget = { work: 0 }; captureMatch: for (const candidate of candidates as { path: string; windows: boolean }[]) for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows, budget)) { disposition = "drop"; break captureMatch; } const match = captureGlob(pattern.path, candidate.path, pattern.windows, budget); if (match === undefined) { disposition = "metadata-only"; break; } if (match) { disposition = "drop"; break captureMatch; } } } } } else if (config.state === "active" && tool.family === "non-file" && tool.command !== undefined && captureMatchCommand(tool.command, config, tool.workdir) !== false) disposition = "drop"; if (config.state === "inactive") return { disposition, payload }; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: tool.extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
 "##;
     TEMPLATE.replace("__AI_MEMORY_CAPTURE_MODE__", capture_mode)
 }
@@ -469,9 +483,7 @@ pub(crate) fn build_zero_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let hooks: Vec<serde_json::Value> = ZERO_EVENTS
         .iter()
         .map(|(zero_event, our_event)| {
@@ -557,9 +569,7 @@ pub(crate) fn build_zcode_hooks_config(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "ai-memory".to_string());
+    let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
     let mut events = serde_json::Map::new();
     for (zcode_event, our_event) in ZCODE_EVENTS {
         let mut args: Vec<String> = Vec::new();
@@ -1568,6 +1578,58 @@ pub(crate) fn local_hook_policy_v1_supported() -> bool {
     )
 }
 
+/// Fallback when no usable executable path can be embedded: the bare command
+/// name, resolved through `PATH` when each hook runs.
+#[cfg(not(windows))]
+const FALLBACK_HOOK_EXE: &str = "ai-memory";
+#[cfg(windows)]
+const FALLBACK_HOOK_EXE: &str = "ai-memory.exe";
+
+/// Strip the ` (deleted)` marker the Linux kernel appends to the
+/// `/proc/<pid>/exe` readlink once the executable's inode has been unlinked or
+/// replaced (Rust std passes the marker through verbatim —
+/// rust-lang/rust#40284). A real executable may itself use that suffix, so
+/// callers must prefer the unmodified path when it still exists.
+fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
+    match exe.to_str() {
+        Some(text) => text
+            .strip_suffix(" (deleted)")
+            .map(PathBuf::from)
+            .unwrap_or(exe),
+        None => exe,
+    }
+}
+
+/// The executable path to embed in a rendered hook command, given what
+/// `current_exe()` produced.
+///
+/// The classic corrupting sequence is `ai-memory upgrade`: it replaces its own
+/// binary and then re-renders the staged hook configs from the same, now
+/// exe-deleted process, so `current_exe()` comes back as `<path> (deleted)`.
+/// Stripping the marker yields the path that now holds the freshly installed
+/// binary. A missing file or a failed resolution falls back to
+/// [`FALLBACK_HOOK_EXE`] instead of baking a dead absolute path into every
+/// hook command.
+fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
+    let Some(exe) = raw else {
+        return PathBuf::from(FALLBACK_HOOK_EXE);
+    };
+    if exe.is_file() {
+        return exe;
+    }
+    let stripped = strip_deleted_suffix(exe);
+    if stripped.is_file() {
+        stripped
+    } else {
+        PathBuf::from(FALLBACK_HOOK_EXE)
+    }
+}
+
+/// [`embedded_exe_from`] over this process's own executable.
+pub(crate) fn hook_embedded_exe_path() -> PathBuf {
+    embedded_exe_from(std::env::current_exe().ok())
+}
+
 fn hook_command(
     script: &Path,
     server_url: &str,
@@ -1637,9 +1699,7 @@ fn hook_command(
             // out; double quotes + the native Windows path work in cmd.exe and
             // Git Bash. The event name is a fixed slug with no shell
             // metacharacters, so it is left unquoted.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1683,9 +1743,7 @@ fn hook_command(
             // gets the local spool + OIDC fallback, instead of the `.sh` script
             // that POSTs via curl. Mirrors `WindowsNative` but with POSIX
             // single-quote quoting. The event name is the script stem.
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "ai-memory".to_string());
+            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
             let event = script
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1724,7 +1782,7 @@ fn windows_native_exec_spec(
     auth_token: Option<&str>,
     context: HookCommandContext<'_>,
 ) -> HookHandlerSpec {
-    let exe = std::env::current_exe().unwrap_or_else(|_| Path::new("ai-memory.exe").to_path_buf());
+    let exe = hook_embedded_exe_path();
     windows_native_exec_spec_with_exe(&exe, script, server_url, auth_token, context)
 }
 
@@ -2196,6 +2254,63 @@ mod tests {
     #[cfg(windows)]
     use std::process::Stdio;
 
+    #[test]
+    fn strip_deleted_suffix_removes_only_the_trailing_kernel_marker() {
+        assert_eq!(
+            strip_deleted_suffix(PathBuf::from("/opt/ai-memory/bin/ai-memory (deleted)")),
+            PathBuf::from("/opt/ai-memory/bin/ai-memory")
+        );
+        // A marker mid-path is a legitimate directory name, not the kernel's
+        // artifact; only the trailing suffix reads as one.
+        let mid = PathBuf::from("/opt/dir (deleted)/ai-memory");
+        assert_eq!(strip_deleted_suffix(mid.clone()), mid);
+        let clean = PathBuf::from("/opt/ai-memory/bin/ai-memory");
+        assert_eq!(strip_deleted_suffix(clean.clone()), clean);
+    }
+
+    #[test]
+    fn embedded_exe_strips_the_marker_when_the_stripped_path_exists() {
+        // The exact corruption window of `ai-memory upgrade`: the process is
+        // still executing the old inode after the rename-over replace, so
+        // `current_exe()` carries the marker while the stripped path already
+        // holds the freshly installed binary.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("ai-memory");
+        fs::write(&exe, b"binary").expect("write exe");
+        let deleted = PathBuf::from(format!("{} (deleted)", exe.display()));
+        assert_eq!(embedded_exe_from(Some(deleted)), exe);
+    }
+
+    #[test]
+    fn embedded_exe_preserves_a_real_file_whose_name_has_the_marker_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let literal = dir.path().join("ai-memory (deleted)");
+        let stripped = dir.path().join("ai-memory");
+        fs::write(&literal, b"literal binary").expect("write literal exe");
+        fs::write(&stripped, b"decoy binary").expect("write stripped decoy");
+
+        assert_eq!(embedded_exe_from(Some(literal.clone())), literal);
+    }
+
+    #[test]
+    fn embedded_exe_falls_back_when_the_resolved_path_is_missing() {
+        // A failed resolution or a dead path must not bake a broken absolute
+        // path into hook commands; the bare name resolves through PATH when
+        // each hook runs.
+        assert_eq!(embedded_exe_from(None), PathBuf::from(FALLBACK_HOOK_EXE));
+        assert_eq!(
+            embedded_exe_from(Some(PathBuf::from("/nonexistent/ai-memory (deleted)"))),
+            PathBuf::from(FALLBACK_HOOK_EXE)
+        );
+    }
+
+    #[test]
+    fn hook_embedded_exe_path_names_an_existing_file_without_marker() {
+        let exe = hook_embedded_exe_path();
+        assert!(exe.is_file(), "{} should exist", exe.display());
+        assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
+    }
+
     fn decode_powershell_encoded_command(command: &str) -> String {
         let (_, encoded) = command
             .split_once(" -EncodedCommand ")
@@ -2311,7 +2426,17 @@ for (const vector of fixture.decisions.filter((v: any) => ["open-code", "omp", "
 }}
 for (const vector of fixture.normalization) {{
   const cwd = marker(`[capture]\nignore_paths = [${{JSON.stringify(vector.pattern)}}]\n`);
-  expectDecision({{ tool: "edit", args: {{ path: vector.candidate }} }}, cwd, vector.match ? "drop" : "keep", "file", "extracted", 1, "fixture-normalization");
+  // Every normalization vector here uses an absolute pattern+candidate pair
+  // (so neither ever needs the real marker directory as a join base); the
+  // fixture's own `cwd` is what decides host flavor. A Windows-shaped `cwd`
+  // (e.g. "C:/") can't be a real directory on this (POSIX) test runner —
+  // `resolve("C:/")` would mangle it through the real OS path module — so
+  // alias the already-written marker file under the fixture's literal `cwd`
+  // string and pass that string straight through, exactly like the native
+  // test honors `vector["cwd"]` verbatim.
+  const hostCwd: string = /^(?:\\\\|\/\/|[A-Za-z]:)/.test(vector.cwd) ? vector.cwd : cwd;
+  if (hostCwd !== cwd) markerFixtures.set(hostCwd, markerFixtures.get(cwd)!);
+  expectDecision({{ tool: "edit", args: {{ path: vector.candidate }} }}, hostCwd, vector.match ? "drop" : "keep", "file", "extracted", 1, "fixture-normalization");
 }}
 expectDecision({{ tool: "edit", args: {{ path: "private/item" }} }}, marker('[capture]\nignore_paths = ["private/**"]\n'), "drop", "file", "extracted", 1, "marker-relative");
 // Shell parity with the native hook's lexical command matching (#948): the
@@ -2345,7 +2470,8 @@ expectDecision({{ tool: "edit", args: {{ path: "private/item" }} }}, nestedCwd, 
 expectDecision({{ tool: "edit", args: {{ path: `${{homedir()}}/home-private/item` }} }}, marker('[capture]\nignore_paths = ["~/home-private/**"]\n'), "drop", "file", "extracted", 1, "home-expansion");
 expectDecision({{ tool: "edit", args: {{ path: "case/item" }} }}, marker('[capture]\nignore_paths = ["Case/**"]\n'), "keep", "file", "extracted", 1, "posix-case");
 expectDecision({{ tool: "edit", args: {{ path: "c:/SECRET/item" }} }}, marker('[capture]\nignore_paths = ["C:/secret/**"]\n'), "drop", "file", "extracted", 1, "windows-drive-case");
-expectDecision({{ tool: "edit", args: {{ path: "//SERVER/SHARE/item" }} }}, marker(`[capture]\nignore_paths = ['${{String.raw`\\server\share/**`}}']\n`), "drop", "file", "extracted", 1, "windows-unc-case");
+const uncCwd = "C:/"; markerFixtures.set(uncCwd, markerFixtures.get(marker(`[capture]\nignore_paths = ['${{String.raw`\\server\share/**`}}']\n`))!);
+expectDecision({{ tool: "edit", args: {{ path: "//SERVER/SHARE/item" }} }}, uncCwd, "drop", "file", "extracted", 1, "windows-unc-case");
 expectDecision({{ tool: "edit", args: {{ path: "x" }} }}, marker('[capture'), "metadata-only", "file", "extracted", 1, "malformed-table");
 const malformedQuoteCwd = marker('[capture]\nignore_paths = ["private/**');
 expectDecision({{ tool: "edit", args: {{ path: privatePath }} }}, malformedQuoteCwd, "metadata-only", "file", "extracted", 1, "malformed-unterminated-quote");

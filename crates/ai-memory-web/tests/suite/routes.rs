@@ -3431,6 +3431,129 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
     }
 }
 
+/// Pins a documented, by-design boundary (see `docs/users.md`): under a
+/// trusted-proxy deployment, a proxied non-root end-user is authenticated as
+/// [`ai_memory_core::AuthLevel::User`] with an [`ai_memory_core::ActorContext`]
+/// (`auth.rs::authenticate_token`'s proxy branch), but — unlike a database
+/// user — is never stamped with an [`ai_memory_core::AuthorizedViewer`],
+/// because grants are keyed on `UserId` and a proxied identity has none.
+/// `viewer_from_parts` reads a missing `AuthorizedViewer` as "no per-project
+/// check applies" (same as root, or an install with no database users), so
+/// the per-project authorization gate is a pass-through for this actor: a
+/// `restricted` project is readable with no grant at all. This is NOT an
+/// endorsement of a gap to close — the proxy is the authorization boundary in
+/// this deployment shape — it is a pin so a future change to this behavior is
+/// an intentional decision, not a silent regression.
+///
+/// This mirrors `web_reads_honour_grants_in_a_restricted_project`'s harness:
+/// that test's own `viewer: None` case already exercises the same code path
+/// (a missing `AuthorizedViewer`), but doesn't carry the extensions a real
+/// trusted-proxy request would, so it doesn't document *why* that is safe
+/// here. The real middleware (`authenticate_token`) is not reachable from
+/// this router-only harness, so this stamps the same extensions it would
+/// have stamped, by hand.
+#[tokio::test]
+async fn a_trusted_proxy_user_is_not_subject_to_restricted_without_a_db_identity() {
+    use ai_memory_core::{ActorContext, AuthLevel};
+
+    let (_tmp, store, wiki) = setup().await;
+    store
+        .writer
+        .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+        .await
+        .unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let client = store
+        .writer
+        .get_or_create_project(ws, "alice-client-work", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(
+        ws,
+        client,
+        "secrets/rates.md",
+        "# Rates\n\nDay rate is confidential.",
+    ))
+    .await
+    .unwrap();
+    // A real database user, with no grant, is correctly refused — the
+    // control proving the project really is restricted.
+    let carol = store
+        .writer
+        .create_human_user(
+            ai_memory_core::NewUser {
+                username: "carol".into(),
+                name: None,
+                email: None,
+            },
+            ai_memory_core::UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let web = router(store.reader.clone(), wiki.clone());
+    let routes = [
+        (
+            api.clone(),
+            "/workspaces/default/projects/alice-client-work/pages/secrets/rates.md",
+        ),
+        (
+            web.clone(),
+            "/w/default/alice-client-work/p/secrets/rates.md",
+        ),
+    ];
+
+    // Control: carol as a *database* user (AuthorizedViewer stamped, no
+    // grant) is refused on both surfaces.
+    for (app, uri) in &routes {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(*uri)
+                    .extension(ai_memory_core::AuthorizedViewer(carol))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    // The pinned case: the same project, read by a request carrying the
+    // extensions a trusted-proxy non-root user actually gets (`ActorContext`
+    // + `AuthLevel::User`) and nothing else — no `AuthorizedViewer`. Today
+    // this is admitted.
+    for (app, uri) in &routes {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(*uri)
+                    .extension(ActorContext {
+                        user: Some("carol-proxied".into()),
+                        ..ActorContext::default()
+                    })
+                    .extension(AuthLevel::User)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{uri}: trusted-proxy user without a DB identity must be admitted today (pinned boundary)"
+        );
+    }
+}
+
 /// #708, second half on the web: bob can no longer read or search alice's
 /// repositories, but every listing, the graph, the workspace overview and a
 /// page's link panel still told him they existed and roughly what was in

@@ -89,6 +89,10 @@ fn run_wrapper_on_fake_macos(args: &[&str]) -> String {
         .args(args)
         .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        // This helper asserts container argv. `install-hooks` defaults to the
+        // native host client now; opt into the documented script fallback so
+        // that subcommand still exercises the container-routing contract.
+        .env("AI_MEMORY_HOOK_PLATFORM", "posix")
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
@@ -1041,6 +1045,10 @@ fn run_wrapper_with_fake_docker_env(
         .args(args)
         .env("PATH", path)
         .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        // Callers test Docker/Podman UID, SELinux, and env forwarding. Keep
+        // `install-hooks` on that explicit compatibility path; native hook
+        // routing has separate regression coverage below.
+        .env("AI_MEMORY_HOOK_PLATFORM", "posix")
         .env("AI_MEMORY_NO_VERSION_CHECK", "1")
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
         .env("HOME", shell_path(tmp.path()))
@@ -2329,6 +2337,7 @@ mod slow {
             .arg("upgrade")
             .env("PATH", path)
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .env("AI_MEMORY_DOCKER", &docker)
             .env(
                 "AI_MEMORY_WRAPPER_URL",
@@ -2754,6 +2763,7 @@ mod slow {
             .env("AI_MEMORY_SKIP_SELF_UPGRADE", "1")
             .env("AI_MEMORY_SERVER_URL", "http://192.168.0.90:49374")
             .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join("data"))
             .output()
             .unwrap();
         assert!(

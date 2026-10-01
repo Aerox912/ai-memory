@@ -47,6 +47,22 @@ pub struct WorkstreamState {
     pub sanitizer: Sanitizer,
     /// ai-memory data root containing `raw/workstreams`.
     pub data_dir: PathBuf,
+    /// Whether a trusted proxy can distinguish operators without DB users.
+    pub trusted_proxy_identity: bool,
+}
+
+pub(crate) async fn managed_run_owner_stamp(
+    reader: &ReaderPool,
+    identity: Option<&ai_memory_core::IdentityKey>,
+    trusted_proxy_identity: bool,
+) -> Result<Option<String>, StoreError> {
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
+    let distinguishes = reader
+        .distinguishes_operators(trusted_proxy_identity)
+        .await?;
+    Ok(ai_memory_core::owner_stamp(Some(identity), distinguishes))
 }
 
 /// Build the host-wrapper API. It is mounted beside `/hook` and therefore
@@ -151,7 +167,8 @@ fn scope_refusal(failure: ScopeResolutionError) -> Response {
 async fn prepare_run(
     State(state): State<WorkstreamState>,
     level: Option<Extension<AuthLevel>>,
-    actor: Option<Extension<ai_memory_core::AuthorizedViewer>>,
+    actor: Option<Extension<ai_memory_core::ActorContext>>,
+    viewer: Option<Extension<ai_memory_core::AuthorizedViewer>>,
     Json(request): Json<PrepareManagedRunRequest>,
 ) -> Response {
     if let Err(response) = authorize(level, Capability::NormalWrite) {
@@ -239,7 +256,7 @@ async fn prepare_run(
         &state.writer,
         request.workspace.trim(),
         request.project.trim(),
-        actor_user(actor),
+        actor_user(viewer),
     )
     .await
     {
@@ -260,20 +277,34 @@ async fn prepare_run(
             );
         }
     };
+    let identity = actor.and_then(|Extension(actor)| actor.identity_key());
+    let owner_user = match managed_run_owner_stamp(
+        &state.reader,
+        identity.as_ref(),
+        state.trusted_proxy_identity,
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+    };
     let prepared = state
         .writer
-        .prepare_workstream_run(PrepareWorkstreamRun {
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
-            repo_fingerprint: request.repo_fingerprint,
-            worktree_fingerprint: request.worktree_fingerprint,
-            cwd: request.cwd,
-            agent: request.agent,
-            automatic_harness: request.automatic_harness,
-            available_agents: request.available_agents,
-            selection,
-            lease_owner: request.lease_owner,
-        })
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+                repo_fingerprint: request.repo_fingerprint,
+                worktree_fingerprint: request.worktree_fingerprint,
+                cwd: request.cwd,
+                agent: request.agent,
+                automatic_harness: request.automatic_harness,
+                available_agents: request.available_agents,
+                selection,
+                lease_owner: request.lease_owner,
+            },
+            owner_user,
+        )
         .await;
     match prepared {
         Ok(prepared) => Json(PrepareManagedRunResponse {
@@ -1093,6 +1124,7 @@ mod tests {
             reader: store.reader.clone(),
             sanitizer: Sanitizer::default(),
             data_dir: data_dir.to_path_buf(),
+            trusted_proxy_identity: false,
         }
     }
 
@@ -1395,6 +1427,7 @@ mod tests {
             State(state),
             None,
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1429,6 +1462,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             None,
             Json(PrepareManagedRunRequest {
@@ -1469,6 +1503,7 @@ mod tests {
             State(state),
             None,
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1488,6 +1523,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_stamps_the_operator_bucket_used_by_session_start_recovery() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let response = prepare_run(
+            State(state.clone()),
+            None,
+            Some(Extension(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            })),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed-owner".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "alice-launcher".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        let (workspace_id, project_id) = store
+            .reader
+            .managed_run_scope(prepared.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            store
+                .writer
+                .link_or_adopt_managed_run_session(ai_memory_store::LinkOrAdoptManagedRunSession {
+                    supplied_run_id: prepared.run_id,
+                    workspace_id,
+                    project_id,
+                    cwd: "/repo".into(),
+                    agent: AgentKind::Codex,
+                    native_session_id: "native-bob".into(),
+                    owner_user: Some(
+                        ai_memory_core::IdentityKey::User("bob".into()).storage_key(),
+                    ),
+                })
+                .await
+                .unwrap(),
+            ai_memory_store::ManagedRunSessionLink::Refused
+        );
+        assert_eq!(
+            store
+                .writer
+                .link_or_adopt_managed_run_session(ai_memory_store::LinkOrAdoptManagedRunSession {
+                    supplied_run_id: prepared.run_id,
+                    workspace_id,
+                    project_id,
+                    cwd: "/repo".into(),
+                    agent: AgentKind::Codex,
+                    native_session_id: "native-alice".into(),
+                    owner_user: Some(
+                        ai_memory_core::IdentityKey::User("alice".into()).storage_key(),
+                    ),
+                })
+                .await
+                .unwrap(),
+            ai_memory_store::ManagedRunSessionLink::Exact(prepared.run_id)
+        );
+    }
+
+    #[tokio::test]
     async fn kiro_is_accepted_as_an_explicit_and_automatic_harness() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
@@ -1495,6 +1621,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             None,
             Json(PrepareManagedRunRequest {
@@ -1534,6 +1661,7 @@ mod tests {
             State(state),
             None,
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1560,6 +1688,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             None,
             Json(PrepareManagedRunRequest {
@@ -1599,6 +1728,7 @@ mod tests {
             State(state),
             None,
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1625,6 +1755,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             None,
             Json(PrepareManagedRunRequest {
@@ -1664,6 +1795,7 @@ mod tests {
             State(state),
             None,
             None,
+            None,
             Json(PrepareManagedRunRequest {
                 workspace: "default".into(),
                 project: "managed".into(),
@@ -1693,6 +1825,7 @@ mod tests {
 
         let explicit = prepare_run(
             State(state.clone()),
+            None,
             None,
             None,
             Json(PrepareManagedRunRequest {
@@ -1730,6 +1863,7 @@ mod tests {
 
         let automatic = prepare_run(
             State(state),
+            None,
             None,
             None,
             Json(PrepareManagedRunRequest {
@@ -1996,6 +2130,7 @@ mod tests {
 
         let prepared = prepare_run(
             State(state.clone()),
+            None,
             None,
             None,
             Json(PrepareManagedRunRequest {

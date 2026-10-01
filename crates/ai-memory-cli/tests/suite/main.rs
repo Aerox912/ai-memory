@@ -17,6 +17,7 @@ mod external_capture_powershell;
 mod external_capture_ts;
 mod hook_drain;
 mod hook_payload;
+mod jail_toggles_e2e;
 mod marker_scope;
 mod message_e2e;
 mod packaging;

@@ -75,7 +75,7 @@ jobs:
       # block that fails to compile (e.g. an indented shell example rustdoc
       # reads as Rust) shipped unnoticed. Run them explicitly.
       - run: cargo test --workspace --doc
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: false
       - name: Build the external lifecycle relay
@@ -310,7 +310,7 @@ jobs:
         with:
           name: ci-ai-memory-linux-x86_64
           path: dist/docker/ai-memory-linux-x86_64
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: build image (local tag only)
         run: docker build --target runtime-prebuilt-amd64 -f docker/Dockerfile -t ai-memory:ci .
       - name: --version smoke
@@ -354,9 +354,8 @@ jobs:
           cargo audit
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0320
-          --ignore RUSTSEC-2026-0194
-          --ignore RUSTSEC-2026-0195
       - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
+      - run: cargo audit --file companions/ai-memory-importer/Cargo.lock
 
   gitleaks:
     name: gitleaks (secret scan)

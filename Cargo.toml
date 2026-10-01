@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "2.5.0-aerox.1"
+version = "2.5.2-aerox.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

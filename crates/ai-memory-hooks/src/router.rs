@@ -1361,14 +1361,6 @@ async fn fetch_and_accept_handoff_at(
     now: jiff::Timestamp,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
-    // A managed run's ledger is additive, not a replacement. Returning it here
-    // skipped `latest_open_handoff` below, so a session launched by
-    // `ai-memory run` never consumed the handoff a previous session left for
-    // it — the slot just stayed open, and the next managed session missed it
-    // too. The brief already reaches the managed path (it is recomposed per
-    // session, so resolving it twice was harmless); the handoff is single-use
-    // and had no second chance.
-    let managed = fetch_managed_context(state, &query, agent, viewer).await?;
     // Keep the active-project key compatible with MCP transports: the native
     // session id is carried separately below to bind a destructive handoff
     // claim to its exact receiver.
@@ -1398,6 +1390,11 @@ async fn fetch_and_accept_handoff_at(
         ai_memory_store::ProjectAccess::Read,
     )
     .await?;
+    // A managed run's ledger is additive, not a replacement. Resolve and
+    // authorize the request's repository before interpreting the run id: a
+    // shared Codex daemon may carry a terminal id from another checkout, and
+    // recovery must select only inside the current, authorized boundary.
+    let managed = fetch_managed_context(state, &query, agent, ws, proj, actor.as_ref()).await?;
     // Session-start handoff delivery is a foreground action. Publish it so
     // static MCP callers resolve to the directory that is opening now. The
     // query carries no recall preference; the main capture path publishes
@@ -1598,7 +1595,9 @@ async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
     agent: AgentKind,
-    viewer: Option<ai_memory_core::UserId>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    actor: Option<&IdentityKey>,
 ) -> anyhow::Result<Option<PendingManagedContext>> {
     let Some(raw_run_id) = query.managed_run.as_deref() else {
         return Ok(None);
@@ -1607,30 +1606,70 @@ async fn fetch_managed_context(
         warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
         return Ok(None);
     };
-    // The run id reaches a workstream's event ledger without naming its
-    // repository; the same rule as the `/workstream/runs/*` routes applies.
-    if viewer.is_some() {
-        let scope = state.reader.managed_run_scope(run_id).await?;
-        crate::grants::authorize_resolved(
-            &state.reader,
-            scope,
-            viewer,
-            ai_memory_store::ProjectAccess::Write,
-        )
-        .await?;
-    }
-    if let Some(native_session_id) = query
+    let Some(native_session_id) = query
         .session_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-    {
-        let _ = state
-            .writer
-            .link_managed_run_session(run_id, agent, native_session_id)
-            .await?;
-    }
-    let Some(context) = state.reader.managed_run_context(run_id, 256).await? else {
-        warn!(managed_run = %run_id, "managed SessionStart has no active run");
+    else {
+        warn!(managed_run = %run_id, "managed SessionStart has no native session id");
+        return Ok(None);
+    };
+    let Some(cwd) = query
+        .cwd
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!(managed_run = %run_id, "managed SessionStart has no checkout cwd");
+        return Ok(None);
+    };
+    let owner_user = crate::workstream::managed_run_owner_stamp(
+        &state.reader,
+        actor,
+        state.trusted_proxy_identity,
+    )
+    .await?;
+    let linked = state
+        .writer
+        .link_or_adopt_managed_run_session(ai_memory_store::LinkOrAdoptManagedRunSession {
+            supplied_run_id: run_id,
+            workspace_id,
+            project_id,
+            cwd: cwd.to_owned(),
+            agent,
+            native_session_id: native_session_id.to_owned(),
+            owner_user,
+        })
+        .await?;
+    let selected_run_id = match linked {
+        ai_memory_store::ManagedRunSessionLink::Exact(run_id) => run_id,
+        ai_memory_store::ManagedRunSessionLink::Adopted(adopted) => {
+            warn!(
+                stale_managed_run = %run_id,
+                managed_run = %adopted,
+                native_session_id,
+                "recovered Codex SessionStart from a stale shared-daemon run id"
+            );
+            adopted
+        }
+        ai_memory_store::ManagedRunSessionLink::Ambiguous => {
+            warn!(managed_run = %run_id, "managed SessionStart recovery is ambiguous");
+            return Ok(None);
+        }
+        ai_memory_store::ManagedRunSessionLink::NoMatch => {
+            warn!(managed_run = %run_id, "managed SessionStart has no live scoped run");
+            return Ok(None);
+        }
+        ai_memory_store::ManagedRunSessionLink::Refused => {
+            warn!(managed_run = %run_id, "managed SessionStart run boundary mismatch");
+            return Ok(None);
+        }
+    };
+    let Some(context) = state
+        .reader
+        .managed_run_context(selected_run_id, 256)
+        .await?
+    else {
+        warn!(managed_run = %selected_run_id, "managed SessionStart has no active run");
         return Ok(None);
     };
     if context.agent != agent {
@@ -1652,7 +1691,7 @@ async fn fetch_managed_context(
         context.sync_after,
     );
     Ok(Some(PendingManagedContext {
-        run_id,
+        run_id: selected_run_id,
         markdown: rendered,
     }))
 }
@@ -12520,7 +12559,9 @@ mod tests {
             project_strategy: None,
             briefing: None,
             briefing_budget: None,
-            managed_run: Some(run.run_id.to_string()),
+            // Codex's shared app-server may retain the previous finished run
+            // id even though this launcher opened `run` (#987).
+            managed_run: Some(first.run_id.to_string()),
             session_id: Some("native-2".into()),
             identity: None,
             identity_src: None,
@@ -12538,6 +12579,13 @@ mod tests {
             rendered.contains("HANDOFF-MARKER"),
             "the managed ledger must not swallow the pending handoff: {rendered}"
         );
+        let linked = state
+            .reader
+            .managed_run_status(run.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(linked.native_session_id.as_deref(), Some("native-2"));
         assert!(
             state
                 .reader

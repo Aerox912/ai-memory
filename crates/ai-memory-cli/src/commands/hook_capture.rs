@@ -16,7 +16,9 @@ use crate::marker::{
     repo_root_project,
 };
 use ai_memory_hooks::capture_policy::MAX_MARKER_BYTES;
-use ai_memory_hooks::{CaptureConfig, CapturePolicy, CaptureSource};
+use ai_memory_hooks::{
+    CaptureConfig, CapturePolicy, CaptureSource, PolicyState, describe_invalid_capture_config,
+};
 
 /// Resolve the nearest marker's capture policy without changing routing parsing.
 /// Root-level marker keys are intentionally ignored here; only `[capture]` is strict.
@@ -45,34 +47,95 @@ pub fn capture_policy(cwd: &str) -> CapturePolicy {
 }
 
 fn read_capture_config(marker: &Path) -> Result<CaptureConfig, ()> {
+    read_capture_config_verbose(marker).map_err(|_reason| ())
+}
+
+/// Same parse as [`read_capture_config`], but keeps the failure reason
+/// instead of collapsing it to `()`. The hot hook path only needs "did this
+/// parse" and discards the reason; diagnostics (`ai-memory doctor`) need it.
+/// Note this only covers the TOML-parse / `[capture]`-shape stage — a config
+/// that parses fine here can still be rejected later at compile time (see
+/// [`ai_memory_hooks::describe_invalid_capture_config`]).
+fn read_capture_config_verbose(marker: &Path) -> Result<CaptureConfig, String> {
     let mut bytes = Vec::with_capacity(MAX_MARKER_BYTES + 1);
     std::fs::File::open(marker)
-        .map_err(|_| ())?
+        .map_err(|e| format!("could not open marker file: {e}"))?
         .take((MAX_MARKER_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
+        .map_err(|e| format!("could not read marker file: {e}"))?;
     if bytes.len() > MAX_MARKER_BYTES {
-        return Err(());
+        return Err(format!(
+            "marker file is larger than the {MAX_MARKER_BYTES}-byte capture-config limit"
+        ));
     }
-    let text = String::from_utf8(bytes).map_err(|_| ())?;
-    let document = text.parse::<toml_edit::DocumentMut>().map_err(|_| ())?;
+    let text =
+        String::from_utf8(bytes).map_err(|e| format!("marker file is not valid UTF-8: {e}"))?;
+    let document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("invalid TOML: {e}"))?;
     let Some(capture) = document.get("capture") else {
         return Ok(CaptureConfig::default());
     };
-    let table = capture.as_table().ok_or(())?;
-    if table.iter().any(|(key, _)| key != "ignore_paths") {
-        return Err(());
+    let table = capture
+        .as_table()
+        .ok_or_else(|| "`[capture]` must be a table".to_owned())?;
+    if let Some((key, _)) = table.iter().find(|(key, _)| *key != "ignore_paths") {
+        return Err(format!(
+            "`[capture]` has an unsupported key `{key}` (only `ignore_paths` is allowed)"
+        ));
     }
     let ignore_paths = match table.get("ignore_paths") {
         None => Vec::new(),
-        Some(item) => item
-            .as_array()
-            .ok_or(())?
-            .iter()
-            .map(|value| value.as_str().map(str::to_owned).ok_or(()))
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(item) => {
+            item.as_array()
+                .ok_or_else(|| "`[capture].ignore_paths` must be an array".to_owned())?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        "`[capture].ignore_paths` must contain only strings".to_owned()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
     Ok(CaptureConfig { ignore_paths })
+}
+
+/// Diagnostic for `ai-memory doctor`: does the nearest `.ai-memory.toml`'s
+/// `[capture]` section actually resolve into an active policy?
+///
+/// Bases the check on [`capture_policy`]'s own resolution state -- the exact
+/// state the live hook path uses -- rather than a parse-only check, because a
+/// `[capture]` table can parse as valid TOML and still be rejected later at
+/// compile time (too many patterns, an unsupported glob character, a `~/`
+/// pattern with no home directory to expand it...), which a parse-only check
+/// would miss entirely.
+///
+/// Returns `None` when there is no marker, or the marker's capture config
+/// resolves (absent, empty, or a valid active policy). Returns
+/// `Some((marker_path, reason))` when a marker exists and its `[capture]`
+/// table is [`PolicyState::Invalid`] -- which fails CLOSED (every file and
+/// shell tool event is reduced to metadata until the marker is fixed;
+/// nothing leaks) but with no other signal anywhere that it happened.
+pub fn capture_config_problem(cwd: &str) -> Option<(PathBuf, String)> {
+    let marker = find_marker(cwd)?;
+    if capture_policy(cwd).state() != PolicyState::Invalid {
+        return None;
+    }
+    let marker_dir = marker.parent().and_then(Path::to_str).unwrap_or(cwd);
+    let home = home_dir();
+    let reason = match read_capture_config_verbose(&marker) {
+        Err(reason) => reason,
+        Ok(config) => describe_invalid_capture_config(
+            &config,
+            marker_dir,
+            home.as_deref().and_then(Path::to_str),
+        )
+        .unwrap_or_else(|| {
+            "the `[capture]` table did not resolve into an active policy".to_owned()
+        }),
+    };
+    Some((marker, reason))
 }
 
 /// First top-level `cwd` string in the payload (parity with
@@ -1366,5 +1429,85 @@ drop_subagent_captures = "true"
         let qs = marker_query_suffix(tmp.path().to_str().unwrap(), Some("repo-root"));
         assert!(qs.contains("&project=pinned"), "{qs}");
         assert!(qs.contains("&project_strategy=repo-root"), "{qs}");
+    }
+
+    #[test]
+    fn capture_config_problem_is_none_without_a_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(capture_config_problem(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn capture_config_problem_is_none_for_a_well_formed_capture_table() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "project = \"ok\"\n\n[capture]\nignore_paths = [\"**/.env\"]\n",
+        )
+        .unwrap();
+        assert!(capture_config_problem(tmp.path().to_str().unwrap()).is_none());
+    }
+
+    /// The exact failure mode found in practice: a dropped `#` turns a
+    /// wrapped comment into a stray token right after a `[capture]` header,
+    /// which is invalid TOML.
+    #[test]
+    fn capture_config_problem_reports_a_toml_syntax_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        std::fs::write(
+            &marker,
+            "project = \"example\"\n\n\
+             [capture] this used to be a comment, now it is a stray token\n\
+             project_strategy = \"repo-root\"\n\n\
+             [capture]\nignore_paths = [\"**/.env\"]\n",
+        )
+        .unwrap();
+        let (reported_marker, reason) =
+            capture_config_problem(tmp.path().to_str().unwrap()).expect("malformed TOML");
+        assert_eq!(reported_marker, marker);
+        assert!(reason.contains("invalid TOML"), "{reason}");
+    }
+
+    #[test]
+    fn capture_config_problem_reports_an_unsupported_capture_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nallowlist = [\"**\"]\n",
+        )
+        .unwrap();
+        let (_, reason) =
+            capture_config_problem(tmp.path().to_str().unwrap()).expect("unsupported key");
+        assert!(reason.contains("allowlist"), "{reason}");
+    }
+
+    /// The gap the parse-only check missed: a `[capture]` table that is
+    /// perfectly valid TOML, and a `[capture]` shape `read_capture_config`
+    /// accepts, but whose `ignore_paths` entry `compile` itself rejects (an
+    /// unsupported glob character). `capture_policy(cwd).state()` must still
+    /// catch this as `Invalid` even though the TOML parse alone would not.
+    #[test]
+    fn capture_config_problem_reports_a_pattern_compile_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets/{a,b}\"]\n",
+        )
+        .unwrap();
+        let (_, reason) = capture_config_problem(tmp.path().to_str().unwrap())
+            .expect("a rejected glob must still surface as a problem");
+        assert!(reason.contains("secrets/{a,b}"), "{reason}");
+        assert!(reason.contains("unsupported glob character"), "{reason}");
+    }
+
+    #[test]
+    fn read_capture_config_and_verbose_agree_on_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        std::fs::write(&marker, "[capture]\nignore_paths = [\"**/*.pem\"]\n").unwrap();
+        let terse = read_capture_config(&marker).expect("valid marker parses");
+        let verbose = read_capture_config_verbose(&marker).expect("valid marker parses");
+        assert_eq!(terse.ignore_paths, verbose.ignore_paths);
     }
 }

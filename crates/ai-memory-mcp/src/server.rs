@@ -4041,7 +4041,13 @@ impl AiMemoryServer {
             let depth = args.related_depth.unwrap_or(1);
             Some(
                 self.reader
-                    .related_walk(ws, proj, page_path.to_string(), depth)
+                    .related_walk(
+                        ws,
+                        proj,
+                        page_path.to_string(),
+                        depth,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?,
             )
@@ -12142,6 +12148,138 @@ mod tests {
         read_as(None)
             .await
             .expect("with no viewer, an existing install must be unchanged");
+    }
+
+    /// #999 at the MCP surface: an authenticated user without a grant must not
+    /// learn about pages in a `restricted` project through
+    /// `memory_read_page { include_related: true }`. The store tests pin the
+    /// walk's per-hop filter; this pins that the tool passes the caller's
+    /// viewer into it — passing `None` there reopened the leak with every store
+    /// test still green. Control: with no viewer (root, or authorization off)
+    /// the same walk still reaches the cross-project page.
+    #[tokio::test]
+    async fn bob_does_not_see_restricted_pages_through_the_related_walk() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let app = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let secret = store
+            .writer
+            .get_or_create_project(ws, "secret", None)
+            .await
+            .unwrap();
+        let page = |project, path: &str, links| ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: project,
+            path: ai_memory_core::PagePath::new(path).unwrap(),
+            title: path.to_string(),
+            body: "body".into(),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links,
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let link_to_secret = ai_memory_core::LinkTarget {
+            workspace: None,
+            project: Some("secret".to_string()),
+            path: ai_memory_core::PagePath::new("notes/s.md").unwrap(),
+            relation: None,
+        };
+        store
+            .writer
+            .upsert_page(page(secret, "notes/s.md", Vec::new()))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(page(app, "notes/a.md", vec![link_to_secret]))
+            .await
+            .unwrap();
+        store
+            .writer
+            .set_access_mode(secret, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let bob = store
+            .writer
+            .create_human_user(
+                NewUser {
+                    username: "bob".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, app)
+            .with_wiki(wiki);
+        let related_as = |viewer: Option<ai_memory_core::UserId>| {
+            let server = &server;
+            async move {
+                let mut parts = test_parts_default();
+                parts.extensions.insert(AuthLevel::User);
+                parts.extensions.insert(bob);
+                if let Some(viewer) = viewer {
+                    parts
+                        .extensions
+                        .insert(ai_memory_core::AuthorizedViewer(viewer));
+                }
+                let result = server
+                    .memory_read_page(
+                        Parameters(ReadPageArgs {
+                            include_related: true,
+                            related_depth: Some(3),
+                            path: Some("notes/a.md".into()),
+                            query: None,
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+                    .expect("the open project's page is readable");
+                call_tool_json(result)["related"]
+                    .as_array()
+                    .expect("include_related attaches a related block")
+                    .iter()
+                    .map(|node| {
+                        format!(
+                            "{}:{}",
+                            node["project"].as_str().unwrap_or_default(),
+                            node["path"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let as_bob = related_as(Some(bob)).await;
+        assert!(
+            as_bob.iter().all(|node| !node.starts_with("secret:")),
+            "a restricted page leaked through the related walk: {as_bob:?}"
+        );
+        let unrestricted = related_as(None).await;
+        assert!(
+            unrestricted.contains(&"secret:notes/s.md".to_string()),
+            "control: with no viewer the walk still reaches it: {unrestricted:?}"
+        );
     }
 
     /// The other half of #708: bob could not open alice's page, but he could

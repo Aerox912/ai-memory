@@ -668,6 +668,14 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
+On Linux and macOS, the Docker wrapper runs `install-hooks` through its
+checksum-verified native host client. The installed hooks therefore enforce
+client-side capture controls such as `[capture] ignore_paths` and allowlist
+mode before an event reaches the spool or network. Set
+`AI_MEMORY_HOOK_PLATFORM=posix` explicitly only when you need the legacy shell
+compatibility path; the installer warns that path cannot enforce capture
+policy v1.
+
 The examples use `docker`; replace it with `podman` on a Podman host. The
 wrapper automatically uses Podman when Docker is not installed. Set
 `AI_MEMORY_DOCKER=podman` to force Podman when both engines are available.

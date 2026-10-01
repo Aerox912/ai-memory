@@ -289,15 +289,40 @@ pub struct RunArgs {
     /// equivalent dangerous-mode option.
     #[arg(long)]
     pub yolo: bool,
-    /// Claude-only: additionally silence the residual `--dangerously-skip-permissions`
-    /// prompts (rm timeout/confirmation, PowerShell rm deny) and force
-    /// `bypassPermissions` via `--settings`. No-op for every other harness
-    /// (a one-line note is printed instead of being silently ignored).
-    /// Off by default; overrides `[claude_true_yolo]` in config.toml when
-    /// passed. Best paired with ai-jail — see
+    /// Everything `--yolo` does, plus — for Claude — forcing
+    /// `bypassPermissions` via `--settings` over any settings `defaultMode`.
+    /// Claude still honors your own explicit `ask` rules in every mode. For
+    /// every other harness it is interchangeable with `--yolo`; passing both
+    /// is redundant but fine. Off by default; `[claude_true_yolo]` in
+    /// config.toml applies the same Claude extra to an explicit `--yolo`
+    /// launch. Best paired with ai-jail — see
     /// `docs/design-yolo-safety-ai-jail.md`.
     #[arg(long = "true-yolo")]
     pub true_yolo: bool,
+    /// Re-run this session inside ai-jail without asking. Bare `--jail` uses
+    /// the smart defaults (credentials present on this host, SSH for an SSH
+    /// `origin`, worktree metadata in a linked worktree); `--jail=LIST` enables
+    /// exactly the comma-separated ai-jail toggles listed (`github`, `aws`,
+    /// `ssh`, `gpu`, `docker`, …; `no-X` forces one off; `all`; `none`) and
+    /// forces every other checklist row off, so it is exact. A
+    /// project `.ai-jail` in the launch directory replaces the smart defaults
+    /// (a list still applies on top). Fails when ai-jail is not usable here;
+    /// ignored inside ai-jail. Wrapper-owned
+    /// like `--yolo`, never forwarded to the harness. See
+    /// `docs/design-yolo-safety-ai-jail.md`.
+    #[arg(
+        long,
+        value_name = "TOGGLES",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        conflicts_with = "no_jail"
+    )]
+    pub jail: Option<String>,
+    /// Never re-run inside ai-jail: skips the `--yolo` ai-jail offer (the
+    /// `--yolo` warning itself still shows).
+    #[arg(long)]
+    pub no_jail: bool,
     /// Start a new native session in the selected workstream instead of
     /// resuming or adopting an existing harness session.
     #[arg(long)]

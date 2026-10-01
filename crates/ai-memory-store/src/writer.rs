@@ -36,8 +36,9 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
-    RenameWorkstream, RenamedWorkstream,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkOrAdoptManagedRunSession,
+    ManagedRunSessionLink, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -713,6 +714,7 @@ pub(crate) enum WriteCmd {
     },
     PrepareWorkstreamRun {
         input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
         reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
     },
     HeartbeatManagedRun {
@@ -728,6 +730,10 @@ pub(crate) enum WriteCmd {
         agent: AgentKind,
         native_session_id: String,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    LinkOrAdoptManagedRunSession {
+        input: LinkOrAdoptManagedRunSession,
+        reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     AcceptManagedRunContext {
         run_id: ManagedRunId,
@@ -2999,9 +3005,22 @@ impl WriterHandle {
         &self,
         input: PrepareWorkstreamRun,
     ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_owned(input, None).await
+    }
+
+    /// Select a workstream and stamp the operator bucket used by safe recovery.
+    pub async fn prepare_workstream_run_owned(
+        &self,
+        input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+    ) -> StoreResult<PreparedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::PrepareWorkstreamRun { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::PrepareWorkstreamRun {
+            input,
+            owner_user,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -3036,6 +3055,17 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Link an exact run or safely recover a stale Codex daemon run id.
+    pub async fn link_or_adopt_managed_run_session(
+        &self,
+        input: LinkOrAdoptManagedRunSession,
+    ) -> StoreResult<ManagedRunSessionLink> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkOrAdoptManagedRunSession { input, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -4236,8 +4266,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::maintenance::record_success(&conn, job);
                 send_or_warn(reply, result, "record_maintenance_job_success");
             }
-            WriteCmd::PrepareWorkstreamRun { input, reply } => {
-                let result = crate::workstream::prepare_run(&mut conn, &input);
+            WriteCmd::PrepareWorkstreamRun {
+                input,
+                owner_user,
+                reply,
+            } => {
+                let result =
+                    crate::workstream::prepare_run(&mut conn, &input, owner_user.as_deref());
                 send_or_warn(reply, result, "prepare_workstream_run");
             }
             WriteCmd::HeartbeatManagedRun { run_id, reply } => {
@@ -4261,6 +4296,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &native_session_id,
                 );
                 send_or_warn(reply, result, "link_managed_run_session");
+            }
+            WriteCmd::LinkOrAdoptManagedRunSession { input, reply } => {
+                let result = crate::workstream::link_or_adopt_native_session(&mut conn, &input);
+                send_or_warn(reply, result, "link_or_adopt_managed_run_session");
             }
             WriteCmd::AcceptManagedRunContext { run_id, reply } => {
                 let result = crate::workstream::accept_context(&mut conn, run_id);

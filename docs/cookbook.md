@@ -168,25 +168,67 @@ ai-memory run --yolo claude
   `Enter`/`y`/`yes` proceeds (the default); `n`/`no` aborts before anything
   launches.
 - **The ai-jail offer.** If [ai-jail](https://github.com/akitaonrails/ai-jail)
-  is on `PATH` (or `~/.local/bin/ai-jail`) and you are not already inside it,
-  a second question offers to re-run the session inside it. Accepting
-  re-execs the original command under `ai-jail --network --agent-state
-  --env <NAME>...`, forwarding only the credential/config
+  is usable — on Linux/macOS, installed on `PATH` (or `~/.local/bin/ai-jail`),
+  with its sandbox backend present (`bwrap` on Linux, `sandbox-exec` on
+  macOS) — and you are not already inside it, a second question offers to
+  re-run the session inside it. When it is not usable (or on Windows) there is
+  no second question; the run just proceeds. Accepting re-execs the original
+  command under `ai-jail --network --agent-state --env <NAME>... --`,
+  forwarding only the credential/config
   environment variables that are already set (server/hook URL,
   `CLAUDE_CONFIG_DIR`, provider API keys, etc.) — `--network` keeps the
   loopback ai-memory server reachable while still sandboxing the filesystem.
   Declining keeps the run unsandboxed (your choice, already warned).
+- **Choosing what the jail gets.** After you accept the offer, a checklist
+  lists what this host can mount, pre-marked so `Enter` does the friendly
+  thing: every credential that exists (`~/.config/gh`, `~/.aws`, `~/.kube`,
+  `~/.config/gcloud`, `~/.docker/config.json`), SSH keys + agent when your
+  `origin` is an SSH remote, and worktree metadata in a linked worktree. The
+  Docker socket (grants host root), GPU, display, Pictures, and Tailscale are
+  listed unchecked. Type row numbers to flip them (`2 4`), or `all` / `none`.
+  A mounted credential is usable by the unsupervised agent, so uncheck what it
+  should not touch. What you see is what you get: unchecked rows are passed
+  as `--no-X`, so they stay off even if your global `~/.ai-jail` enables them.
+- **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
+  ai-jail straight away, turning on those pre-marked defaults and leaving
+  everything else to your own ai-jail config — with or without `--yolo`, and
+  in scripts too; it fails rather than running unjailed if ai-jail is not
+  usable. `--jail=github,ssh,no-mise` is exact: the listed toggles (`no-X`
+  forces one off), with every other checklist row forced off; `all` turns
+  every row on and `none` turns every row off. `--no-jail` never jails and skips the
+  offer (the `--yolo` warning stays). There are no bare `--github`-style
+  flags on purpose: they would collide with the harness's own flags (Claude
+  Code has a `--worktree`). The credential mounts need ai-jail 2.5.0; toggles
+  your installed ai-jail lacks are hidden, and naming one is an error.
+- **A project `.ai-jail` wins.** If the directory you launch from has its own
+  `.ai-jail`, ai-jail loads it as-is: no checklist, and a bare `--jail` adds
+  no toggles; `--jail=…` still applies its list on top. A project file cannot
+  enable credentials (ai-jail treats it as untrusted), so to have them mounted
+  automatically there, enable them in your global `~/.ai-jail` or pass
+  `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
+  run never writes its own flags into your repository's `.ai-jail`.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
   directly — `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
   `(jail) `); it fails open (shows the warning) when undetectable, never
   open to skipping it silently.
-- **Claude "true yolo".** `--dangerously-skip-permissions` alone still pauses
-  Claude Code on `permissions.ask`/`deny` rules and on a 2-minute `rm`
-  confirmation. Opt in with `--true-yolo` (or `claude_true_yolo = true` in
-  `config.toml` / `AI_MEMORY_CLAUDE_TRUE_YOLO=true`) to also silence those —
-  Claude-only, off by default, and best paired with ai-jail since it does not
-  widen your own `deny`/`ask` rules.
+- **Claude "true yolo".** `--true-yolo` includes everything `--yolo` does
+  (`ai-memory run claude --true-yolo` is enough; adding `--yolo` too is
+  harmless) and, for Claude, also forces `bypassPermissions` over any
+  `defaultMode` in your settings. For other harnesses it is the same as
+  `--yolo`. `claude_true_yolo = true` in `config.toml` /
+  `AI_MEMORY_CLAUDE_TRUE_YOLO=true` applies the Claude extra to every `--yolo`
+  launch, never to a run without it.
+  **It cannot remove your own `ask` rules**: Claude Code honors explicit
+  `permissions.ask` rules (and its built-in command-safety checks) in every
+  mode, so a rule like `Bash(docker run *)` in `~/.claude/settings.json` still
+  pauses the run. For a pause-free sandbox, drop those `ask` entries — `deny`
+  rules block without pausing, so they can stay. Best paired with ai-jail.
+- **Passing extra env, e.g. a GitHub token.** `ai-memory run claude --yolo
+  --env GH_TOKEN="$(gh auth token)"` forwards it into the jailed agent (needs
+  ai-jail 2.4.2 or later when you accept the jail offer). This
+  hands a sandboxed agent your token, so only do it for work you'd trust it
+  with; it is deliberately never forwarded automatically.
 
 See [`design-yolo-safety-ai-jail.md`](design-yolo-safety-ai-jail.md) for the
 full contract.

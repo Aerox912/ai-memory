@@ -7444,6 +7444,12 @@ impl ReaderPool {
     ///
     /// Returns an empty vec when the seed is missing or has no neighbours.
     ///
+    /// `viewer` filters every hop the way [`Self::page_links`] filters its far
+    /// end: a page in a project the viewer cannot read is neither returned
+    /// nor walked through, so nothing reachable only through it is returned
+    /// either. `None` (root, or per-repository authorization off) walks every
+    /// latest page.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn related_walk(
@@ -7452,6 +7458,7 @@ impl ReaderPool {
         project_id: ProjectId,
         path: String,
         depth: u8,
+        viewer: Option<UserId>,
     ) -> StoreResult<Vec<RelatedNode>> {
         let depth = depth.clamp(1, RELATED_WALK_MAX_DEPTH);
         self.with_conn(move |conn| {
@@ -7472,13 +7479,14 @@ impl ReaderPool {
             // (latest-only, cross-project) but also selects `pg.id` so the walk
             // can continue from each neighbour.
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let visible = readable_repository_predicate("pg.project_id", viewer);
             let outgoing = format!(
                 "SELECT DISTINCT pg.id, pg.path, pg.title, {kind_expr}, ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.to_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1 \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let incoming = format!(
@@ -7487,7 +7495,7 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.from_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1 \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let mut out_stmt = conn.prepare(&outgoing)?;

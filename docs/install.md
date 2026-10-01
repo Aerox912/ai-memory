@@ -479,10 +479,13 @@ a script fallback.
 
 `[capture] ignore_paths` is enforced only by native `ai-memory hook` commands
 and generated OpenCode/OMP/Pi/OpenClaw integrations. Local installers select
-native commands where supported; legacy `.sh`/`.ps1` hooks and remote-only or
-Docker script bundles do not enforce it. Re-run `install-hooks --agent <agent>
---apply` or refresh/reinstall generated plugins after upgrading; installer
-capability output reflects the selected integration. See the canonical
+native commands where supported. The Linux/macOS Docker wrapper also routes
+ordinary `install-hooks` through its checksum-verified native host client, so
+the quick-start path is covered. Legacy `.sh`/`.ps1` hooks, an explicit
+`AI_MEMORY_HOOK_PLATFORM=posix|windows`, `setup-agent`, and remote-only/manual
+Docker script bundles do not enforce it. Re-run `install-hooks --agent
+<agent> --apply` or refresh/reinstall generated plugins after upgrading;
+installer capability output reflects the selected integration. See the canonical
 [capture exclusions reference](marker-file.md#capture-exclusions).
 
 Lifecycle observation bodies are bounded separately from the 10 MiB HTTP
@@ -538,9 +541,10 @@ Windows, so the usual install is covered. It is the *script* installs that are
 not: the bundled shell/PowerShell hooks POST to the server directly and never
 execute the binary, so nothing reads the mode. In practice that means the
 legacy `posix`/`windows` platform override (`AI_MEMORY_HOOK_PLATFORM`), the
-Docker host wrapper, and `setup-agent` snippets, which emit script commands by
-design. `install-hooks --apply` prints the mode and warns when the install it
-is writing cannot enforce it.
+remote `setup-agent` flow, and manual Docker script-bundle installs. The
+Linux/macOS Docker wrapper's ordinary `install-hooks` path uses its native host
+client and is covered. `install-hooks --apply` prints the mode and warns when
+the install it is writing cannot enforce it.
 
 Within that boundary the mode is not per-agent: it is stored once in the data
 directory and every native hook command reads it, whichever agent invoked it.
@@ -607,17 +611,14 @@ it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.
 
 Upgrading the binary is sufficient for native Claude Code installs, and pending
-spooled events drain with the raw field stripped as well. Installs that run the
-`.sh`/`.ps1` script fallback (the Docker script bundle or an explicit
-`AI_MEMORY_HOOK_PLATFORM=posix`) cannot sanitize the assistant text, so a `Stop`
-payload still carrying the raw field is dropped whole by the script rather than
-POSTed verbatim. The Docker wrapper deliberately keeps script commands because a
-binary path inside its helper container is not valid on the host; running
-`install-hooks` through that wrapper refreshes the scripts but does not convert
-them. To capture assistant text safely, install a native ai-memory client on the
-agent host, then use that native executable to run
-`install-hooks --agent claude-code --apply`. Even if the script fallback is
-retained, the server still strips any raw field on receipt before persistence.
+spooled events drain with the raw field stripped as well. The Linux/macOS Docker
+wrapper installs the same native hook command through its checksum-verified
+host client. Installs that explicitly select the `.sh`/`.ps1` compatibility
+fallback (`AI_MEMORY_HOOK_PLATFORM=posix|windows`), or use a remote/manual
+Docker script bundle, cannot sanitize the assistant text, so a `Stop` payload
+still carrying the raw field is dropped whole by the script rather than POSTed
+verbatim. Even when that fallback is retained, the server strips any raw field
+on receipt before persistence.
 
 Native `ai-memory hook --event ...` commands spool events locally. The POSIX
 shell bundle spools too, but only on failure: it POSTs first and writes the
@@ -799,7 +800,9 @@ including Pi and Zero, have lifecycle capture paths through `install-hooks`.
 > real `ai-memory.exe`, `args` = argv tokens for `hook --event ...`); other
 > agents use native single command strings according to their hook schema.
 > PowerShell/Git Bash script bundles are compatibility fallbacks and do not
-> enforce capture-policy v1. Remote-only/Docker script installs still use the
+> enforce capture-policy v1. The Linux/macOS Docker wrapper downloads a
+> checksum-verified native host client for ordinary `install-hooks` calls.
+> Remote-only/manual Docker script installs still use the
 > two-step path: (1) `docker cp` bundled scripts to your home dir, (2)
 > `docker run --rm install-hooks` renders the config snippet.
 > OpenClaw, OpenCode, OMP, and Pi are different: they use generated
@@ -2035,6 +2038,26 @@ hosted compatibility endpoints, no dedicated ai-memory provider is required.
 Configure embeddings separately if your chosen API Route model does not
 provide an OpenAI-compatible embeddings endpoint.
 
+[FutureInfra](https://futureinfra.ai/ai/) is an OpenAI-compatible AI API
+router and uses the same provider; no dedicated ai-memory provider is needed.
+Its OpenAI-compatible base is `https://futureinfra.ai/v1/ai`. That path does
+not end in a version segment, so pass the full Chat Completions URL (ai-memory
+uses a base URL that already ends in `/chat/completions` as-is). Pass its API
+key through the generic compatibility credential:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://futureinfra.ai/v1/ai/chat/completions
+-e AI_MEMORY_LLM_MODEL=openai/gpt-4o-mini
+-e LLM_API_KEY="$FUTUREINFRA_API_KEY"
+```
+
+Model ids use the `provider/model` format, e.g. `anthropic/claude-sonnet-4` or
+`deepseek/deepseek-chat`; `GET https://futureinfra.ai/v1/ai/models` lists the
+current ids. Keys are created in the
+[FutureInfra console](https://futureinfra.ai/console/?screen=ai-router). This
+example configures the LLM only; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
@@ -2488,7 +2511,11 @@ ai-memory install-hooks --agent  claude-code --apply
 ```
 
 The installed Docker wrapper runs CLI commands inside a short-lived
-helper container. For local loopback servers, it automatically bridges
+helper container for server/store operations, but runs `install-hooks` through
+the stable checksum-verified native client under
+`~/.local/share/ai-memory/native-runner/`. This keeps hook command paths valid
+on the host and enforces capture exclusions before spooling. For local loopback
+servers, the wrapper automatically bridges
 that helper back to the host's `127.0.0.1:49374`, so `ai-memory status`,
 `ai-memory search`, and `ai-memory bootstrap` work with the same default
 URL as the generated agent config.
@@ -2565,8 +2592,8 @@ ai-memory upgrade
 
 The command downloads the wrapper and its SHA-256 checksum from the latest
 GitHub Release, refuses an unverified update, pulls the latest Docker
-image, re-stages hook scripts under
-`~/.local/share/ai-memory/hooks/<agent>/` for configured agents, and
+image, refreshes the checksum-verified native host client, rewrites previously
+staged hook registrations to that native command when supported, and
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
@@ -2604,7 +2631,11 @@ The native path downloads the matching release archive
 Windows) and its `.sha256` sidecar from GitHub Releases, verifies the
 checksum, replaces the on-disk binary (and a sibling `hooks/` directory when
 present), then re-stages hooks for agents already under the data-dir hooks
-tree. Windows uses rename-aside (`.exe` → `.old`, then promote `.new`) because
+tree. The archive's packaged service files, default config, and documentation
+are checked against the release workflow's exact layout but are not extracted
+during self-upgrade. Archives are capped at 4,096 entries and 512 MiB expanded,
+in addition to the 128 MiB response-body cap. Windows uses rename-aside
+(`.exe` → `.old`, then promote `.new`) because
 a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
 installs (use the package manager), unwritable prefixes (for example Program
 Files — download the zip manually), and in-container binaries (upgrade the

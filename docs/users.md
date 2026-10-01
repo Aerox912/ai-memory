@@ -159,6 +159,17 @@ root_subject = "<root-subject>"
   exact match with `root_issuer` plus `root_subject`.
 - Origin health checks or maintenance calls that need root should use the root
   bearer, not the proxy bearer. Raw actor headers on the root rung are ignored.
+- **A proxied non-root end-user is not subject to per-project `restricted`
+  grants.** The proxy branch authenticates the request as `AuthLevel::User`
+  with an `ActorContext`, but — unlike a database user — never maps it to a
+  database `UserId`/`AuthorizedViewer`: grants are keyed on `UserId`, and a
+  proxied identity has none to key on. A missing `AuthorizedViewer` reads as
+  "no per-project check applies" (the same as root, or an install with no
+  database users at all), so a `restricted` project is readable by any
+  proxied user with no grant. This is by design, not a gap: in a trusted-proxy
+  deployment the proxy itself is the authorization boundary. If you need
+  per-project `restricted` enforcement for individual end users, issue them
+  database-user tokens (see above) instead of relying on the proxy headers.
 
 ## Identity keys
 

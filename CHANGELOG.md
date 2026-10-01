@@ -7,6 +7,183 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2-aerox.1] - 2026-10-01
+
+### Changed
+- Integrated canonical v2.5.2 and subsequent upstream changes through `53985bddc466a1d37e8ee819ea52133012927d45`, including managed-run recovery migration V71, while retaining Aerox file-backed authentication, runtime-only hook credentials, isolated pools, and Windows/WSL release packaging.
+
+### Changed
+- Documented FutureInfra as an endpoint for the existing `openai-compat`
+  provider. (#1026)
+
+### Fixed
+- Fixed `ai-memory upgrade` rewriting native hook commands with Linux's
+  ` (deleted)` executable-path suffix after replacing its own binary. Every
+  hook renderer now keeps a still-existing literal path, otherwise strips the
+  kernel suffix only when the resulting installed binary exists, and finally
+  falls back to the bare `ai-memory` command instead of embedding a dead path.
+  The in-process refresh continues using the already-loaded CLI/config scope.
+  (#1027)
+- Fixed native `ai-memory upgrade` rejecting every current Linux, macOS, and
+  Windows release archive when it encountered the packaging, config-template,
+  or documentation entries shipped beside the binary. The extractor now
+  validates the exact support-file layout emitted by `release.yml`, ignores
+  those non-runtime files during self-upgrade, and still extracts only the
+  binary and hooks. Archive entry-count and expanded-size caps now complement
+  the existing compressed-download limit. (#1025)
+- Fixed the recommended Linux/macOS Docker-wrapper `install-hooks` path
+  silently installing shell hooks that cannot enforce client-side capture
+  controls such as `[capture] ignore_paths` and allowlist mode. The wrapper now
+  uses its existing checksum-verified native host client for hook installation
+  and refresh, while an explicit `AI_MEMORY_HOOK_PLATFORM=posix|windows` keeps
+  the documented compatibility fallback and warning. Wrapper upgrades refresh
+  that stable native client before rewriting existing hook registrations.
+  (#1002)
+- Fixed managed Codex sessions losing their startup continuity when a shared
+  Codex app-server daemon reports a finished run's stale `AI_MEMORY_RUN_ID`.
+  SessionStart now recovers only the sole live, undelivered Codex run in the
+  already-authorized repository, checkout cwd, and operator bucket, and links
+  it atomically to the new native session. Active boundary mismatches,
+  concurrent matching runs, cross-project or cross-worktree candidates,
+  cross-operator candidates, and a second linker all fail closed instead of
+  guessing or rebinding a run. (#987)
+- `ai-memory doctor` now warns when the nearest `.ai-memory.toml`'s
+  `[capture]` section is invalid. This fails closed today — every file and
+  shell tool event is reduced to metadata until the marker is fixed, nothing
+  leaks — but nothing surfaced that it had happened, so an operator could
+  believe `ignore_paths` was excluding paths it no longer was. The check is
+  based on the same resolution state the live hook path uses (not just
+  whether the TOML parses), so it also catches a `[capture]` table that
+  parses fine but is still rejected at compile time, e.g. an unsupported glob
+  character in `ignore_paths`. (#1021)
+- Fixed the shell and PowerShell hook scripts mishandling a `$HOME` that ends
+  in a separator: the shell walks missed a marker between the checkout and
+  home, and the PowerShell walks went past home and read a marker above it.
+  Both now match the native `ai-memory hook` walk. (#1023)
+- Fixed `ai-memory run --jail` leaving the `ssh` toggle unchecked when
+  `git push` goes over SSH but `origin`'s fetch URL does not show it: an HTTPS
+  `origin` with an SSH `pushurl` or `pushInsteadOf`, or a `host:path` remote
+  using an `~/.ssh/config` alias. The interactive offer now also uses
+  ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
+  trust checks is treated as unavailable instead of producing a broken offer.
+  (#1024)
+## [2.5.2] - 2026-10-01
+
+### Added
+- Added `ai-memory run --jail[=TOGGLES]` and `--no-jail`, and an interactive
+  checklist after the `--yolo` ai-jail offer, to choose which ai-jail
+  credentials and capabilities the jailed session gets. Bare `--jail` re-runs
+  inside ai-jail without asking, using smart defaults: every credential present
+  on the host (`~/.config/gh`, `~/.aws`, `~/.kube`, `~/.config/gcloud`,
+  `~/.docker/config.json`), SSH when `origin` is an SSH remote, and worktree
+  metadata in a linked worktree; host capabilities (`docker`, `gpu`,
+  `display`, `pictures`, `tailscale`) stay off, and anything else is left to
+  the user's own ai-jail config. `--jail=github,aws,no-mise` is exact: it
+  passes every checklist row it does not name as `--no-X`, so a global
+  `~/.ai-jail` cannot add to it (`all` and `none` also work); the checklist
+  likewise passes unchecked rows as `--no-X`. `--jail` works without `--yolo`
+  and in scripts, and fails instead of running unjailed when ai-jail is not
+  usable. Only toggles the installed ai-jail advertises in its
+  `--help` are offered or passed; the credential mounts need ai-jail 2.5.0.
+  ai-jail's security switches (`seccomp`, `landlock`, `private-home`, …) are
+  never accepted. `--no-jail` skips the offer while keeping the `--yolo`
+  warning. A project `.ai-jail` in the launch directory replaces the checklist
+  and the bare-`--jail` defaults (ai-jail loads it under its own trust rules;
+  `--jail=…` still applies on top), and every jailed re-run now passes
+  `--no-save-config`, so ai-jail no longer writes ai-memory's `--network` /
+  `--agent-state` / credential flags into the repository's `.ai-jail`.
+
+### Fixed
+- Fixed the shell and PowerShell session-start hooks for Claude Code, Codex,
+  Cursor, Gemini CLI, OpenCode, Command Code, Devin, and Antigravity CLI not
+  sending the marker's `[briefing]` keys (`briefing`, `briefing_budget`) on the
+  handoff request, so a repository with `inject_on_session_start = true` got
+  the handoff without its compiled brief on script installs (Docker wrapper,
+  `setup-agent`). Only the native `ai-memory hook` command and the Kiro CLI and
+  Kimi Code scripts sent them; all now match `docs/marker-file.md`. (#998)
+- Fixed a wiki checkpoint leaving `.git/index` behind the commit it made. A
+  path-scoped checkpoint wrote the index file only once every 50 commits, so
+  between writes `HEAD` and the working tree held the new page while the index
+  still named the old blob, and `git status` from outside the server showed
+  every checkpointed page as `MM`; a checkpoint with nothing to commit left a
+  stale index the same way. The history itself was always correct. Not specific
+  to Windows. (#983, #1006)
+- Fixed a wiki checkpoint failing instead of retrying when a full walk listed a
+  file that was gone by the time it was read (libgit2's `Os`-class "failed to
+  read file into stream", e.g. an atomic writer's temp file renamed away
+  mid-walk). It now takes the same bounded racy-read retry as a file changed
+  mid-write; unrelated I/O errors still fail fast. This was also the source of
+  an intermittent `concurrent_commits_queue_instead_of_failing` CI failure.
+
+### Security
+- Fixed GHSA-gf78-hf8g-vffm: `memory_read_page` with `include_related` returning pages from
+  projects the caller cannot read under per-project authorization, and walking
+  through them to reach others: in multi-user mode an authenticated user without
+  a grant saw the paths, titles, kinds, and project names of pages in a
+  `restricted` project up to three hops away (never their bodies). `page_links`
+  and the graph already hid them; the multi-hop related walk now filters every
+  hop the same way. Installs without authorization, and root, are unchanged.
+  (#999)
+- Fixed CLI `ai-memory message send` (`POST /admin/messages/send`) bypassing
+  `message_send` admission: it inserted the message without consulting a
+  configured webhook's reject policy or notifying observers, while the MCP
+  send path enforced both. It now runs admission at the recipient scope before
+  the insert — a rejection returns 403 and stores nothing — and notifies
+  observers only after a successful commit, without waiting on nonblocking
+  ones. (#756)
+
+## [2.5.1] - 2026-10-01
+
+### Fixed
+- Fixed `ai-memory run --yolo`'s ai-jail re-exec aborting when the wrapped
+  command carried a flag that ai-jail also defines: `run claude --yolo --env
+  GH_TOKEN=…` failed with "flag --env after command would be passed to the
+  child". The invocation now separates ai-jail's sandbox flags from the
+  wrapped command with `--`; forwarding such a flag also needs ai-jail 2.4.2 or
+  later, whose guard honors the separator.
+- Fixed the `--yolo` ai-jail offer appearing when accepting it could not
+  work. It is now shown only on Linux/macOS when both ai-jail and its sandbox
+  backend (`bwrap` / `sandbox-exec`) are present — never on Windows, even with a
+  file named `ai-jail` on `PATH` — and otherwise the run proceeds without the
+  question. The re-exec runs the exact binary that was found, so a
+  `~/.local/bin`-only ai-jail no longer fails to exec after the user accepted.
+- Fixed `--true-yolo`. It now implies `--yolo` (the warning, the ai-jail
+  offer, and each harness's dangerous mode), so passing it alone no longer
+  bypassed Claude's permissions with no warning; it is interchangeable with
+  `--yolo` for non-Claude harnesses instead of printing "ignoring it"; and it is
+  recognized after native arguments (`run claude --model opus --true-yolo`)
+  instead of being passed to Claude as an unknown option. The `claude_true_yolo`
+  config key now
+  only upgrades an explicit `--yolo`/`--true-yolo` launch, as documented,
+  rather than applying `bypassPermissions` to every managed Claude run.
+- Fixed relaunching right after an interrupted `ai-memory run` failing with
+  "workstream is already active: owned by … until …" when the previous
+  launcher could not release its lease (killed, terminal closed, or an
+  ai-jail sandbox torn down). An interactive launch now names the holder and
+  waits for that lease to lapse (at most one ~90-second lease; Ctrl-C aborts),
+  then starts by itself. A holder that renews the lease meanwhile is reported
+  as a launcher still running — never displaced — and non-interactive launches
+  keep the short retry window.
+- Fixed `--true-yolo` claiming protections it never provided. It set three
+  `CLAUDE_CODE_DISABLE_*RM*` environment variables that Claude Code does not
+  read, and passed an empty `permissions.ask` array that cannot clear `ask`
+  rules from other settings scopes (Claude Code unions them). Both were
+  removed; true-yolo now forces only `bypassPermissions`, and the docs state
+  that Claude still honors your own `ask` rules and command-safety checks in
+  every mode.
+
+### Security
+- Fixed GHSA-vh98: a capture-exclusion candidate or shell argument spelled
+  with a leading `//` (e.g. `//repo/secret/token.txt`) self-classified as a
+  Windows UNC path regardless of the actual host, so it matched zero POSIX
+  `ignore_paths` patterns (a flavor mismatch) and was captured instead of
+  dropped. Path flavor for an untrusted candidate is now derived from the
+  host (the cwd) rather than the candidate string alone, both in the native
+  hook (`ai-memory-hooks` `capture_policy.rs`) and the generated
+  OpenCode/OMP/Pi/OpenClaw TypeScript integrations
+  (`ai-memory-cli` `render_shared.rs`); a genuine Windows/UNC host's UNC
+  candidates are unaffected.
+
 ## [2.5.0-aerox.1] - 2026-09-30
 
 ### Changed
@@ -3833,7 +4010,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - CI now rejects a change that writes into an already-released CHANGELOG
-  section. `bin/release` renames `## [Unreleased]` to `## [X.Y.Z]`, so a branch
+  section. `bin/release` renames `## [Unreleased]
+
+## [2.5.2-aerox.1] - 2026-10-01
+
+### Changed
+- Integrated canonical v2.5.2 and subsequent upstream changes through `53985bddc466a1d37e8ee819ea52133012927d45`, including managed-run recovery migration V71, while retaining Aerox file-backed authentication, runtime-only hook credentials, isolated pools, and Windows/WSL release packaging.` to `## [X.Y.Z]`, so a branch
   opened before a release carries a diff anchored at the old line numbers and
   git merges it into whatever section now occupies them — silently, with no
   conflict. Three entries landed in the wrong release this way (#491 into
@@ -7741,7 +7923,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...HEAD
+[2.5.2]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...v2.5.2
+[2.5.1]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...v2.5.1
 [2.5.0]: https://github.com/akitaonrails/ai-memory/compare/v2.4.2...v2.5.0
 [2.4.2]: https://github.com/akitaonrails/ai-memory/compare/v2.4.1...v2.4.2
 [2.4.1]: https://github.com/akitaonrails/ai-memory/compare/v2.4.0...v2.4.1

@@ -35,7 +35,10 @@ stdout (or their equivalent context-injection result); Grok and Zero must call
 Capture exclusions are separate from MCP registration. Native hook commands and
 generated OpenCode/OMP/Pi/OpenClaw integrations enforce `[capture]
 ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
-not. Reinstall/refresh an existing hook or plugin to gain it; see
+not. The Linux/macOS Docker wrapper's ordinary `install-hooks` command uses its
+checksum-verified native host client and is covered; this limitation applies to
+manual container/script extraction and explicit compatibility overrides.
+Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
 Claude Desktop, VS Code Copilot, Zed, and Muse Code are **MCP-only** here:

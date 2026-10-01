@@ -437,6 +437,19 @@ impl CaptureDecision {
 }
 
 impl CapturePolicy {
+    /// This policy's resolution state: whether a marker was absent, parsed
+    /// into an active pattern set, or present but rejected (bad TOML, a
+    /// `[capture]` shape `read_capture_config` doesn't accept, or a pattern
+    /// `compile` rejects, e.g. an unsupported glob). `Invalid` already fails
+    /// closed in [`Self::inspect`] — this accessor exists for diagnostics
+    /// (`ai-memory doctor`) that want to say *why* without re-deriving it
+    /// from scratch or trusting a parse-only check that misses the
+    /// `compile`-rejected case.
+    #[must_use]
+    pub const fn state(&self) -> PolicyState {
+        self.state
+    }
+
     /// Resolves a marker config atomically. Empty parsed configuration is inactive.
     /// `home_dir` is required only when at least one pattern starts with `~/`.
     #[must_use]
@@ -462,7 +475,7 @@ impl CapturePolicy {
                 patterns,
                 home: home_dir.and_then(|dir| normalize_root(dir).ok()),
             },
-            Err(()) => Self {
+            Err(_) => Self {
                 state: PolicyState::Invalid,
                 patterns: Vec::new(),
                 home: None,
@@ -1014,10 +1027,23 @@ fn normalize_candidate(candidate: &str, cwd: &str) -> Option<Normalized> {
         return None;
     }
     let cwd = normalize_root(cwd).ok()?;
+    // Flavor must come from the host (the cwd), never from the candidate
+    // string alone: on a POSIX host a leading `//` is an ordinary doubled
+    // separator, not a UNC root, but `flavor_of` cannot tell the two apart
+    // from the string in isolation. Collapsing it first keeps a POSIX
+    // candidate POSIX-flavored so it still matches a POSIX `ignore_paths`
+    // pattern instead of silently escaping every pattern via a flavor
+    // mismatch (GHSA-vh98). A genuine Windows/UNC host is unaffected: the
+    // collapse only runs when the cwd itself is not windows-flavored.
     let raw = if is_absolute(candidate) {
         candidate.to_owned()
     } else {
         join(&cwd, candidate)
+    };
+    let raw = if flavor_of(&cwd) == Flavor::Posix && raw.starts_with("//") {
+        format!("/{}", raw.trim_start_matches('/'))
+    } else {
+        raw
     };
     let flavor = flavor_of(&raw);
     Some(Normalized {
@@ -1029,11 +1055,14 @@ fn compile(
     config: &CaptureConfig,
     marker_dir: &str,
     home_dir: Option<&str>,
-) -> Result<Vec<CompiledPattern>, ()> {
+) -> Result<Vec<CompiledPattern>, String> {
     if config.ignore_paths.len() > MAX_IGNORE_PATTERNS {
-        return Err(());
+        return Err(format!(
+            "`ignore_paths` has more than {MAX_IGNORE_PATTERNS} entries"
+        ));
     }
-    let marker = normalize_root(marker_dir).map_err(|_| ())?;
+    let marker = normalize_root(marker_dir)
+        .map_err(|_| "the repository path could not be normalized".to_owned())?;
     let needs_home = config
         .ignore_paths
         .iter()
@@ -1042,7 +1071,10 @@ fn compile(
         Some(
             home_dir
                 .and_then(|dir| normalize_root(dir).ok())
-                .ok_or(())?,
+                .ok_or_else(|| {
+                    "a pattern starts with '~/' but no home directory is available to expand it"
+                        .to_owned()
+                })?,
         )
     } else {
         None
@@ -1051,16 +1083,23 @@ fn compile(
         .ignore_paths
         .iter()
         .map(|source| {
-            validate_glob(source)?;
+            validate_glob(source)
+                .map_err(|reason| format!("ignore_paths entry {source:?} {reason}"))?;
             let expanded = if let Some(rest) = source.strip_prefix("~/") {
-                join(home.as_deref().ok_or(())?, rest)
+                let home = home.as_deref().ok_or_else(|| {
+                    "a pattern starts with '~/' but no home directory is available to expand it"
+                        .to_owned()
+                })?;
+                join(home, rest)
             } else if is_absolute(source) {
                 source.clone()
             } else {
                 join(&marker, source)
             };
             let flavor = flavor_of(&expanded);
-            let path = normalize_segments(&expanded).ok_or(())?;
+            let path = normalize_segments(&expanded).ok_or_else(|| {
+                format!("ignore_paths entry {source:?} could not be normalized into a path")
+            })?;
             Ok(CompiledPattern {
                 literal_prefix: literal_prefix(&path).into(),
                 directory_base: path.strip_suffix("/**").map(|base| {
@@ -1076,20 +1115,59 @@ fn compile(
         })
         .collect()
 }
-fn validate_glob(pattern: &str) -> Result<(), ()> {
-    if pattern.trim().is_empty()
-        || pattern.chars().count() > MAX_IGNORE_PATTERN_CHARS
-        || pattern.contains(['!', '{', '}', '[', ']', '(', ')', '|', '^', '$', '%'])
-        || pattern.contains("${")
-        || pattern.contains("***")
-        || pattern
-            .replace('\\', "/")
-            .split('/')
-            .any(|segment| segment == "..")
-        || (pattern.starts_with('~') && !pattern.starts_with("~/"))
-        || is_drive_relative(pattern)
+
+/// Diagnostic twin of the compile step [`CapturePolicy::resolve`] runs: a
+/// `[capture]` table can parse as valid TOML and still fail here (too many
+/// patterns, an unsupported glob character, a `..` segment, a `~/` pattern
+/// with no home directory to expand it...), which is exactly the gap a
+/// parse-only check (e.g. `read_capture_config_verbose`) misses. `None`
+/// means this config would compile into an active policy; `Some(reason)`
+/// names the first rejected pattern and why.
+#[must_use]
+pub fn describe_invalid_capture_config(
+    config: &CaptureConfig,
+    marker_dir: &str,
+    home_dir: Option<&str>,
+) -> Option<String> {
+    if config.ignore_paths.is_empty() {
+        return None;
+    }
+    compile(config, marker_dir, home_dir).err()
+}
+fn validate_glob(pattern: &str) -> Result<(), String> {
+    if pattern.trim().is_empty() {
+        return Err("is empty".to_owned());
+    }
+    if pattern.chars().count() > MAX_IGNORE_PATTERN_CHARS {
+        return Err(format!(
+            "is longer than {MAX_IGNORE_PATTERN_CHARS} characters"
+        ));
+    }
+    if pattern.contains(['!', '{', '}', '[', ']', '(', ')', '|', '^', '$', '%']) {
+        return Err(
+            "contains an unsupported glob character (one of ! { } [ ] ( ) | ^ $ %)".to_owned(),
+        );
+    }
+    if pattern.contains("${") {
+        return Err("contains a shell-style variable expansion (${...})".to_owned());
+    }
+    if pattern.contains("***") {
+        return Err("contains three or more consecutive '*'".to_owned());
+    }
+    if pattern
+        .replace('\\', "/")
+        .split('/')
+        .any(|segment| segment == "..")
     {
-        return Err(());
+        return Err("contains a '..' path segment".to_owned());
+    }
+    if pattern.starts_with('~') && !pattern.starts_with("~/") {
+        return Err(
+            "starts with '~' but not '~/' (only home-relative '~/...' is supported)".to_owned(),
+        );
+    }
+    if is_drive_relative(pattern) {
+        return Err("is drive-relative (e.g. 'C:foo' without a path separator)".to_owned());
     }
     Ok(())
 }
@@ -1273,6 +1351,83 @@ mod tests {
         // A new field must not silently tighten capture for existing installs.
         assert_eq!(CaptureMode::default(), CaptureMode::Denylist);
     }
+
+    #[test]
+    fn state_reports_active_for_a_valid_config() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        assert_eq!(policy.state(), PolicyState::Active);
+    }
+
+    #[test]
+    fn state_reports_inactive_for_an_absent_marker() {
+        let policy = CapturePolicy::resolve(CaptureSource::Absent, "/repo", None);
+        assert_eq!(policy.state(), PolicyState::Inactive);
+    }
+
+    #[test]
+    fn state_reports_inactive_for_an_empty_ignore_paths() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: Vec::new(),
+            }),
+            "/repo",
+            None,
+        );
+        assert_eq!(policy.state(), PolicyState::Inactive);
+    }
+
+    #[test]
+    fn state_reports_invalid_for_a_parse_failure() {
+        let policy = CapturePolicy::resolve(CaptureSource::Invalid, "/repo", None);
+        assert_eq!(policy.state(), PolicyState::Invalid);
+    }
+
+    #[test]
+    fn state_reports_invalid_for_a_config_that_parses_but_does_not_compile() {
+        // This is exactly the gap a parse-only check misses: valid TOML,
+        // valid `[capture]` shape, but a pattern `compile` itself rejects.
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secrets/{a,b}".into()],
+            }),
+            "/repo",
+            None,
+        );
+        assert_eq!(policy.state(), PolicyState::Invalid);
+    }
+
+    #[test]
+    fn describe_invalid_capture_config_is_none_when_it_would_compile() {
+        let config = CaptureConfig {
+            ignore_paths: vec!["secret/**".into()],
+        };
+        assert!(describe_invalid_capture_config(&config, "/repo", None).is_none());
+    }
+
+    #[test]
+    fn describe_invalid_capture_config_names_the_rejected_pattern() {
+        let config = CaptureConfig {
+            ignore_paths: vec!["ok/**".into(), "secrets/{a,b}".into()],
+        };
+        let reason = describe_invalid_capture_config(&config, "/repo", None)
+            .expect("a rejected glob must produce a reason");
+        assert!(reason.contains("secrets/{a,b}"), "{reason}");
+        assert!(reason.contains("unsupported glob character"), "{reason}");
+    }
+
+    #[test]
+    fn describe_invalid_capture_config_is_none_for_an_empty_config() {
+        let config = CaptureConfig {
+            ignore_paths: Vec::new(),
+        };
+        assert!(describe_invalid_capture_config(&config, "/repo", None).is_none());
+    }
     #[test]
     fn fixture_vectors() {
         let fixture: Value =
@@ -1325,6 +1480,69 @@ mod tests {
         }
         assert!(CaptureProtocol::parse(&fixture["protocol"]["accept"]).is_some());
         assert!(CaptureProtocol::parse(&fixture["protocol"]["reject"]).is_none());
+    }
+    /// Adversarial regression for GHSA-vh98 / security-boundaries.md row
+    /// 11b: a POSIX-host candidate spelled with a leading `//` used to be
+    /// classified `Flavor::Windows` purely from the string, so it matched
+    /// zero POSIX `ignore_paths` patterns (flavor mismatch in `match_paths`'
+    /// filter) and was captured instead of dropped. `flavor_of` cannot tell
+    /// a doubled POSIX separator from a UNC root by itself; only the host
+    /// (the cwd) can. This attempts the violation, proves a plain-looking
+    /// control still drops normally, and proves a genuine Windows-hosted UNC
+    /// candidate still matches (so the fix didn't just blanket-collapse
+    /// every `//`).
+    #[test]
+    fn a_leading_double_slash_candidate_does_not_escape_posix_ignore_paths_via_flavor_mismatch() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        // The violation attempt: on the unfixed code this normalized to a
+        // Windows-flavored candidate and matched no POSIX pattern, so it
+        // came back `Keep` (captured) instead of `Drop`.
+        let attack =
+            json!({"tool_name":"Edit","tool_input":{"file_path":"//repo/secret/token.txt"}});
+        assert_eq!(
+            policy
+                .inspect(AgentKind::ClaudeCode, &attack, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop,
+            "a leading `//` must not escape a POSIX host's ignore_paths"
+        );
+        // Legitimate control: an ordinary single-slash candidate under the
+        // same pattern must keep being dropped.
+        let control =
+            json!({"tool_name":"Edit","tool_input":{"file_path":"/repo/secret/token.txt"}});
+        assert_eq!(
+            policy
+                .inspect(AgentKind::ClaudeCode, &control, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        // Windows-UNC control: a genuine UNC candidate on a Windows host
+        // must still match a UNC pattern — the fix is host-derived, not an
+        // unconditional `//` -> `/` collapse.
+        let windows_policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["\\\\server\\share\\**".into()],
+            }),
+            "C:/",
+            None,
+        );
+        let unc = json!({"tool_name":"Edit","tool_input":{"file_path":"//SERVER/SHARE/token.txt"}});
+        assert_eq!(
+            windows_policy
+                .inspect(AgentKind::ClaudeCode, &unc, "C:/")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop,
+            "a genuine UNC candidate on a Windows host must still match"
+        );
     }
     #[test]
     fn all_states_and_strict_protocol_are_reachable() {

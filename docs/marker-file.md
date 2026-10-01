@@ -414,10 +414,13 @@ Capture policy v1 is enforced by native `ai-memory hook` commands (including
 native POSIX/Windows hook commands) and generated OpenCode, OMP, Pi, and
 OpenClaw integrations, including the lexical shell-command matching above.
 Local installers default to native commands where that
-path is supported. Legacy `.sh`/`.ps1` hooks and remote-only/Docker script
-bundles do **not** enforce it. Reinstall hooks or refresh/reinstall generated
-plugins after upgrading; existing hooks/plugins keep their prior behavior.
-Installer capability output describes the selected integration.
+path is supported. The Linux/macOS Docker wrapper's ordinary `install-hooks`
+path uses its checksum-verified native host client and is supported too.
+Legacy `.sh`/`.ps1` hooks, explicit compatibility overrides, and
+remote-only/manual Docker script bundles do **not** enforce it. Reinstall hooks
+or refresh/reinstall generated plugins after upgrading; existing hooks/plugins
+keep their prior behavior. Installer capability output describes the selected
+integration.
 
 New clients remain safe with old servers because stripping and dropping happen
 on the client. Old clients talking to new servers retain old behavior and cannot
