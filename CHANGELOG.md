@@ -11,8 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Integrated canonical v2.5.2 and subsequent upstream changes through `53985bddc466a1d37e8ee819ea52133012927d45`, including managed-run recovery migration V71, while retaining Aerox file-backed authentication, runtime-only hook credentials, isolated pools, and Windows/WSL release packaging.
-
-### Changed
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 
