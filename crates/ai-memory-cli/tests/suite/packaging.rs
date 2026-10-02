@@ -210,11 +210,19 @@ fn macos_release_tarball_ships_the_launchd_agent_plist() {
 #[test]
 fn unix_release_tarball_packing_disables_appledouble_sidecars() {
     let release = read_repo(".github/workflows/release.yml");
-    let pack = "COPYFILE_DISABLE=1 tar -C \"dist/$artifact\" -czf \"$artifact.tar.gz\" .";
+    let pack = "tar -C \"dist/$artifact\" -czf \"$artifact.tar.gz\" .";
+    let packs: Vec<_> = release.lines().filter(|line| line.contains(pack)).collect();
     assert!(
-        release.matches(pack).count() >= 2,
-        "Linux and macOS release pack steps must set COPYFILE_DISABLE=1"
+        !packs.is_empty(),
+        "the release workflow must still package a Unix runtime archive"
     );
+    for line in packs {
+        assert!(
+            line.trim()
+                .starts_with(&format!("COPYFILE_DISABLE=1 {pack}")),
+            "every configured Unix release pack step must set COPYFILE_DISABLE=1: {line}"
+        );
+    }
 }
 
 /// Drift lock for #1025: every top-level name staged into a release archive
