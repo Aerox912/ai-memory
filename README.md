@@ -761,7 +761,15 @@ config home.
 ai-memory run claude
 ai-memory run codex --yolo   # later: same workstream, different harness
 ai-memory continue           # resume the newest managed checkout
+# after a dead launcher left its lease behind (same operator only)
+ai-memory run --force-unlock codex
 ```
+
+`--force-unlock` immediately expires the selected workstream's active lease;
+use it only when you know the previous launcher is gone. It does not kill a
+native process, and it cannot evict another authenticated operator's run. See
+the [managed-workstream recovery notes](docs/managed-workstreams.md#lease-recovery)
+for the full safety contract.
 
 Auto-wiring is on by default; opt out with `ai-memory run --no-autowire` or
 `AI_MEMORY_RUN_AUTOWIRE=false`. You can still wire agents by hand with

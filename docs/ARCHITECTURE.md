@@ -205,8 +205,12 @@ ledger/session state: after any harness establishes the workstream, a newly
 joining harness starts fresh and receives portable history instead of adopting
 unrelated old native history. Handled launcher failures cancel their lease;
 normal reopen retries brief finalization conflicts, while an unclean process
-death remains bounded by the renewable lease expiry. See [Managed cross-harness
-workstreams](managed-workstreams.md).
+death remains bounded by the renewable lease expiry. An explicit
+`--force-unlock` recovery expires and replaces a selected active lease in the
+same writer transaction, but only when its durable operator attribution equals
+the new run's attribution; the informational `host:pid` lease label is never an
+authorization key. The old run can no longer heartbeat or finish. See [Managed
+cross-harness workstreams](managed-workstreams.md).
 
 ## Hook event vocabulary
 

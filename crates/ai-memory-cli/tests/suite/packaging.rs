@@ -204,6 +204,103 @@ fn macos_release_tarball_ships_the_launchd_agent_plist() {
     );
 }
 
+/// Source lock: Unix release packing must disable macOS AppleDouble sidecars
+/// (`._*`) so Linux runners and macOS producers emit the same archive layout
+/// upgrade's allowlist expects (see `extracts_archive_built_like_release_yml`).
+#[test]
+fn unix_release_tarball_packing_disables_appledouble_sidecars() {
+    let release = read_repo(".github/workflows/release.yml");
+    let pack = "COPYFILE_DISABLE=1 tar -C \"dist/$artifact\" -czf \"$artifact.tar.gz\" .";
+    assert!(
+        release.matches(pack).count() >= 2,
+        "Linux and macOS release pack steps must set COPYFILE_DISABLE=1"
+    );
+}
+
+/// Drift lock for #1025: every top-level name staged into a release archive
+/// by `release.yml` must be extractable or listed in upgrade's exact support
+/// consts (`RELEASE_SUPPORT_*`). Direction is release → allowlist (Windows
+/// correctly omits `packaging/`). Catching a new `dist/$artifact/share`
+/// without an allowlist update keeps CI red before a live tarball upgrade
+/// fails after checksum.
+#[test]
+fn release_yml_staged_top_levels_are_upgrade_allowlisted() {
+    let release = read_repo(".github/workflows/release.yml");
+    let staged = release_yml_staged_top_levels(&release);
+    assert!(
+        staged.contains("hooks") && staged.contains("docs") && staged.contains("crates"),
+        "sanity: release.yml must still stage shared top-levels; got {staged:?}"
+    );
+
+    let upgrade = read_repo("crates/ai-memory-cli/src/commands/upgrade.rs");
+    let dirs = const_str_slice_body(&upgrade, "RELEASE_SUPPORT_DIRS");
+    let files = const_str_slice_body(&upgrade, "RELEASE_SUPPORT_FILES");
+    for name in &staged {
+        // Runtime extract targets live outside the support consts.
+        if matches!(name.as_str(), "hooks" | "ai-memory" | "ai-memory.exe") {
+            continue;
+        }
+        let quoted = format!("\"{name}\"");
+        assert!(
+            dirs.contains(&quoted) || files.contains(&quoted),
+            "release.yml stages top-level `{name}` but it is missing from \
+             RELEASE_SUPPORT_DIRS/FILES in upgrade.rs"
+        );
+    }
+}
+
+/// First path components under `dist/$artifact/…` and `$stage/…`, plus
+/// README.md/LICENSE when the workflow copies them onto the stage root.
+fn release_yml_staged_top_levels(release: &str) -> std::collections::BTreeSet<String> {
+    let mut tops = std::collections::BTreeSet::new();
+    for prefix in ["dist/$artifact/", "$stage/"] {
+        let mut search = release;
+        while let Some(idx) = search.find(prefix) {
+            let after = &search[idx + prefix.len()..];
+            let end = after
+                .find(|c: char| c == '"' || c == '\'' || c == '`' || c == '\\' || c.is_whitespace())
+                .unwrap_or(after.len());
+            let rel = &after[..end];
+            if let Some(top) = rel
+                .split('/')
+                .next()
+                .filter(|s| is_release_top_level_name(s))
+            {
+                tops.insert(top.to_string());
+            }
+            // Always advance so an empty relative path cannot spin forever.
+            search = &search[idx + 1..];
+        }
+    }
+    if release.contains("cp README.md LICENSE \"dist/$artifact/\"")
+        || release.contains("Copy-Item README.md, LICENSE $stage")
+    {
+        tops.insert("README.md".to_string());
+        tops.insert("LICENSE".to_string());
+    }
+    tops
+}
+
+/// Reject globs / comment noise (e.g. `"$stage/*"` in release.yml prose).
+fn is_release_top_level_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn const_str_slice_body<'a>(src: &'a str, name: &str) -> &'a str {
+    let marker = format!("const {name}:");
+    let start = src
+        .find(&marker)
+        .unwrap_or_else(|| panic!("upgrade.rs must declare {name}"));
+    let from = &src[start..];
+    let end = from
+        .find(';')
+        .unwrap_or_else(|| panic!("{name} const must end with ';'"));
+    &from[..end]
+}
+
 #[test]
 fn aur_packages_install_all_native_assets() {
     for path in ["packaging/aur/PKGBUILD", "packaging/aur/PKGBUILD-bin"] {

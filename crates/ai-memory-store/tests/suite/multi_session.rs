@@ -22,7 +22,7 @@ use ai_memory_core::{
     owner_stamp,
 };
 use ai_memory_store::{
-    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun, Store,
+    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun, Store, StoreError,
     WorkstreamSelection,
 };
 
@@ -915,6 +915,99 @@ async fn stale_codex_run_recovery_cannot_cross_project_owner_or_session_boundari
         current_status.native_session_id.as_deref(),
         Some("native-alice")
     );
+}
+
+/// Forced lease recovery is deliberately narrower than project write access:
+/// the same operator can recover their own abandoned launcher, while another
+/// operator in the same project cannot evict it. The old run becomes terminal
+/// in the same transaction that creates the replacement.
+#[tokio::test]
+async fn force_unlock_replaces_only_the_same_operators_active_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |lease_owner: &str| PrepareWorkstreamRun {
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "repo".into(),
+        worktree_fingerprint: "worktree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::Current,
+        lease_owner: lease_owner.into(),
+    };
+
+    let abandoned = store
+        .writer
+        .prepare_workstream_run_owned(prepare("alice:1"), Some(alice.clone()))
+        .await
+        .unwrap();
+    let refused = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(prepare("bob:2"), Some(bob), true)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, StoreError::WorkstreamBusy(_)));
+    assert!(
+        store
+            .writer
+            .heartbeat_managed_run(abandoned.run_id)
+            .await
+            .unwrap(),
+        "a refused cross-owner takeover must leave the original lease active"
+    );
+
+    let replacement = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(prepare("alice:3"), Some(alice.clone()), true)
+        .await
+        .unwrap();
+    assert_ne!(replacement.run_id, abandoned.run_id);
+    assert!(
+        !store
+            .writer
+            .heartbeat_managed_run(abandoned.run_id)
+            .await
+            .unwrap(),
+        "the replaced run must be terminal"
+    );
+    assert!(
+        store
+            .writer
+            .heartbeat_managed_run(replacement.run_id)
+            .await
+            .unwrap(),
+        "the replacement is the sole live control"
+    );
+
+    let solo = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                selection: WorkstreamSelection::New("solo".into()),
+                ..prepare("solo:1")
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let solo_replacement = store
+        .writer
+        .prepare_workstream_run_owned_with_unlock(
+            PrepareWorkstreamRun {
+                selection: WorkstreamSelection::Named("solo".into()),
+                ..prepare("solo:2")
+            },
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_ne!(solo_replacement.run_id, solo.run_id);
 }
 
 /// Two launches in one repository are a real possibility when the operator

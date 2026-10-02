@@ -144,7 +144,8 @@ Use the tuple recipe when event IDs have narrower scope.
 - A rate-limited source can be skipped while other sources advance. Inspect
   acknowledgements even on HTTP 429 or a partial failure; `failed_index` identifies
   a processing failure after earlier skips. An acknowledgement can also mean a
-  deliberate policy drop, not a new observation.
+  deliberate policy drop, or an event that can never be stored (no session id
+  on anything but a session start), not a new observation.
 - On a timeout or lost response, retry unchanged items and keys. Back off on
   saturation rather than opening an unbounded number of requests.
 

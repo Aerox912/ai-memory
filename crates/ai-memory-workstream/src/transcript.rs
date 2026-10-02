@@ -209,6 +209,79 @@ pub async fn discover_native_session(
     Ok(None)
 }
 
+/// Find the Claude Code background session that `native_session_id` attached
+/// to during this run, if any.
+///
+/// `/resume` on a background session (one hosted by the Claude Code daemon)
+/// does not continue the foreground session: the conversation keeps going in
+/// the background session's own transcript, whose records carry
+/// `"sessionKind": "bg"` and name the attached foreground session in
+/// `session_id`. The daemon's hooks never see this run's id, so without this
+/// the workstream stays on the foreground session and the next launch resumes
+/// a transcript with no conversation in it.
+///
+/// Only transcripts written since `started_at` are read, the newest first,
+/// and a record must also match this checkout. Transcripts without those
+/// fields (older Claude Code builds) never match.
+pub fn claude_attached_background_session(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+    started_at: SystemTime,
+) -> Result<Option<String>> {
+    if !valid_native_session_id(native_session_id) {
+        return Ok(None);
+    }
+    let mut candidates = collect_session_files(ManagedHarness::Claude, home, session_dir)?;
+    candidates.sort_by(|left, right| {
+        modified(right)
+            .cmp(&modified(left))
+            .then_with(|| left.cmp(right))
+    });
+    let attached_marker = format!("\"session_id\":\"{native_session_id}\"");
+    for path in candidates.into_iter().take(512) {
+        if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
+            break;
+        }
+        if path
+            .file_stem()
+            .is_some_and(|stem| stem == std::ffi::OsStr::new(native_session_id))
+        {
+            continue;
+        }
+        let reader = BufReader::new(File::open(&path)?);
+        for line in reader.lines() {
+            let line = line?;
+            if !line.contains(&attached_marker) {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let background = value.get("sessionKind").and_then(Value::as_str) == Some("bg");
+            let attached =
+                value.get("session_id").and_then(Value::as_str) == Some(native_session_id);
+            let in_checkout = value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|recorded| same_path(Path::new(recorded), cwd));
+            let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
+                continue;
+            };
+            if background
+                && attached
+                && in_checkout
+                && session != native_session_id
+                && valid_native_session_id(session)
+            {
+                return Ok(Some(session.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// List newest native sessions whose recorded working directory matches the
 /// current checkout. Native stores are opened read-only and unrelated paths are
 /// excluded before candidates reach the launcher prompt.
@@ -3417,6 +3490,16 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
     }
 }
 
+/// The primary native store root a launch reads: `session_dir` when an
+/// override resolved one, otherwise the harness default under `home`.
+pub fn native_store_root(
+    harness: ManagedHarness,
+    home: &Path,
+    session_dir: Option<&Path>,
+) -> PathBuf {
+    session_root(harness, home, session_dir)
+}
+
 /// Kiro CLI 2.16.2 honored `KIRO_HOME` for its v2 store but wrote v3 sessions
 /// to the default home during acceptance. Scan the configured root first and
 /// the default root as a compatibility fallback; every result still passes
@@ -4308,6 +4391,84 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn claude_attached_background_session_follows_only_this_checkouts_bg_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let write = |name: &str, records: &[Value]| {
+            let path = project.join(format!("{name}.jsonl"));
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(&path, body).unwrap();
+            path
+        };
+        let record = |session: &str, attached: &str, kind: Option<&str>, cwd: &Path| {
+            let mut value = json!({
+                "type": "user",
+                "sessionId": session,
+                "session_id": attached,
+                "cwd": cwd,
+            });
+            if let Some(kind) = kind {
+                value["sessionKind"] = json!(kind);
+            }
+            value
+        };
+        let find = |id: &str| {
+            claude_attached_background_session(temp.path(), &cwd, None, id, started_at).unwrap()
+        };
+
+        // The foreground transcript names itself; it is never the answer.
+        write("fg", &[record("fg", "fg", None, &cwd)]);
+        assert_eq!(find("fg"), None);
+
+        // Without `sessionKind: bg`, or from another checkout, a record that
+        // names the foreground session is not a background continuation.
+        write("plain", &[record("plain", "fg", None, &cwd)]);
+        write(
+            "elsewhere",
+            &[record("elsewhere", "fg", Some("bg"), &other)],
+        );
+        assert_eq!(find("fg"), None);
+
+        // A concurrent launch in this checkout attached its own foreground
+        // session to a background one; that conversation is not this run's.
+        write(
+            "concurrent",
+            &[record("concurrent", "other-fg", Some("bg"), &cwd)],
+        );
+        assert_eq!(find("fg"), None);
+        assert_eq!(find("other-fg").as_deref(), Some("concurrent"));
+
+        // A transcript last written before the run started is not read.
+        let stale = write("stale", &[record("stale", "fg", Some("bg"), &cwd)]);
+        File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(started_at - Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(find("fg"), None);
+
+        write(
+            "bg",
+            &[
+                record("bg", "earlier-client", Some("bg"), &cwd),
+                record("bg", "fg", Some("bg"), &cwd),
+            ],
+        );
+        assert_eq!(find("fg").as_deref(), Some("bg"));
+        assert_eq!(find("unrelated"), None);
     }
 
     #[test]

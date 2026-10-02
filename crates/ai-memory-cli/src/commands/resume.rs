@@ -165,6 +165,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             jail: None,
             no_jail: false,
             fresh: args.fresh,
+            force_unlock: false,
             no_autowire: false,
             env: Vec::new(),
             env_file: None,

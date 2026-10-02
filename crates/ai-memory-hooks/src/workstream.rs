@@ -288,9 +288,10 @@ async fn prepare_run(
         Ok(owner) => owner,
         Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
     };
+    let force_unlock = request.force_unlock;
     let prepared = state
         .writer
-        .prepare_workstream_run_owned(
+        .prepare_workstream_run_owned_with_unlock(
             PrepareWorkstreamRun {
                 workspace_id: scope.workspace_id,
                 project_id: scope.project_id,
@@ -304,6 +305,7 @@ async fn prepare_run(
                 lease_owner: request.lease_owner,
             },
             owner_user,
+            force_unlock,
         )
         .await;
     match prepared {
@@ -1439,6 +1441,7 @@ mod tests {
                 available_agents: vec![AgentKind::Codex, AgentKind::ClaudeCode],
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "automatic".into(),
             }),
         )
@@ -1476,6 +1479,7 @@ mod tests {
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "explicit".into(),
             }),
         )
@@ -1515,6 +1519,7 @@ mod tests {
                 available_agents: vec![AgentKind::KimiCode, AgentKind::ClaudeCode],
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "automatic".into(),
             }),
         )
@@ -1561,6 +1566,7 @@ mod tests {
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "alice-launcher".into(),
             }),
         )
@@ -1614,6 +1620,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_unlock_cannot_evict_another_operator() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        for name in ["alice", "bob"] {
+            store
+                .writer
+                .create_human_user(
+                    ai_memory_core::NewUser {
+                        username: name.into(),
+                        name: None,
+                        email: None,
+                    },
+                    ai_memory_core::UserRole::User,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let actor = |name: &str| {
+            Some(Extension(ai_memory_core::ActorContext {
+                user: Some(name.into()),
+                ..ai_memory_core::ActorContext::default()
+            }))
+        };
+        let request = |force_unlock: bool, lease_owner: &str| PrepareManagedRunRequest {
+            workspace: "default".into(),
+            project: "managed-force-unlock".into(),
+            cwd: "/repo".into(),
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            workstream: None,
+            new_workstream: None,
+            force_unlock,
+            lease_owner: lease_owner.into(),
+        };
+
+        let first = prepare_run(
+            State(state.clone()),
+            None,
+            actor("alice"),
+            None,
+            Json(request(false, "alice:1")),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+        let first: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+
+        let refused = prepare_run(
+            State(state.clone()),
+            None,
+            actor("bob"),
+            None,
+            Json(request(true, "bob:2")),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert!(
+            store
+                .writer
+                .heartbeat_managed_run(first.run_id)
+                .await
+                .unwrap(),
+            "the refused caller must not disturb Alice's lease"
+        );
+
+        let replacement = prepare_run(
+            State(state),
+            None,
+            actor("alice"),
+            None,
+            Json(request(true, "alice:3")),
+        )
+        .await;
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let body = to_bytes(replacement.into_body(), 64 * 1024).await.unwrap();
+        let replacement: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_ne!(replacement.run_id, first.run_id);
+        assert!(
+            !store
+                .writer
+                .heartbeat_managed_run(first.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .writer
+                .heartbeat_managed_run(replacement.run_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn kiro_is_accepted_as_an_explicit_and_automatic_harness() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path()).unwrap();
@@ -1635,6 +1741,7 @@ mod tests {
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "explicit".into(),
             }),
         )
@@ -1673,6 +1780,7 @@ mod tests {
                 available_agents: vec![AgentKind::KiroCli],
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "automatic".into(),
             }),
         )
@@ -1702,6 +1810,7 @@ mod tests {
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "explicit".into(),
             }),
         )
@@ -1740,6 +1849,7 @@ mod tests {
                 available_agents: vec![AgentKind::CommandCode, AgentKind::ClaudeCode],
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "automatic".into(),
             }),
         )
@@ -1769,6 +1879,7 @@ mod tests {
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "explicit".into(),
             }),
         )
@@ -1807,6 +1918,7 @@ mod tests {
                 available_agents: vec![AgentKind::Grok],
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "automatic".into(),
             }),
         )
@@ -1839,6 +1951,7 @@ mod tests {
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "explicit".into(),
             }),
         )
@@ -1877,6 +1990,7 @@ mod tests {
                 available_agents: vec![AgentKind::AntigravityCli],
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "automatic".into(),
             }),
         )
@@ -2144,6 +2258,7 @@ mod tests {
                 available_agents: Vec::new(),
                 workstream: None,
                 new_workstream: None,
+                force_unlock: false,
                 lease_owner: "alice".into(),
             }),
         )

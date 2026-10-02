@@ -7,14 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.5.2-aerox.1] - 2026-10-01
+## [2.5.2-aerox.2] - 2026-10-03
 
 ### Changed
-- Integrated canonical v2.5.2 and subsequent upstream changes through `53985bddc466a1d37e8ee819ea52133012927d45`, including managed-run recovery migration V71, while retaining Aerox file-backed authentication, runtime-only hook credentials, isolated pools, and Windows/WSL release packaging.
+- Integrated canonical changes through `ff74f2de20165be684b9eff3932c150a73ce24e2`, retaining Aerox file-backed authentication, runtime-only hook credentials, pool isolation, and Windows/WSL packaging.
 - Documented FutureInfra as an endpoint for the existing `openai-compat`
   provider. (#1026)
 
 ### Fixed
+- Fixed watcher reindexing racing with writes and batches to the same page by
+  sharing their per-page mutex from disk read through SQLite upsert. Both
+  mutation guards are released before embedding; external editors remain
+  outside this coordination. (#1059)
+- Fixed a managed Claude Code run losing its conversation after `/resume` on a
+  Claude Code background session. The run used to finish on the foreground
+  session it started with, which held none of the conversation, so the next
+  `ai-memory run claude` or `continue` resumed it and Claude opened an empty
+  session. A Claude run now finishes on the background session its own
+  session attached to in this checkout, found from that transcript's
+  `sessionKind: "bg"` records; another launch's background session is never
+  taken. (#1050)
+- Fixed interrupted launchers blocking an immediate managed-workstream restart
+  by adding explicit `ai-memory run --force-unlock` recovery. The server
+  atomically expires and replaces only a lease attributed to the same
+  authenticated operator (or another unattributed lease in single-user
+  operation), while cross-operator eviction remains refused; the command does
+  not kill a native process. (#795)
+- Fixed Unix release archives potentially carrying macOS AppleDouble sidecars
+  outside the native upgrader's strict path allowlist. Release packing now
+  disables sidecar generation, and packaging tests lock the staged top-level
+  layout to the upgrader allowlist so future release changes cannot silently
+  make official archives un-upgradable. (#1029)
 - Fixed `ai-memory upgrade` rewriting native hook commands with Linux's
   ` (deleted)` executable-path suffix after replacing its own binary. Every
   hook renderer now keeps a still-existing literal path, otherwise strips the
@@ -65,6 +88,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-jail's own dry-run preflight, so a backend that exists but fails ai-jail's
   trust checks is treated as unavailable instead of producing a broken offer.
   (#1024)
+- Fixed `continue`, `resume` and bare `ai-memory run` losing sessions launched
+  under a custom native store, such as a second Claude Code config home set
+  with `CLAUDE_CONFIG_DIR`. Automatic harness selection now scans the store the
+  launch resolves (`--env`, then the process environment) instead of always the
+  default one. The client records the store of every session it links, at
+  launch or when the run finishes, in `client-projects.json`. A later launch
+  that cannot find that session and resolves a different store now stops with
+  an error naming both stores and keeps the workstream link, where it used to
+  start fresh and repoint the workstream. `--fresh` still starts a new session.
+  (#1047)
+- Fixed Claude Code sessions never seeing the "broaden when the current project
+  comes up empty" and "maintained pages are evidence, not authority" rules,
+  because Claude Code truncates MCP server instructions at 2,048 characters.
+  The instructions now open with a self-contained core under that cap, and a
+  regression test keeps it there. (#1035)
+- Fixed the macOS menu-bar app showing only a red status item when the bundled
+  server cannot start (for example a port already in use; #1044 reports OpenCode
+  v2's background service on `127.0.0.1:49374`). The menu extra now surfaces a
+  fatal `stderr.log` line written since the last start, and `docs/macos.md`
+  documents the port collision and how to move one side. (#1044)
+- Fixed hook-spool drains stalling behind an event that has no session id.
+  `/hook/batch` reported such an event (anything but a session start) as a
+  failed item, so the drain retried it up to its attempt budget while every
+  event queued behind it waited. The server now acknowledges and drops it,
+  counted as `dropped_invalid` in the ingest metrics, and keeps processing the
+  rest of the batch. (#1062)
+- Fixed `drop_subagent_captures` discarding entire top-level Claude Code
+  sessions launched with `--agent`. An `agent_type` alone no longer marks a
+  session as a subagent; `agent_id` and Grok's `subagentType` still do, so
+  actual subagent filtering remains enabled. Claude Code reports a Task
+  subagent under its parent's session id, so a subagent's events no longer
+  mark that session as a subagent: the parent's Stop, SessionEnd, summary and
+  handoff are kept. (#1041, #1048)
+
+### Docs
+- Corrected the Codex support matrix to describe managed-run recovery from a
+  stale shared-daemon run id; `--no-daemon` remains an optional diagnostic and
+  isolation switch. (#987)
+
+## [2.5.2-aerox.1] - 2026-10-01
+
+### Changed
+- Integrated canonical v2.5.2 through `53985bddc466a1d37e8ee819ea52133012927d45`, including migration V71 and verified Windows/WSL packaging.
+
 ## [2.5.2] - 2026-10-01
 
 ### Added
@@ -4008,12 +4075,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - CI now rejects a change that writes into an already-released CHANGELOG
-  section. `bin/release` renames `## [Unreleased]
-
-## [2.5.2-aerox.1] - 2026-10-01
-
-### Changed
-- Integrated canonical v2.5.2 and subsequent upstream changes through `53985bddc466a1d37e8ee819ea52133012927d45`, including managed-run recovery migration V71, while retaining Aerox file-backed authentication, runtime-only hook credentials, isolated pools, and Windows/WSL release packaging.` to `## [X.Y.Z]`, so a branch
+  section. `bin/release` renames `## [Unreleased]` to `## [X.Y.Z]`, so a branch
   opened before a release carries a diff anchored at the old line numbers and
   git merges it into whatever section now occupies them — silently, with no
   conflict. Three entries landed in the wrong release this way (#491 into

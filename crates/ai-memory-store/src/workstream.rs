@@ -276,6 +276,7 @@ pub(crate) fn prepare_run(
     conn: &mut Connection,
     input: &PrepareWorkstreamRun,
     owner_user: Option<&str>,
+    force_unlock: bool,
 ) -> StoreResult<PreparedWorkstreamRun> {
     if owner_user
         .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
@@ -293,21 +294,29 @@ pub(crate) fn prepare_run(
     )?;
 
     let (workstream_id, workstream_name) = select_workstream(&tx, input, now)?;
-    let busy: Option<(String, i64)> = tx
+    let busy: Option<(Vec<u8>, String, i64, Option<String>)> = tx
         .query_row(
-            "SELECT lease_owner, lease_expires_at FROM managed_runs \
+            "SELECT id, lease_owner, lease_expires_at, owner_user FROM managed_runs \
              WHERE workstream_id = ?1 AND state = 'active'",
             params![workstream_id.as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if let Some((owner, expires)) = busy {
-        return Err(StoreError::WorkstreamBusy(format!(
-            "owned by {owner} until {}",
-            Timestamp::from_microsecond(expires)
-                .map(|t| t.to_string())
-                .unwrap_or_else(|_| expires.to_string())
-        )));
+    if let Some((run_id, owner, expires, active_owner_user)) = busy {
+        if force_unlock && active_owner_user.as_deref() == owner_user {
+            tx.execute(
+                "UPDATE managed_runs SET state = 'expired', ended_at = ?1, \
+                 lease_expires_at = ?1 WHERE id = ?2 AND state = 'active'",
+                params![now, run_id],
+            )?;
+        } else {
+            return Err(StoreError::WorkstreamBusy(format!(
+                "owned by {owner} until {}",
+                Timestamp::from_microsecond(expires)
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|_| expires.to_string())
+            )));
+        }
     }
 
     let latest_sequence: i64 = tx.query_row(

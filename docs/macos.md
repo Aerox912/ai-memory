@@ -407,6 +407,16 @@ wrapper's `posix` shell-script path does not. Re-run `install-hooks --agent
   `launchctl print gui/$(id -u)/com.github.akitaonrails.ai-memory`. The app
   never writes into its own bundle; a missing `config.toml` is created under
   `~/Library/Application Support/ai-memory` by bundled `ai-memory init`.
+- **`Error: binding 127.0.0.1:49374` / `Address already in use` (the server
+  exits immediately and the menu extra stays red):** another process already
+  holds the port, for example OpenCode v2's background service (reported in
+  #1044 to default to 49374). Move one side — start
+  ai-memory elsewhere (`bind = "127.0.0.1:<free-port>"` in
+  `~/Library/Application Support/ai-memory/config.toml`, then update the app's
+  server URL in Settings to match), or move the other service
+  (`opencode service set port <free-port>`). Find the current holder with
+  `lsof -nP -iTCP:49374 -sTCP:LISTEN`. The menu extra now surfaces this error
+  instead of showing only a red status item.
 
 ## Suggested Test Checklist
 

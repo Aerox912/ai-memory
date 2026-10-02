@@ -178,7 +178,10 @@ pub struct Wiki {
     /// while different paths still run concurrently. The map is GC'd
     /// opportunistically — entries no writer currently holds are dropped on the
     /// next acquisition — so it stays bounded to currently-contended paths.
+    /// Reindexes share it from disk read through SQL upsert.
     page_locks: Arc<std::sync::Mutex<HashMap<PageKey, Arc<tokio::sync::Mutex<()>>>>>,
+    #[cfg(test)]
+    reindex_read_barrier: Option<Arc<tokio::sync::Barrier>>,
     /// Scopes this process has already materialized `_meta.md` manifests for.
     /// Keeps [`Wiki::ensure_scope_manifests`] to one hash lookup per page
     /// write after the scope's first — the store query and the two manifest
@@ -216,6 +219,8 @@ impl Wiki {
             store_reader: None,
             mutation_lock: Arc::new(RwLock::new(())),
             page_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            reindex_read_barrier: None,
             manifested_scopes: Arc::new(Mutex::new(HashSet::new())),
             reconcile_tombstones_deleted_pages: false,
         })
@@ -1696,7 +1701,7 @@ impl Wiki {
                 "refusing to index pending proposal sidecar",
             ));
         }
-        // Scoped so the mutation guard is dropped before the embed call
+        // Scoped so both mutation guards are dropped before the embed call
         // below — same shape as `write_page` (#607/#929): embedding calls
         // out to the configured provider, and holding the guard across that
         // would block every other write in the wiki for its duration.
@@ -1727,12 +1732,15 @@ impl Wiki {
     /// has two very different callers with two different locking needs
     /// (`reindex_page`'s brief read guard; `hard_delete_decay_tombstone`'s
     /// long-lived write guard, which must never embed at all — see there).
+    /// The caller already holds the global mutation guard (shared or
+    /// exclusive); acquire only the page mutex here, always after that guard.
     async fn reindex_page_locked(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         path: PagePath,
     ) -> WikiResult<(PageId, Option<PendingEmbed>)> {
+        let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
         let abs = self.abs_path(workspace_id, project_id, &path);
         if std::fs::symlink_metadata(&abs)?.file_type().is_symlink() {
             return Err(WikiError::Io(std::io::Error::other(format!(
@@ -1778,6 +1786,12 @@ impl Wiki {
             }
             _ => None,
         };
+
+        #[cfg(test)]
+        if let Some(barrier) = &self.reindex_read_barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
 
         let id = self
             .writer
@@ -5876,6 +5890,352 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a purged page must not reappear in the index"
+        );
+    }
+
+    async fn finish_lock_test<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .expect("wiki lock operation must finish without deadlock")
+    }
+
+    // Poll the real operation until it queues behind the held page mutex.
+    // Unlike a delay, this proves it reached that lock before we release it.
+    async fn wait_for_page_waiter<F: std::future::Future>(
+        wiki: &Wiki,
+        key: &PageKey,
+        mut future: std::pin::Pin<&mut F>,
+    ) {
+        finish_lock_test(std::future::poll_fn(|cx| {
+            assert!(
+                future.as_mut().poll(cx).is_pending(),
+                "operation bypassed the held page lock"
+            );
+            let locks = wiki.page_locks.lock().unwrap();
+            if locks
+                .get(key)
+                .is_some_and(|lock| Arc::strong_count(lock) >= 3)
+            {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_page_lock_waits_before_reading_and_allows_another_path() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/held.md").unwrap();
+        let other = PagePath::new("notes/other.md").unwrap();
+        let original = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "original",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        wiki.write_page(req(
+            ws,
+            proj,
+            other.as_str(),
+            "control",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        let global = wiki.mutation_lock.read().await;
+        let page = wiki.lock_page(ws, proj, &path).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        std::fs::write(&abs, "transientsnapshot\n").unwrap();
+        let reindex = wiki.reindex_page(ws, proj, path.clone());
+        tokio::pin!(reindex);
+        wait_for_page_waiter(&wiki, &(ws, proj, path.clone()), reindex.as_mut()).await;
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().into())
+                .await
+                .unwrap(),
+            Some(original),
+            "the transient disk snapshot must not enter SQL"
+        );
+
+        let other_abs = wiki.abs_path(ws, proj, &other);
+        std::fs::write(&other_abs, "independentcontrol\n").unwrap();
+        finish_lock_test(wiki.reindex_page(ws, proj, other.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, other.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "independentcontrol\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&other_abs).unwrap(),
+            "independentcontrol\n"
+        );
+
+        std::fs::write(&abs, "committedwinner\n").unwrap();
+        drop(page);
+        drop(global);
+        let id = finish_lock_test(reindex).await.unwrap();
+        assert_ne!(id, original);
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "committedwinner\n"
+        );
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "committedwinner\n");
+        assert!(
+            store
+                .reader
+                .search_pages("transientsnapshot".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_page_lock_serializes_write_through_the_upsert() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/race.md").unwrap();
+        wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "original",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        std::fs::write(wiki.abs_path(ws, proj, &path), "watcher snapshot\n").unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut watcher = wiki.clone();
+        watcher.reindex_read_barrier = Some(barrier.clone());
+        let reindex_path = path.clone();
+        let reindex =
+            tokio::spawn(async move { watcher.reindex_page(ws, proj, reindex_path).await });
+        finish_lock_test(barrier.wait()).await;
+
+        let write = wiki.write_page(req(
+            ws,
+            proj,
+            path.as_str(),
+            "writer winner",
+            serde_json::json!({}),
+        ));
+        tokio::pin!(write);
+        wait_for_page_waiter(&wiki, &(ws, proj, path.clone()), write.as_mut()).await;
+        assert_eq!(
+            wiki.read_page(ws, proj, &path).unwrap().body,
+            "watcher snapshot\n"
+        );
+        finish_lock_test(barrier.wait()).await;
+        let watcher_id = finish_lock_test(reindex).await.unwrap().unwrap();
+        let writer_id = finish_lock_test(write).await.unwrap();
+        assert_ne!(writer_id, watcher_id);
+        assert_eq!(
+            wiki.read_page(ws, proj, &path).unwrap().body.trim(),
+            "writer winner"
+        );
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "writer winner"
+        );
+        store
+            .reader
+            .with_conn(move |conn| {
+                let (body, supersedes): (String, Vec<u8>) = conn.query_row(
+                    "SELECT body, supersedes FROM pages WHERE id = ?1 AND is_latest = 1",
+                    [writer_id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(body, "writer winner");
+                assert_eq!(supersedes, watcher_id.as_bytes());
+                let prior: String = conn.query_row(
+                    "SELECT body FROM pages WHERE id = ?1",
+                    [watcher_id.as_bytes()],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    prior, "watcher snapshot\n",
+                    "the earlier version stays reachable"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reindex_page_lock_and_reversed_duplicate_batches_do_not_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let a = PagePath::new("notes/a.md").unwrap();
+        let z = PagePath::new("notes/z.md").unwrap();
+        let batch = |paths: &[&PagePath], body: &str| {
+            paths
+                .iter()
+                .map(|path| req(ws, proj, path.as_str(), body, serde_json::json!({})))
+                .collect()
+        };
+        wiki.apply_batch(batch(&[&a, &z], "original"))
+            .await
+            .unwrap();
+        std::fs::write(wiki.abs_path(ws, proj, &z), "watcher snapshot\n").unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut watcher = wiki.clone();
+        watcher.reindex_read_barrier = Some(barrier.clone());
+        let reindex_path = z.clone();
+        let reindex =
+            tokio::spawn(async move { watcher.reindex_page(ws, proj, reindex_path).await });
+        finish_lock_test(barrier.wait()).await;
+
+        let reverse = wiki.apply_batch(batch(&[&z, &a, &a], "first batch"));
+        tokio::pin!(reverse);
+        wait_for_page_waiter(&wiki, &(ws, proj, z.clone()), reverse.as_mut()).await;
+        let forward = wiki.apply_batch(batch(&[&a, &z], "second batch winner"));
+        tokio::pin!(forward);
+        wait_for_page_waiter(&wiki, &(ws, proj, a.clone()), forward.as_mut()).await;
+        finish_lock_test(barrier.wait()).await;
+        let watcher_id = finish_lock_test(reindex).await.unwrap().unwrap();
+        let first = finish_lock_test(reverse).await.unwrap();
+        let second = finish_lock_test(forward).await.unwrap();
+        assert_eq!(
+            first[1], first[2],
+            "duplicate paths share one lock and no-op version"
+        );
+        for (path, id) in [(&a, second[0]), (&z, second[1])] {
+            assert_eq!(
+                wiki.read_page(ws, proj, path).unwrap().body.trim(),
+                "second batch winner"
+            );
+            assert_eq!(
+                store
+                    .reader
+                    .latest_page_id_by_ids(ws, proj, path.as_str().into())
+                    .await
+                    .unwrap(),
+                Some(id)
+            );
+            assert_eq!(
+                store
+                    .reader
+                    .page_body_by_ids(ws, proj, path.as_str())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                "second batch winner"
+            );
+        }
+        store
+            .reader
+            .with_conn(move |conn| {
+                let ancestor: Vec<u8> = conn.query_row(
+                    "SELECT supersedes FROM pages WHERE id = ?1",
+                    [second[1].as_bytes()],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(ancestor, first[0].as_bytes());
+                let ancestor: Vec<u8> = conn.query_row(
+                    "SELECT supersedes FROM pages WHERE id = ?1",
+                    [first[0].as_bytes()],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(ancestor, watcher_id.as_bytes());
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reindex_page_lock_releases_both_guards_before_embedding() {
+        struct LockCheckingEmbedder {
+            wiki: Wiki,
+            key: PageKey,
+            calls: std::sync::atomic::AtomicUsize,
+            inner: ai_memory_llm::SyntheticEmbedder,
+        }
+        #[async_trait::async_trait]
+        impl Embedder for LockCheckingEmbedder {
+            fn provider(&self) -> &'static str {
+                self.inner.provider()
+            }
+            fn model(&self) -> &str {
+                self.inner.model()
+            }
+            fn dim(&self) -> u32 {
+                self.inner.dim()
+            }
+            async fn embed(&self, text: &str) -> ai_memory_llm::LlmResult<Vec<f32>> {
+                let global = self
+                    .wiki
+                    .mutation_lock
+                    .try_write()
+                    .expect("embedding must run outside the global lock");
+                let page =
+                    finish_lock_test(self.wiki.lock_page(self.key.0, self.key.1, &self.key.2))
+                        .await;
+                drop(page);
+                drop(global);
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.embed(text).await
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/embed.md").unwrap();
+        std::fs::create_dir_all(wiki.abs_path(ws, proj, &path).parent().unwrap()).unwrap();
+        std::fs::write(
+            wiki.abs_path(ws, proj, &path),
+            "---\nabstract: short summary\n---\nembedded body\n",
+        )
+        .unwrap();
+        let embedder = Arc::new(LockCheckingEmbedder {
+            wiki: wiki.clone(),
+            key: (ws, proj, path.clone()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            inner: ai_memory_llm::SyntheticEmbedder::new(32),
+        });
+        let wiki = wiki.with_embedder(embedder.clone());
+        let id = finish_lock_test(wiki.reindex_page(ws, proj, path))
+            .await
+            .unwrap();
+        assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            store
+                .reader
+                .embedded_page_ids(ws, proj, "synthetic".into(), "bag-of-words-v1".into(), 32)
+                .await
+                .unwrap()
+                .contains(&id)
         );
     }
 

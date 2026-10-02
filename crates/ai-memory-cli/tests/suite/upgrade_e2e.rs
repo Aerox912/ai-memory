@@ -78,6 +78,27 @@ mod slow {
             let mut builder = tar::Builder::new(&mut tar_bytes);
             append_regular(&mut builder, "ai-memory", NEW_BINARY, 0o755);
             append_regular(&mut builder, "hooks/claude-code/new.sh", NEW_HOOK, 0o755);
+            // Match release.yml Unix layout (exact support paths) so hermetic
+            // upgrade still exercises the #1025 support-file allowlist.
+            append_dir(&mut builder, "packaging");
+            append_dir(&mut builder, "packaging/launchd");
+            append_regular(
+                &mut builder,
+                "packaging/launchd/com.github.akitaonrails.ai-memory.plist",
+                b"plist",
+                0o644,
+            );
+            append_dir(&mut builder, "docs");
+            append_regular(&mut builder, "docs/install.md", b"# install", 0o644);
+            append_dir(&mut builder, "crates");
+            append_regular(
+                &mut builder,
+                "crates/ai-memory-cli/templates/config.default.toml",
+                b"# config",
+                0o644,
+            );
+            append_regular(&mut builder, "README.md", b"# ai-memory", 0o644);
+            append_regular(&mut builder, "LICENSE", b"MIT", 0o644);
             builder.finish().expect("finish tar");
         }
         let mut gz_bytes = Vec::new();
@@ -101,9 +122,38 @@ mod slow {
             zip.start_file("hooks/claude-code/new.sh", options)
                 .expect("start hook");
             zip.write_all(NEW_HOOK).expect("write hook");
+            // Windows release.yml ships docs/crates/README/LICENSE (no
+            // packaging/); include them so zip allowlist drift is caught.
+            zip.add_directory("docs/", options).expect("docs dir");
+            zip.start_file("docs/install.md", options)
+                .expect("start docs");
+            zip.write_all(b"# install").expect("write docs");
+            zip.add_directory("crates/", options).expect("crates dir");
+            zip.start_file(
+                "crates/ai-memory-cli/templates/config.default.toml",
+                options,
+            )
+            .expect("start crates");
+            zip.write_all(b"# config").expect("write crates");
+            zip.start_file("README.md", options).expect("start readme");
+            zip.write_all(b"# ai-memory").expect("write readme");
+            zip.start_file("LICENSE", options).expect("start license");
+            zip.write_all(b"MIT").expect("write license");
             zip.finish().expect("finish zip");
         }
         cursor.into_inner()
+    }
+
+    fn append_dir(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str) {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_path(path).expect("set dir path");
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append(&header, std::io::empty())
+            .expect("append tar dir");
     }
 
     fn append_regular(

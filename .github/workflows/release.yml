@@ -97,7 +97,7 @@ jobs:
           mkdir -p "dist/$artifact/docs"
           cp README.md LICENSE "dist/$artifact/"
           cp docs/install.md "dist/$artifact/docs/install.md"
-          tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
+          COPYFILE_DISABLE=1 tar -C "dist/$artifact" -czf "$artifact.tar.gz" .
           sha256sum "$artifact.tar.gz" > "$artifact.tar.gz.sha256"
 
 

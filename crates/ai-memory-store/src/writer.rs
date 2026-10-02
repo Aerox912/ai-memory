@@ -715,6 +715,7 @@ pub(crate) enum WriteCmd {
     PrepareWorkstreamRun {
         input: PrepareWorkstreamRun,
         owner_user: Option<String>,
+        force_unlock: bool,
         reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
     },
     HeartbeatManagedRun {
@@ -3014,10 +3015,23 @@ impl WriterHandle {
         input: PrepareWorkstreamRun,
         owner_user: Option<String>,
     ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_owned_with_unlock(input, owner_user, false)
+            .await
+    }
+
+    /// Select a workstream, optionally replacing this same operator's active
+    /// lease in the same writer transaction.
+    pub async fn prepare_workstream_run_owned_with_unlock(
+        &self,
+        input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+        force_unlock: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PrepareWorkstreamRun {
             input,
             owner_user,
+            force_unlock,
             reply: tx,
         })
         .await?;
@@ -4269,10 +4283,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::PrepareWorkstreamRun {
                 input,
                 owner_user,
+                force_unlock,
                 reply,
             } => {
-                let result =
-                    crate::workstream::prepare_run(&mut conn, &input, owner_user.as_deref());
+                let result = crate::workstream::prepare_run(
+                    &mut conn,
+                    &input,
+                    owner_user.as_deref(),
+                    force_unlock,
+                );
                 send_or_warn(reply, result, "prepare_workstream_run");
             }
             WriteCmd::HeartbeatManagedRun { run_id, reply } => {

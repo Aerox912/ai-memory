@@ -49,7 +49,7 @@ pub enum Command {
     RepairBackfillTimestamps(RepairBackfillTimestampsArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
     /// Native arguments are forwarded except exact wrapper flags such as
-    /// `--yolo` and `--fresh`.
+    /// `--yolo`, `--fresh`, and `--force-unlock`.
     Run(RunArgs),
     /// Pick a local project and installed harness, then launch from that
     /// checkout. Removes the `cd` step `run` requires.
@@ -327,6 +327,12 @@ pub struct RunArgs {
     /// resuming or adopting an existing harness session.
     #[arg(long)]
     pub fresh: bool,
+    /// Force-expire the selected workstream's active lease before launching.
+    /// Use only when the previous launcher is gone: its later heartbeat or
+    /// finish will be refused. The server permits takeover only for the same
+    /// authenticated operator (or the single-user, unattributed owner).
+    #[arg(long)]
+    pub force_unlock: bool,
     /// Skip the one-time auto-install of this harness's ai-memory hooks + MCP.
     /// Auto-wire is on by default so a managed launch captures without a manual
     /// `install-hooks`/`install-mcp` step; pass this (or set
