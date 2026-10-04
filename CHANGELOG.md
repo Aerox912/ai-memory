@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now kept by both, and by the PreCompact and PostCompaction checkpoints,
   which rewrote it the same way. The write no longer stamps
   `observation_generation`. (#1138)
+- Fixed `ai-memory backfill` failing on every Antigravity CLI session: it and
+  `ai-memory run` now import the session's user prompts from `agy`'s
+  `history.jsonl`, keeping only lines whose conversation and workspace match
+  the checkout. (#1134)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
