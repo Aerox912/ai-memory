@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2-aerox.3] - 2026-10-04
+
+### Changed
+- Integrated canonical changes through `0ee4a1354ab268680dfc54d63361b7e95948b740`, retaining Aerox file-backed authentication, runtime-only hook credentials, isolated memory pools, and Windows/WSL packaging.
+
+### Fixed
+- Gated reserved global-scope writes through the same authorization resolver for both explicit and implicit scope spellings (GHSA-7qj3-7wqw-m5w6).
+- Resolved reserved `_global` wiki links in the default workspace across store, wiki, and web rendering. (#1064)
+- Redacted Gemini authorization API keys and disabled default thinking for Gemini 3.8 Flash. (#1077)
+- Routed OpenCode Go and Zen models through their correct API transports. (#1080)
+- Preserved live OpenCode 2 sessions when the plugin unloads. (#1074)
+- Attached managed Claude launches to their own still-running background sessions. (#1067)
+- Avoided working-tree scans before the resume picker. (#1039)
+- Drained in-flight store commands when the writer shuts down instead of leaving callers waiting indefinitely.
+
 ## [2.5.2-aerox.2] - 2026-10-03
 
 ### Changed
