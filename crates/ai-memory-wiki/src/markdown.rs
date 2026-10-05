@@ -551,14 +551,20 @@ fn resolve_local_wikilink(
     // source page — `page_path` is unused on this branch of
     // `normalize_link_target`/`resolve_relative`), `.md` appended,
     // traversal collapsed.
-    let target = normalize_link_target(&path_part, page_path, true)?;
+    // Split off a trailing #anchor/?query so it survives the rewrite.
+    let (clean_path, suffix) = match path_part.find(['#', '?']) {
+        Some(i) => (&path_part[..i], &path_part[i..]),
+        None => (path_part.as_str(), ""),
+    };
+    let target = normalize_link_target(clean_path, page_path, true)?;
     let page_dir: Vec<&str> = page_path
         .as_str()
         .rsplit_once('/')
         .map_or_else(Vec::new, |(dir, _)| {
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
-    let href = relative_href(&page_dir, &target);
+    let mut href = relative_href(&page_dir, &target);
+    href.push_str(suffix);
     let display = label.map_or(target_part, str::trim).to_string();
     Some((href, display))
 }
@@ -1283,6 +1289,27 @@ mod tests {
         assert_eq!(
             rewrite_local_wikilinks("[[decisions/b.md|the decision]]", &path, "proj"),
             "[the decision](../decisions/b.md)"
+        );
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_preserves_anchor_and_query_fragments() {
+        let path = PagePath::new("concepts/a.md").unwrap();
+        assert_eq!(
+            rewrite_local_wikilinks("See [[decisions/b.md#context]].", &path, "proj"),
+            "See [decisions/b.md#context](../decisions/b.md#context)."
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#context|the decision]]", &path, "proj"),
+            "[the decision](../decisions/b.md#context)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b.md?v=1#part-2]]", &path, "proj"),
+            "[decisions/b.md?v=1#part-2](../decisions/b.md?v=1#part-2)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks("[[decisions/b#my section|My Section]]", &path, "proj"),
+            "[My Section](<../decisions/b.md#my section>)"
         );
     }
 

@@ -104,8 +104,8 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
 }
 
 /// Convert `[[target]]` / `[[target|label]]` spans into `[label](href)`
-/// markdown links, skipping code: fenced and indented code blocks and
-/// inline-code spans. Targets that aren't internal pages (external
+/// markdown links, skipping code (fenced and indented code blocks and
+/// inline-code spans) and raw HTML blocks. Targets that aren't internal pages (external
 /// schemes, traversal, empty) are left as literal `[[…]]`.
 ///
 /// What counts as code is what the renderer's own parser reads as code,
@@ -113,10 +113,14 @@ fn scope_relative_link<'a>(dest: CowStr<'a>, workspace: &str, project: &str) -> 
 /// CommonMark says they do, so a nested list item or a paragraph's
 /// continuation line indented four spaces is text, and its wikilink is
 /// rewritten like any other (the engine's link extractor indexes it).
+///
+/// An HTML block is shown as escaped source text, so markdown inside it
+/// is never parsed: a rewritten wikilink would surface as its generated
+/// `[label](w/…/p/….md)` markup instead of the `[[…]]` the page holds.
 fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
     let mut out = String::with_capacity(body.len() + 64);
     let mut pos = 0;
-    for code in code_ranges(body) {
+    for code in literal_ranges(body) {
         rewrite_wikilinks_in_lines(&body[pos..code.start], workspace, project, &mut out);
         out.push_str(&body[code.clone()]);
         pos = code.end;
@@ -125,14 +129,16 @@ fn preprocess_wikilinks(body: &str, workspace: &str, project: &str) -> String {
     out
 }
 
-/// Byte ranges of the code in `body` (fenced and indented code blocks,
-/// inline-code spans) as the renderer's parser reads it, in document
-/// order and without overlap.
-fn code_ranges(body: &str) -> Vec<Range<usize>> {
+/// Byte ranges of `body` the renderer shows verbatim (fenced and indented
+/// code blocks, inline-code spans, raw HTML blocks) as its parser reads
+/// them, in document order and without overlap.
+fn literal_ranges(body: &str) -> Vec<Range<usize>> {
     let mut ranges: Vec<Range<usize>> = Vec::new();
     for (event, range) in Parser::new_ext(body, options()).into_offset_iter() {
-        if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_))
-            && ranges.last().is_none_or(|last| range.start >= last.end)
+        if matches!(
+            event,
+            Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock) | Event::Code(_)
+        ) && ranges.last().is_none_or(|last| range.start >= last.end)
         {
             ranges.push(range);
         }
@@ -222,10 +228,17 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     // Optional `[workspace/]project:` scope qualifier.
     let (ws, proj, path_part) = split_scope(target, workspace, project);
 
-    // Strip anchor/query, reject non-page extensions, normalise the `.md`
-    // suffix, then rely on the canonical page-path validator for traversal,
-    // absolute paths, Windows prefixes, backslashes, and empty segments.
-    let path = path_part.split(['#', '?']).next().unwrap_or("").trim();
+    // Split off a trailing #anchor/?query so it survives the rewrite,
+    // matching scope_relative_link.
+    let (path_part, suffix) = match path_part.find(['#', '?']) {
+        Some(i) => (&path_part[..i], &path_part[i..]),
+        None => (path_part, ""),
+    };
+
+    // Reject non-page extensions, normalise the `.md` suffix, then rely on
+    // the canonical page-path validator for traversal, absolute paths,
+    // Windows prefixes, backslashes, and empty segments.
+    let path = path_part.trim();
     if path.is_empty() {
         return None;
     }
@@ -240,12 +253,55 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     };
     let path = PagePath::new(path).ok()?;
 
-    let href = crate::templates::page_href(ws, proj, path.as_str());
+    let href = format!(
+        "{}{}",
+        crate::templates::page_href(ws, proj, path.as_str()),
+        encode_link_suffix(suffix)
+    );
     let display = label
         .filter(|l| !l.is_empty())
         .unwrap_or(target)
         .to_string();
     Some((href, display))
+}
+
+/// Percent-encode a wikilink's `#anchor` / `?query` suffix for a Markdown
+/// link destination. A space, parenthesis, angle bracket, quote or backslash
+/// would end or break the bare `[label](href)` destination; the URI delimiters
+/// a fragment or query uses (and existing `%` escapes) stay as written.
+fn encode_link_suffix(suffix: &str) -> String {
+    let mut out = String::with_capacity(suffix.len());
+    for byte in suffix.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@'
+            | b'/'
+            | b'?'
+            | b'#'
+            | b'%' => out.push(byte as char),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(&mut out, "%{byte:02X}");
+            }
+        }
+    }
+    out
 }
 
 /// Peel an optional `[workspace/]project:` scope off a wikilink target,
@@ -622,6 +678,66 @@ mod tests {
     }
 
     #[test]
+    fn wikilink_preserves_anchor_and_query_suffix() {
+        let html = render(
+            "see [[notes/foo#section-1]] and [[notes/bar.md#section-2|Bar Section]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(
+                r#"href="w/default/scratch/p/notes/foo.md#section-1">notes/foo#section-1</a>"#
+            ),
+            "bare anchor: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/bar.md#section-2">Bar Section</a>"#),
+            "anchor with label: {html}"
+        );
+
+        let cross = render(
+            "[[otherproj:notes/x#heading]] [[_global:python-env?v=1#setup|Setup]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            cross.contains(
+                r#"href="w/default/otherproj/p/notes/x.md#heading">otherproj:notes/x#heading</a>"#
+            ),
+            "cross-project anchor: {cross}"
+        );
+        assert!(
+            cross.contains(r#"href="w/default/_global/p/python-env.md?v=1#setup">Setup</a>"#),
+            "global scope query and anchor: {cross}"
+        );
+    }
+
+    #[test]
+    fn wikilink_suffix_with_space_or_parenthesis_stays_one_link() {
+        let html = render(
+            "[[notes/foo#my section]] and [[notes/foo#a)b]]",
+            "default",
+            "scratch",
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#my%20section">"#),
+            "space in anchor: {html}"
+        );
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#a%29b">"#),
+            "parenthesis in anchor: {html}"
+        );
+        assert!(
+            !html.contains("b)"),
+            "a ')' must not close the link early: {html}"
+        );
+        assert!(
+            !html.contains("[["),
+            "both wikilinks render as links: {html}"
+        );
+    }
+
+    #[test]
     fn wikilink_cross_project_and_cross_workspace_scope() {
         let html = render(
             "[[otherproj:notes/x]] [[ws2/proj2:y]]",
@@ -667,6 +783,30 @@ mod tests {
 
         let inline = render("use `[[notes/foo]]` literally", "default", "scratch");
         assert!(!inline.contains("<a href"), "inline code: {inline}");
+    }
+
+    /// An HTML block renders as its escaped source, so a wikilink in it
+    /// has to stay as written rather than turn into rewritten link markup.
+    #[test]
+    fn wikilink_kept_as_written_in_html_block() {
+        let comment = render("<!-- see [[notes/foo]] -->", "default", "scratch");
+        assert!(comment.contains("see [[notes/foo]]"), "comment: {comment}");
+        assert!(!comment.contains("/p/notes/foo.md"), "comment: {comment}");
+
+        let div = render("<div>\n[[notes/foo|Foo]]\n</div>", "default", "scratch");
+        assert!(div.contains("[[notes/foo|Foo]]"), "div: {div}");
+
+        // Inline HTML is only the tag itself; the text around it is still
+        // a paragraph, and so is the paragraph after the block.
+        let inline = render(
+            "<div>x</div>\n\ntext <span>[[notes/foo]]</span>",
+            "default",
+            "scratch",
+        );
+        assert!(
+            inline.contains(r#"<a href="w/default/scratch/p/notes/foo.md">notes/foo</a>"#),
+            "inline: {inline}"
+        );
     }
 
     #[test]

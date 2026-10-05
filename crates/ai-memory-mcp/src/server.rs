@@ -987,6 +987,7 @@ fn tool_call_is_write(tool: &str) -> bool {
             | "memory_briefing"
             | "memory_explore"
             | "memory_status"
+            | "memory_handoff_list"
             | "memory_message_list"
             | "memory_install_self_routing"
     )
@@ -3171,10 +3172,11 @@ impl AiMemoryServer {
     /// shared slot included, on the same rung ladder as every other admin
     /// operation — which also means a single-operator server (no users, no
     /// trusted proxy) is unaffected.
-    async fn place_slot_write(
+    async fn place_slot_mutation(
         &self,
         path: PagePath,
         parts: &axum::http::request::Parts,
+        op: &str,
     ) -> Result<PagePath, McpError> {
         if !self.per_user_slots {
             return Ok(path);
@@ -3198,13 +3200,48 @@ impl AiMemoryServer {
                 Err(McpError::invalid_request(
                     format!(
                         "path '{}' belongs to another operator's slot namespace; \
-                         write your own slot instead",
+                         {op} your own slot instead",
                         path.as_str()
                     ),
                     None,
                 ))
             }
         }
+    }
+
+    /// Route an incoming `_slots/` write when per-user slots are active.
+    ///
+    /// Non-admin callers writing a generic slot name (e.g.
+    /// `_slots/current-focus.md`) are silently redirected to their personal
+    /// slot (`_slots/u-<identity_key>/current-focus.md`). A caller writing
+    /// directly to another operator's slot namespace is rejected with
+    /// [`McpError::invalid_request`]. Admin callers write the requested path
+    /// exactly as it always has. Admins may still curate any namespace, the
+    /// shared slot included, on the same rung ladder as every other admin
+    /// operation - which also means a single-operator server (no users, no
+    /// trusted proxy) is unaffected.
+    async fn place_slot_write(
+        &self,
+        path: PagePath,
+        parts: &axum::http::request::Parts,
+    ) -> Result<PagePath, McpError> {
+        self.place_slot_mutation(path, parts, "write").await
+    }
+
+    /// Route an incoming `_slots/` delete when per-user slots are active.
+    ///
+    /// Non-admin callers deleting a generic slot name (e.g.
+    /// `_slots/current-focus.md`) are silently redirected to their personal
+    /// slot (`_slots/u-<identity_key>/current-focus.md`). A caller deleting
+    /// directly in another operator's slot namespace is rejected with
+    /// [`McpError::invalid_request`]. Admin callers delete the requested path
+    /// directly.
+    async fn place_slot_delete(
+        &self,
+        path: PagePath,
+        parts: &axum::http::request::Parts,
+    ) -> Result<PagePath, McpError> {
+        self.place_slot_mutation(path, parts, "delete").await
     }
 
     /// Gate an operation behind [`ai_memory_core::Capability::Admin`].
@@ -4351,6 +4388,7 @@ impl AiMemoryServer {
         };
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        let path = self.place_slot_delete(path, &parts).await?;
         let (ws, proj) = self
             .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
@@ -15641,10 +15679,13 @@ mod tests {
         for read in [
             "memory_query",
             "memory_read_page",
+            "memory_read_session_observations",
             "memory_recent",
             "memory_briefing",
             "memory_explore",
             "memory_status",
+            "memory_handoff_list",
+            "memory_message_list",
             "memory_install_self_routing",
         ] {
             assert!(!tool_call_is_write(read), "{read}");
@@ -15654,14 +15695,37 @@ mod tests {
             "memory_delete_page",
             "memory_feedback",
             "memory_consolidate",
+            "memory_auto_improve",
+            "memory_lint",
             "memory_forget_sweep",
             "memory_handoff_begin",
+            "memory_handoff_accept",
+            "memory_handoff_cancel",
+            "memory_message_send",
+            "memory_message_pop",
+            "memory_message_cancel",
         ] {
             assert!(tool_call_is_write(write), "{write}");
         }
         // The deliberate default: a tool this list has never met counts as
         // a write, so forgetting to classify a future tool is visible.
         assert!(tool_call_is_write("memory_some_future_tool"));
+    }
+
+    #[test]
+    fn memory_handoff_list_is_classified_as_read_activity() {
+        assert!(!tool_call_is_write("memory_handoff_list"));
+        let mut buffer = ClientActivityBuffer::new();
+        buffer.record(
+            "test-client".into(),
+            1,
+            tool_call_is_write("memory_handoff_list"),
+        );
+        assert_eq!(
+            buffer.pending.get(&("test-client".into(), 1)),
+            Some(&(1, 0)),
+            "read-only handoff inspection must increment reads, not writes"
+        );
     }
 
     #[test]

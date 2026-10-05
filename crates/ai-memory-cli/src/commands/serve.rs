@@ -1199,6 +1199,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             // connected is the exact state a launched-but-unused server sits
             // in, and until #699 nothing here listened for one at all.
             let service = tokio::select! {
+                // A handshake that completes in the same poll a signal
+                // arrives in counts as connected: an unbiased select would
+                // pick either branch at random.
+                biased;
                 service = server.serve(stdio()) => Some(service?),
                 signal = shutdown.recv() => {
                     info!(signal, "shutdown signal received before a client connected; stopping");

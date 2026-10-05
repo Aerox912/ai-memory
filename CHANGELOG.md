@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2-aerox.4] - 2026-10-05
+
+### Changed
+- Integrated all 32 canonical commits through `fc4da03ac5268aa44d18894685818eab2f9ecdea`, retaining Aerox file-backed authentication, runtime-only hook credentials, isolated memory pools, and Windows/WSL packaging.
+
+### Fixed
+- Fixed `memory_handoff_list` MCP tool calls being counted under writes in
+  `client_activity`: the read-only inspection tool is now classified as a read
+  in `tool_call_is_write`. (#1088)
+- Fixed the provider-health wrapper dropping the caller's operation id: its
+  `complete_with_operation_id` and `complete_structured_raw_with_operation_id`
+  fell to the trait defaults, so every retry of one logical operation got a
+  fresh id and, for OpenCode, a new session header on every call. The wrapper
+  now forwards both. (#1085)
+- Fixed `backfill` failing with a non-root key on a multi-user server. Its
+  emptiness check used the root-only `/admin/sessions/by-agent` route, so every
+  developer's own key got 403; on a 403 it now asks the grant-checked
+  `GET /api/v1/workspaces/{ws}/projects/{p}/sessions` instead. (#1086)
+- Fixed the sanitizer missing uppercase `*_KEY_ID`, `*_PASSPHRASE`,
+  `*_SIGNING_KEY`, `*_PEPPER` and `*_SALT` assignments (e.g. an S3
+  `…_ACCESS_KEY_ID`, an auth token pepper) and dotless base64 JSON tokens such
+  as Cloudflare tunnel tokens (`eyJ…`, 40+ characters); lowercase code
+  identifiers, SHAs, UUIDs and short `eyJ` fragments are left alone. (#1084)
+- Fixed `memory_delete_page` bypassing per-user slot namespace routing and
+  access checks when `[slots] per_user` is active. Non-admin callers deleting a
+  generic slot path (`_slots/current-focus.md`) are now redirected to their
+  personal slot namespace instead of removing the shared project-wide slot, and
+  deleting directly inside another operator's slot namespace is rejected with an
+  invalid request error. (#1083)
+- Fixed the web page view showing a `[[wikilink]]` inside a raw HTML block
+  (an HTML comment, a `<div>` block) as generated link markup such as
+  `[notes/foo](w/default/scratch/p/notes/foo.md)`. HTML blocks render as
+  escaped source text, so the wikilink now stays as the page wrote it. (#1087)
+- Fixed wikilinks dropping `#anchor` and `?query` suffixes. `[[page#section]]`
+  and `[[page#section|label]]` lost the fragment when rewritten to standard
+  Markdown links (for example on OKF export), leaving the link pointed at the
+  page root. The rewriters now keep the suffix, percent-encoded where needed so
+  a space or parenthesis in it cannot break the link. In `/web` the suffix is
+  kept on the href; the page view does not emit heading ids. (#1089)
+
 ## [2.5.2-aerox.3] - 2026-10-04
 
 ### Changed
