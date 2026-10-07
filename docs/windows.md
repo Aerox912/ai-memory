@@ -533,6 +533,11 @@ native on an i7-6700HQ). Notes:
   `ai-memory.exe`, so release binaries and Cargo-built binaries work directly.
 - The `.sh`/`.ps1` scripts stay bundled as a fallback — the Docker /
   `setup-agent` flow (no local binary) keeps emitting the shell command.
+  For outage parity with the native hooks, both script bundles spool an
+  undeliverable event (connection failure, timeout, 5xx) to the same
+  `<data_dir>/hook-spool/` contract `ai-memory hook-drain` reads, and flush
+  the backlog after the next successful delivery; a terminal 4xx is not
+  retried.
 - `AI_MEMORY_HOOK_PLATFORM` accepts five values:
   - `windows-native` — Claude exec-form direct binary call (default on native Windows).
   - `windows` — PowerShell `-EncodedCommand` + staged `.ps1` script. The native
