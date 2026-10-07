@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed the hook spool charging a spooled event's retry budget while the
+  server was unreachable: an endpoint-level delivery failure (connection
+  refused, timeout, DNS — the existing `Unreachable` classification) no
+  longer increments `attempts`, so a total outage no longer deletes the
+  oldest events at roughly one per `max_attempts` drain passes while the
+  server is down. Post-connect failures (a server that answers with 5xx or
+  a protocol error) keep the previous charging semantics, and the 10,000
+  file cap and 7-day spool TTL bounds are unchanged. Also corrected the
+  stale `hooks/_lib.sh` comment that claimed the backlog is drained at
+  session boundaries only (a piggyback drain also runs after any
+  successful 2xx POST). (#NNN)
+
 
 ## [2.6.0] - 2026-10-07
 

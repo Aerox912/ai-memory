@@ -1041,8 +1041,10 @@ ai_memory_json_string() {
 # TypeScript integrations gained this in #580; the script bundle is the
 # remaining capture path that POSTs and forgets.
 #
-# The backlog is drained at session boundaries only — never on the
-# per-tool-call hot path, which must not block the agent.
+# The backlog is drained at session boundaries and, after any successful
+# 2xx POST, by the detached piggyback drain in ai_memory_kick_drain —
+# never synchronously on the per-tool-call hot path, which must not block
+# the agent.
 
 ai_memory_spool_dir() {
     printf '%s/hook-spool' "$(ai_memory_state_dir)"
