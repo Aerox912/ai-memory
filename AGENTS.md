@@ -624,3 +624,8 @@ Additional boundary rules:
   agent-to-agent inbox/queue and the on-start hot-context notice.
 - [`docs/companion-crates.md`](docs/companion-crates.md) — boundary for
   optional companion projects (e.g. the importer).
+- [`docs/desktop/`](docs/desktop/) — research notes and phased plan for
+  GUI/desktop-app support (Claude Desktop, Codex desktop, Antigravity IDE,
+  ChatGPT/Grok desktop, Zed): verified per-app mechanics, capture/dedup
+  design, installer + CLI coexistence. Reconciles RFC #878; read before
+  any desktop-capture or tray/installer work.
