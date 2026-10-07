@@ -5296,8 +5296,7 @@ function mcpSignal(signal?: AbortSignal): AbortSignal | undefined {
   return anyFactory ? anyFactory([signal, timeout]) : timeout;
 }
 
-async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
-  const id = ++mcpRequestId;
+function mcpHeaders(ctx?: any): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -5308,9 +5307,14 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
     headers["X-Memory-Actor-Session-Id"] = session;
     headers["Mcp-Session-Id"] = session;
   }
+  return headers;
+}
+
+async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
+  const id = ++mcpRequestId;
   const response = await fetch(MCP_SERVER, {
     method: "POST",
-    headers,
+    headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
     signal: mcpSignal(signal),
   });
@@ -5319,6 +5323,16 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
   if (payload?.error) throw new Error(`ai-memory MCP ${method} failed: ${payload.error.message ?? JSON.stringify(payload.error)}`);
   if (payload?.result?.isError) throw new Error(`ai-memory MCP ${method} returned isError`);
   return payload?.result;
+}
+
+async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void> {
+  const response = await fetch(MCP_SERVER, {
+    method: "POST",
+    headers: mcpHeaders(ctx),
+    body: JSON.stringify({ jsonrpc: "2.0", method, params: params ?? {} }),
+    signal: mcpSignal(signal),
+  });
+  if (!response.ok) throw new Error(`ai-memory MCP notification ${method} failed: HTTP ${response.status}`);
 }
 
 function toolInputSchema(tool: any): any {
@@ -5332,7 +5346,7 @@ async function bootstrapMcpBridge(pi: any): Promise<void> {
       capabilities: {},
       clientInfo: { name: "ai-memory-pi-extension", version: "0.0.0" },
     });
-    try { await mcpRpc("notifications/initialized"); } catch (_e) {}
+    try { await mcpNotify("notifications/initialized"); } catch (_e) {}
     const listed = await mcpRpc("tools/list");
     for (const tool of listed?.tools ?? []) {
       try {
@@ -11375,7 +11389,14 @@ model = "gpt-5"
         assert!(extension.contains("function mcpSignal(signal?: AbortSignal)"));
         assert!(extension.contains("anyFactory([signal, timeout])"));
         assert!(extension.contains("mcpRpc(\"initialize\""));
-        assert!(extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains("mcpNotify(\"notifications/initialized\""));
+        assert!(!extension.contains("mcpRpc(\"notifications/initialized\""));
+        assert!(extension.contains(
+            "async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void>"
+        ));
+        assert!(extension.contains(
+            "body: JSON.stringify({ jsonrpc: \"2.0\", method, params: params ?? {} })"
+        ));
         assert!(extension.contains("mcpRpc(\"tools/list\""));
         assert!(extension.contains("pi.registerTool"));
         assert!(extension.contains("label: tool.name"));
