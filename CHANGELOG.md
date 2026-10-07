@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the already-scrubbed text, mirroring `Sanitized::new` and the #1109
   feedback-reason fix. The stored body shapes and byte limits are unchanged.
   (#1114)
+- Fixed the native hook's client-side spool cap truncating oversized
+  lifecycle bodies (user prompts, notifications, post-compaction summaries)
+  before any scrubbing: the capped field is now scrubbed with the built-in
+  sanitizer first and truncated second — the order `assistant_capture` and
+  the #980 / #1109 fixes established — so a straddling secret can no longer
+  reach the spool (and through it the server) as an unredacted fragment.
+  (#1114)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
