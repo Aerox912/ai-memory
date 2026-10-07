@@ -7552,9 +7552,13 @@ impl ReaderPool {
     /// version of a page identified by `(workspace_id, project_id, path)`.
     ///
     /// Both ends are constrained to `is_latest = 1`, so superseded versions
-    /// never leak into the link panel. Returns empty lists when the page is
-    /// missing or has no links. `viewer` drops links whose far end is in a
-    /// repository that user may not read; `None` keeps them all.
+    /// never leak into the link panel, and to [`not_expired`] so a TTL'd
+    /// neighbour is hidden the same way search / recent / briefing /
+    /// [`Self::graph_neighbors_for_project`] already hide it. The seed
+    /// lookup is an exact-path read and still finds an expired page.
+    /// Returns empty lists when the page is missing or has no links.
+    /// `viewer` drops links whose far end is in a repository that user may
+    /// not read; `None` keeps them all.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -7579,14 +7583,18 @@ impl ReaderPool {
                 return Ok(PageLinks::default());
             };
 
-            // Outgoing: latest pages this page links to. Incoming: latest
-            // pages that link here. Both reuse the path-inference `kind`
-            // fallback so untagged pages still classify.
+            // Outgoing: latest unexpired pages this page links to.
+            // Incoming: latest unexpired pages that link here. Both reuse
+            // the path-inference `kind` fallback so untagged pages still
+            // classify. `?2` is the retrieval TTL cutoff; the viewer
+            // predicate inlines its id, so the placeholder is free.
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
             // A link into a repository the viewer cannot read would show them
             // its name and a page title and path inside it — the same leak as a
             // graph edge — so the far end is filtered like one.
             let visible = readable_repository_predicate("pg.project_id", viewer);
+            let ttl = not_expired("pg", "?2");
+            let now = now_us();
             let outgoing = format!(
                 "SELECT DISTINCT pg.path, pg.title, {kind_expr}, \
                             ws.name, pr.name \
@@ -7594,7 +7602,7 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.to_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let incoming = format!(
@@ -7604,13 +7612,13 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.from_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
 
             let collect = |sql: &str| -> StoreResult<Vec<RelatedPage>> {
                 let mut stmt = conn.prepare(sql)?;
-                let rows = stmt.query_map(params![id_bytes], |row| {
+                let rows = stmt.query_map(params![id_bytes, now], |row| {
                     Ok(RelatedPage {
                         path: row.get(0)?,
                         title: row.get(1)?,
@@ -7640,9 +7648,12 @@ impl ReaderPool {
     /// This is the multi-hop generalisation of [`Self::page_links`]: depth 1
     /// returns exactly the seed's direct neighbours (the union of `links` and
     /// `backlinks`), and each further hop expands the frontier by one edge.
-    /// Like `page_links`, both ends are constrained to `is_latest = 1`, and
-    /// neighbours in sibling projects/workspaces resolve and carry their real
-    /// coordinate — the walk is cross-project aware.
+    /// Like `page_links`, both ends are constrained to `is_latest = 1` and
+    /// [`not_expired`], so an expired neighbour is neither returned nor
+    /// walked through. Neighbours in sibling projects/workspaces resolve
+    /// and carry their real coordinate — the walk is cross-project aware.
+    /// The seed lookup is an exact-path read and still starts from an
+    /// expired page.
     ///
     /// Bounds (all enforced regardless of the caller):
     /// - `depth` is clamped into `1..=`[`RELATED_WALK_MAX_DEPTH`].
@@ -7658,7 +7669,7 @@ impl ReaderPool {
     /// end: a page in a project the viewer cannot read is neither returned
     /// nor walked through, so nothing reachable only through it is returned
     /// either. `None` (root, or per-repository authorization off) walks every
-    /// latest page.
+    /// latest unexpired page.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -7686,17 +7697,20 @@ impl ReaderPool {
             };
 
             // Per-node expansion reuses the exact `page_links` resolution
-            // (latest-only, cross-project) but also selects `pg.id` so the walk
-            // can continue from each neighbour.
+            // (latest-only, unexpired, cross-project) but also selects
+            // `pg.id` so the walk can continue from each neighbour. One
+            // cutoff for every hop of this walk.
             let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
             let visible = readable_repository_predicate("pg.project_id", viewer);
+            let ttl = not_expired("pg", "?2");
+            let now = now_us();
             let outgoing = format!(
                 "SELECT DISTINCT pg.id, pg.path, pg.title, {kind_expr}, ws.name, pr.name \
                      FROM links l \
                      JOIN pages pg ON pg.id = l.to_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.from_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let incoming = format!(
@@ -7705,7 +7719,7 @@ impl ReaderPool {
                      JOIN pages pg ON pg.id = l.from_page_id \
                      JOIN projects pr ON pr.id = pg.project_id \
                      JOIN workspaces ws ON ws.id = pg.workspace_id \
-                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible} \
+                     WHERE l.to_page_id = ?1 AND pg.is_latest = 1{visible}{ttl} \
                      ORDER BY ws.name, pr.name, pg.path"
             );
             let mut out_stmt = conn.prepare(&outgoing)?;
@@ -7722,7 +7736,7 @@ impl ReaderPool {
                     // Outgoing edges are labelled "link", incoming "backlink";
                     // a node reachable both ways keeps its first-reached label.
                     for (direction, stmt) in [("link", &mut out_stmt), ("backlink", &mut in_stmt)] {
-                        let rows = stmt.query_map(params![node], |row| {
+                        let rows = stmt.query_map(params![node, now], |row| {
                             let id: Vec<u8> = row.get(0)?;
                             Ok((
                                 id,
