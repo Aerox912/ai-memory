@@ -16866,7 +16866,7 @@ mod tests {
                 "cwd": "/repo",
                 "tool_name": "Read",
                 "tool_use_id": "call-1114",
-                "tool_response": format!("{} {secret}", "x".repeat(1_940)),
+                "tool_response": format!("{} {secret}", "x".repeat(1_920)),
             }),
         );
         process(&state, env, None, Vec::new()).await.unwrap();

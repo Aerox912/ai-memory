@@ -2081,7 +2081,10 @@ mod tests {
             q,
             serde_json::json!({"payload":{"tool":"bash","output":"é".repeat(2_000)}}),
         );
-        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+        let body = long.body_excerpt.unwrap();
+        assert!(body.len() > 2_000);
+        let capped = truncate_utf8_bytes(&body, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.len() <= 2_000);
     }
 
     /// OpenCode's plugin `event` hook receives bus events shaped like
@@ -2568,8 +2571,9 @@ mod tests {
             }),
         );
         let excerpt = env.body_excerpt.unwrap();
-        assert!(excerpt.ends_with('…'));
         assert!(excerpt.starts_with("tool_family: non-file\noutcome: unknown\n---\n"));
+        let capped = truncate_utf8_bytes(&excerpt, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.ends_with('…'));
     }
 
     /// Regression: the native-binary hook command sends the script stem
@@ -2927,7 +2931,10 @@ mod tests {
             },
             serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":"utf8-1","output": "é".repeat(2_000)}),
         );
-        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+        let body = long.body_excerpt.unwrap();
+        assert!(body.len() > 2_000);
+        let capped = truncate_utf8_bytes(&body, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.len() <= 2_000);
     }
 
     #[test]
