@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `graph_neighbors_for_project` already applied the retrieval TTL
   (`expires_at` is null or still in the future); these two queries only
   filtered `is_latest`. An expired neighbour is neither returned nor
-  walked through. Exact-path reads of an expired page are unchanged.
+  walked through. Exact-path reads of an expired page are unchanged. (#1141)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
