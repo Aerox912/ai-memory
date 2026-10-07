@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotency `ingest_key` before its initial attempt and keeps it on the
   spooled replay, so an ambiguous delivery that committed server-side is
   discarded on replay instead of double-ingested. (#1122)
+- Continued the `memory_explore` provider-body redaction (#1103) to
+  `memory_query(answer=true)`: when answer synthesis fails, the
+  `answer_unavailable` note and the server warning now carry only the
+  redacted `class`/`status` summary (for example
+  `class=provider status=400`) instead of the error's `Display`, which for a
+  provider failure includes the upstream response body. The default path
+  (no `answer`) is unchanged. (#PRNUM)
 
 ## [2.6.0] - 2026-10-07
 
