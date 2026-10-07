@@ -171,13 +171,16 @@ fn powershell_hook_spools_when_server_unreachable() {
     let files = spool_files(&data_dir);
     assert_eq!(files.len(), 1, "one spool entry after a refused POST");
     let name = files[0].file_name().unwrap().to_string_lossy().to_string();
+    let stem = name.strip_suffix(".json").unwrap_or_default();
+    let segments = stem.split('-').collect::<Vec<_>>();
     assert!(
-        name.len() == "0000000000000-0-0000000000000000.json".len()
-            && name
-                .split('-')
-                .next()
-                .is_some_and(|stamp| stamp.len() == 13 && stamp.bytes().all(|b| b.is_ascii_digit()))
-            && name.ends_with(".json"),
+        segments.len() == 3
+            && segments[0].len() == 13
+            && segments[0].bytes().all(|byte| byte.is_ascii_digit())
+            && !segments[1].is_empty()
+            && segments[1].bytes().all(|byte| byte.is_ascii_digit())
+            && segments[2].len() == 16
+            && segments[2].bytes().all(|byte| byte.is_ascii_hexdigit()),
         "entry name follows <ms:013>-<pid>-<seq:x016>: {name}"
     );
 

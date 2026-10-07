@@ -18,7 +18,7 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ("am-spool-" + [Guid]::NewGuid().To
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 $env:AI_MEMORY_DATA_DIR = (Join-Path $root "data")
 # Port 1 is reserved and never listens: connection refused, immediately.
-$RefusedUrl = "http://127.0.0.1:1/hook?event=stop&agent=codex&ingest_key=ps0123456789abcdef"
+$RefusedUrl = "http://127.0.0.1:1/hook?event=stop&agent=codex&ingest_key=ps0000000000000000"
 
 # 1. The lib captured its own path so the detached drain child can be
 #    pointed back at this exact file.
