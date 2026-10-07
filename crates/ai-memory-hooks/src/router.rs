@@ -17,7 +17,7 @@ use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
     NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
-    WorkstreamEvent, WorkstreamEventKind,
+    WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle,
@@ -42,7 +42,7 @@ use crate::capture_policy::{
 use crate::log;
 use crate::payload::{
     HookEnvelope, HookEvent, HookQuery, ProjectSource, ProjectStrategy, body_is_subagent,
-    parse_agent,
+    durable_body_cap, parse_agent,
 };
 use crate::synth::synthesize_session_page;
 
@@ -3292,6 +3292,21 @@ async fn process(
     }
 }
 
+/// Durable body for a hook observation: scrub the **full** excerpt first,
+/// then apply the per-event ceiling to the redacted text.
+///
+/// The cap used to run inside excerpt extraction in `payload`, before the
+/// sanitizer ever saw the text — a secret straddling the cutoff was cut in
+/// half, leaving a prefix too short to match a pattern, stored in clear text
+/// (#1114). This is the body-side twin of the #980 title-hint fix: scrub and
+/// cap together, in that order, at the persistence boundary.
+fn durable_body(event: HookEvent, excerpt: Option<&str>, sanitizer: &Sanitizer) -> String {
+    let Some(excerpt) = excerpt else {
+        return String::new();
+    };
+    truncate_utf8_bytes(&sanitizer.scrub(excerpt), durable_body_cap(event))
+}
+
 async fn process_authorized(
     state: &HookState,
     env: HookEnvelope,
@@ -3534,7 +3549,7 @@ async fn process_authorized(
                 .title_hint
                 .clone()
                 .unwrap_or_else(|| kind.as_str().to_string()),
-            body: env.body_excerpt.clone().unwrap_or_default(),
+            body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
         };
@@ -16733,6 +16748,180 @@ mod tests {
             "title exceeded the 80-char display cap: {:?}",
             obs.title
         );
+    }
+
+    /// Shared shape for the #1114 body-side regressions: a secret straddling
+    /// a per-event byte cap used to be cut in half at excerpt extraction,
+    /// before the sanitizer ever ran, so the surviving prefix was too short
+    /// to match and was stored unredacted. Each test drives the full ingest
+    /// funnel with a `{20,}`-length pattern and asserts the stored body
+    /// carries the redaction marker, no secret fragment, and the cap.
+    async fn assert_body_scrubbed_before_cap(
+        state: &HookState,
+        event: &str,
+        kind: ObservationKind,
+        body_key: &str,
+        padding: usize,
+        cap: usize,
+    ) {
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: event.into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                body_key: format!("{} {secret}", "x".repeat(padding)),
+            }),
+        );
+        process(state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == kind)
+            .unwrap_or_else(|| panic!("{event} observation was recorded"))
+            .body
+            .clone();
+        assert!(
+            !body.contains(&secret) && !body.contains("SECRETZ"),
+            "unredacted secret fragment survived the cap: {body:?}"
+        );
+        assert!(
+            body.contains("REDACT"),
+            "body carries no trace of redaction — the sanitizer never saw \
+             enough of the secret to match it: {body:?}"
+        );
+        assert!(body.len() <= cap, "body exceeded the {cap}-byte cap: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn issue_1114_user_prompt_body_is_sanitized_before_the_16kib_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        assert_body_scrubbed_before_cap(
+            &state,
+            "user-prompt",
+            ObservationKind::UserPrompt,
+            "prompt",
+            crate::payload::USER_PROMPT_EXCERPT_MAX_BYTES - 14,
+            crate::payload::USER_PROMPT_EXCERPT_MAX_BYTES,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_1114_post_compaction_body_is_sanitized_before_the_16kib_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        assert_body_scrubbed_before_cap(
+            &state,
+            "post-compaction",
+            ObservationKind::PostCompaction,
+            "summary",
+            crate::payload::POST_COMPACTION_EXCERPT_MAX_BYTES - 14,
+            crate::payload::POST_COMPACTION_EXCERPT_MAX_BYTES,
+        )
+        .await;
+    }
+
+    /// The tool excerpt surface: the cap runs on the whole durable body
+    /// (`tool: …\n---\n…`), so the padding lands inside the tool result.
+    #[tokio::test]
+    async fn issue_1114_tool_body_is_sanitized_before_the_2kb_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-1114",
+                "tool_response": format!("{} {secret}", "x".repeat(1_940)),
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation was recorded")
+            .body
+            .clone();
+        assert!(
+            !body.contains(&secret) && !body.contains("SECRETZ"),
+            "unredacted secret fragment survived the cap: {body:?}"
+        );
+        assert!(body.contains("REDACT"), "no redaction marker: {body:?}");
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "body exceeded the 2 KB cap: {body:?}"
+        );
+    }
+
+    /// The per-event caps keep splitting on UTF-8 boundaries through the
+    /// funnel (`truncate_utf8_bytes`), so a multibyte tool result is capped
+    /// without producing invalid bytes.
+    #[tokio::test]
+    async fn tool_body_cap_keeps_the_utf8_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-utf8",
+                "tool_response": "é".repeat(2_000), // 2 bytes each: 2x the cap
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation was recorded")
+            .body;
+        assert!(body.contains('é'));
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "body exceeded the 2 KB cap: {body:?}"
+        );
+        assert!(body.ends_with('…'));
     }
 
     #[test]
