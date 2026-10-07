@@ -6,10 +6,11 @@
 //! prompts, hooks, or LLM output), so raw HTML is escaped and unsafe
 //! link schemes are neutralised.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, PagePath};
-use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// Render a markdown body to HTML using GFM-ish defaults.
 ///
@@ -33,10 +34,11 @@ pub fn render(body: &str, workspace: &str, project: &str) -> String {
     // there, mirroring the engine's link extractor.
     let body = preprocess_wikilinks(body, workspace, project);
 
-    let parser =
-        Parser::new_ext(&body, options()).map(|event| sanitize_event(event, workspace, project));
+    let parser = Parser::new_ext(&body, options());
+    let with_headings = HeadingIdAssigner::new(parser);
+    let sanitized = with_headings.map(|event| sanitize_event(event, workspace, project));
     let mut out = String::with_capacity(body.len() + body.len() / 4);
-    html::push_html(&mut out, parser);
+    html::push_html(&mut out, sanitized);
     out
 }
 
@@ -340,6 +342,162 @@ fn split_scope<'a>(
     (cur_ws, cur_proj, target)
 }
 
+/// Iterator adapter that ensures every `Tag::Heading` event has a unique `id`.
+///
+/// If a heading does not already carry an `id`, its inner text events are
+/// buffered until `TagEnd::Heading`, converted to a URL-safe slug, deduplicated
+/// against other headings on the page, and assigned to the heading start tag.
+struct HeadingIdAssigner<'a, I> {
+    iter: I,
+    slugger: HeadingSlugger,
+    queue: VecDeque<Event<'a>>,
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> HeadingIdAssigner<'a, I> {
+    fn new(iter: I) -> Self {
+        Self {
+            iter,
+            slugger: HeadingSlugger::default(),
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(event) = self.queue.pop_front() {
+            return Some(event);
+        }
+
+        let event = self.iter.next()?;
+        match event {
+            Event::Start(Tag::Heading {
+                level,
+                id,
+                classes,
+                attrs,
+            }) => {
+                let mut text = String::new();
+                let mut inner_events = Vec::new();
+                let mut end_level = None;
+
+                for next_event in self.iter.by_ref() {
+                    match next_event {
+                        Event::End(TagEnd::Heading(lvl)) => {
+                            end_level = Some(lvl);
+                            break;
+                        }
+                        Event::Text(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::Text(s));
+                        }
+                        Event::Code(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::Code(s));
+                        }
+                        Event::InlineMath(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::InlineMath(s));
+                        }
+                        Event::DisplayMath(s) => {
+                            text.push_str(&s);
+                            inner_events.push(Event::DisplayMath(s));
+                        }
+                        other => {
+                            inner_events.push(other);
+                        }
+                    }
+                }
+
+                let id_str = match id {
+                    Some(custom) => self.slugger.deduplicate(custom.as_ref()),
+                    None => self.slugger.slugify(&text),
+                };
+                self.queue.push_back(Event::Start(Tag::Heading {
+                    level,
+                    id: Some(CowStr::Boxed(id_str.into_boxed_str())),
+                    classes,
+                    attrs,
+                }));
+                self.queue.extend(inner_events);
+                if let Some(lvl) = end_level {
+                    self.queue.push_back(Event::End(TagEnd::Heading(lvl)));
+                }
+
+                self.queue.pop_front()
+            }
+            other => Some(other),
+        }
+    }
+}
+
+/// State for tracking and deduplicating heading slugs across a rendered page.
+#[derive(Default)]
+struct HeadingSlugger {
+    seen: HashSet<String>,
+    counts: HashMap<String, usize>,
+}
+
+impl HeadingSlugger {
+    fn slugify(&mut self, text: &str) -> String {
+        let base = slugify(text);
+        self.deduplicate(&base)
+    }
+
+    fn deduplicate(&mut self, base: &str) -> String {
+        let base = if base.is_empty() { "section" } else { base };
+        if self.seen.insert(base.to_string()) {
+            return base.to_string();
+        }
+        let counter = self.counts.entry(base.to_string()).or_insert(1);
+        loop {
+            let candidate = format!("{base}-{counter}");
+            *counter += 1;
+            if self.seen.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
+    }
+}
+
+/// Convert heading text to a URL-friendly slug.
+///
+/// Converts alphanumeric characters to lowercase, replaces whitespace,
+/// dashes and hyphens with `-` (collapsing consecutive separators),
+/// preserves underscores, and strips punctuation. Empty results fall back
+/// to `"section"`.
+fn slugify(text: &str) -> String {
+    let mut slug = String::with_capacity(text.len());
+    let mut prev_is_dash = false;
+
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                slug.push(lc);
+            }
+            prev_is_dash = false;
+        } else if c == '_' {
+            slug.push(c);
+            prev_is_dash = false;
+        } else if (c == '-' || c == '—' || c == '–' || c.is_whitespace())
+            && !slug.is_empty()
+            && !prev_is_dash
+        {
+            slug.push('-');
+            prev_is_dash = true;
+        }
+    }
+
+    let trimmed = slug.trim_end_matches('-');
+    if trimmed.is_empty() {
+        "section".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn sanitize_event<'a>(event: Event<'a>, workspace: &str, project: &str) -> Event<'a> {
     match event {
         Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
@@ -480,12 +638,13 @@ pub fn strip_leading_h1<'a>(body: &'a str, title: &str) -> &'a str {
     // Setext form: `Title\n====…` (1+ equals signs). Look ahead.
     if let Some((first_line, after_first)) = trimmed.split_once('\n')
         && !first_line.is_empty()
-        && let Some((second_line, after_second)) = after_first.split_once('\n')
-        && !second_line.is_empty()
-        && second_line.chars().all(|c| c == '=')
         && first_line.trim() == title
     {
-        return after_second.trim_start_matches(['\n', '\r']);
+        let (second_line, after_second) = after_first.split_once('\n').unwrap_or((after_first, ""));
+        let underline = second_line.trim_end_matches(['\r', ' ', '\t']);
+        if !underline.is_empty() && underline.chars().all(|c| c == '=') {
+            return after_second.trim_start_matches(['\n', '\r']);
+        }
     }
     body
 }
@@ -497,7 +656,7 @@ mod tests {
     #[test]
     fn renders_basic_markdown() {
         let html = render("# Hello\n\nworld", "default", "scratch");
-        assert!(html.contains("<h1>Hello</h1>"));
+        assert!(html.contains(r#"<h1 id="hello">Hello</h1>"#));
         assert!(html.contains("<p>world</p>"));
     }
 
@@ -651,6 +810,30 @@ mod tests {
         // `----` underlines are H2, not H1. Leave them alone.
         let out = strip_leading_h1("Title\n----\n\nbody\n", "Title");
         assert_eq!(out, "Title\n----\n\nbody\n");
+    }
+
+    #[test]
+    fn strip_setext_h1_handles_crlf_and_trailing_whitespace() {
+        let out = strip_leading_h1("Title\r\n=====\r\n\r\nbody\r\n", "Title");
+        assert_eq!(out, "body\r\n");
+
+        let out = strip_leading_h1("Title\n=====   \t\n\nbody\n", "Title");
+        assert_eq!(out, "body\n");
+
+        let out = strip_leading_h1("Title\r\n=====  \r\n\r\nbody\r\n", "Title");
+        assert_eq!(out, "body\r\n");
+
+        // Negative control: an underline with inner spaces is not a setext
+        // H1 underline — the heading must survive stripping.
+        let out = strip_leading_h1("Title\r\n== x ==\r\nbody", "Title");
+        assert_eq!(out, "Title\r\n== x ==\r\nbody");
+    }
+
+    #[test]
+    fn strip_setext_h1_handles_eof_without_trailing_newline() {
+        assert_eq!(strip_leading_h1("Title\n=====", "Title"), "");
+        assert_eq!(strip_leading_h1("Title\r\n=====\r", "Title"), "");
+        assert_eq!(strip_leading_h1("\r\n\r\nTitle\r\n=====", "Title"), "");
     }
 
     #[test]
@@ -1002,6 +1185,117 @@ mod tests {
         assert!(
             html.contains(r#"href="w/default/scratch/p/y.md""#),
             "repeated ./ must be stripped: {html}"
+        );
+    }
+
+    #[test]
+    fn heading_ids_are_emitted_for_all_levels() {
+        let md = "# Level 1\n\n## Level 2\n\n### Level 3\n\n#### Level 4\n\n##### Level 5\n\n###### Level 6";
+        let html = render(md, "default", "scratch");
+        assert!(html.contains(r#"<h1 id="level-1">Level 1</h1>"#), "{html}");
+        assert!(html.contains(r#"<h2 id="level-2">Level 2</h2>"#), "{html}");
+        assert!(html.contains(r#"<h3 id="level-3">Level 3</h3>"#), "{html}");
+        assert!(html.contains(r#"<h4 id="level-4">Level 4</h4>"#), "{html}");
+        assert!(html.contains(r#"<h5 id="level-5">Level 5</h5>"#), "{html}");
+        assert!(html.contains(r#"<h6 id="level-6">Level 6</h6>"#), "{html}");
+    }
+
+    #[test]
+    fn heading_ids_strip_punctuation_and_normalize_dashes() {
+        let md = "## What \"deleted\" means: purge & destroy?\n\n### Scenario D — menu bar app\n\n#### 1. Introduction (v1.0)";
+        let html = render(md, "default", "scratch");
+        assert!(
+            html.contains(r#"<h2 id="what-deleted-means-purge-destroy">"#),
+            "punctuation and symbols: {html}"
+        );
+        assert!(
+            html.contains(r#"<h3 id="scenario-d-menu-bar-app">"#),
+            "em dash: {html}"
+        );
+        assert!(
+            html.contains(r#"<h4 id="1-introduction-v10">"#),
+            "numbered heading: {html}"
+        );
+    }
+
+    #[test]
+    fn heading_ids_with_formatting_and_code() {
+        let md = "## Hello **bold** and `code` span";
+        let html = render(md, "default", "scratch");
+        assert!(
+            html.contains(
+                r#"<h2 id="hello-bold-and-code-span">Hello <strong>bold</strong> and <code>code</code> span</h2>"#
+            ),
+            "inline formatting: {html}"
+        );
+    }
+
+    #[test]
+    fn duplicate_headings_disambiguate_with_suffixes() {
+        let md = "## Context\n\n## Context\n\n## Context 1\n\n## Context";
+        let html = render(md, "default", "scratch");
+        assert!(html.contains(r#"<h2 id="context">Context</h2>"#), "{html}");
+        assert!(
+            html.contains(r#"<h2 id="context-1">Context</h2>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="context-1-1">Context 1</h2>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="context-2">Context</h2>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn empty_or_punctuation_only_headings_fall_back_to_section() {
+        let md = "## ???\n\n## !!!";
+        let html = render(md, "default", "scratch");
+        assert!(html.contains(r#"<h2 id="section">???</h2>"#), "{html}");
+        assert!(html.contains(r#"<h2 id="section-1">!!!</h2>"#), "{html}");
+    }
+
+    #[test]
+    fn heading_with_raw_html_and_quotes_escapes_markup_and_keeps_id_slug_safe() {
+        let md = "## <img src=x onerror=alert(1)> \"q\"";
+        let html = render(md, "default", "scratch");
+        assert!(
+            !html.contains("<img"),
+            "raw heading HTML must not survive as markup: {html}"
+        );
+        // Smart punctuation renders the quotes as “q”; the HTML payload must
+        // stay escaped text inside the heading.
+        assert!(
+            html.contains(r#"<h2 id="q">&lt;img src=x onerror=alert(1)&gt; “q”</h2>"#),
+            "the heading must render escaped text with a slug id: {html}"
+        );
+        let id = html
+            .split("id=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("no heading id emitted: {html}"));
+        assert!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+            "heading id must match ^[a-z0-9_-]+$, got: {id}"
+        );
+    }
+
+    #[test]
+    fn wikilink_anchor_matches_generated_heading_id() {
+        let md = "Jump to [[notes/foo#my-section|My Section]]\n\n## My Section";
+        let html = render(md, "default", "scratch");
+        assert!(
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md#my-section">My Section</a>"#),
+            "link href: {html}"
+        );
+        assert!(
+            html.contains(r#"<h2 id="my-section">My Section</h2>"#),
+            "heading id: {html}"
         );
     }
 }

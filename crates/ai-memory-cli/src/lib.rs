@@ -16,7 +16,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use clap::Parser;
 use tracing::info;
 
 mod auth_bearer;
@@ -44,7 +43,7 @@ pub async fn run() -> Result<()> {
         data_dir,
         config: config_path,
         command,
-    } = Cli::parse();
+    } = cli::parse_process();
 
     // Hooks fire on every tool call: they must be cheap and must emit ONLY
     // their JSON object to stdout. Short-circuit before config load and
@@ -108,6 +107,7 @@ pub async fn run() -> Result<()> {
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
         Command::Status(args) => commands::status::run(&config, args).await,
+        Command::ListProjects(args) => commands::list_projects::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,
         Command::Backfill(args) => commands::backfill::run(&config, args).await,
         Command::RepairBackfillTimestamps(args) => {
@@ -160,8 +160,10 @@ pub async fn run() -> Result<()> {
             commands::reclaim_ledger_versions::run(&config, args).await
         }
         Command::Backup(args) => commands::backup::run(&config, args).await,
+        Command::BackupAgents(args) => commands::backup_agents::run(&config, args),
         Command::ExportOkf(args) => commands::export_okf::run(&config, args).await,
         Command::Restore(args) => commands::restore::run(&config, args),
+        Command::RestoreAgents(args) => commands::restore_agents::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),
         // `Hook` is handled in the fast-path above (before config/tracing).
@@ -201,6 +203,7 @@ pub async fn run() -> Result<()> {
         Command::User(args) => commands::user::run(&config, args).await,
         Command::ApiKey(args) => commands::api_key::run(&config, args).await,
         Command::Project(args) => commands::project::run(&config, args).await,
+        Command::Profile(args) => commands::profile::run(&config, args).await,
         Command::Server(args) => commands::server::run(&config, args),
         // `Completions` is handled in the fast-path above (before config/tracing).
         Command::Completions(args) => commands::completions::run(args),

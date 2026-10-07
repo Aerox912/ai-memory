@@ -387,7 +387,9 @@ fn split_scope(target: &str) -> LinkKey {
         || lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return (None, None, target.to_string());
     }
@@ -785,7 +787,9 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
     if lower.starts_with("mailto:")
         || lower.starts_with("data:")
         || lower.starts_with("javascript:")
+        || lower.starts_with("vbscript:")
         || lower.starts_with("tel:")
+        || lower.starts_with("file:")
     {
         return None;
     }
@@ -1075,6 +1079,26 @@ mod tests {
         // `https://...` must not be parsed as project "https".
         let links = extract_links("[[https://example.com]] [[mailto:a@b.com]]", &page());
         assert!(links.is_empty(), "URLs/schemes are not links: {links:?}");
+    }
+
+    #[test]
+    fn extract_links_file_and_vbscript_schemes_are_not_scopes() {
+        // `/web` already leaves these literal. Without the same prefixes
+        // here, `[[file:notes/x.md]]` peels `file` as a project scope and
+        // indexes a cross-project edge no page write can satisfy.
+        let links = extract_links(
+            "[[file:notes/x.md]] [[vbscript:msgbox]] [[file:///etc/passwd]]",
+            &page(),
+        );
+        assert!(
+            links.is_empty(),
+            "file/vbscript schemes are not wiki links: {links:?}"
+        );
+        let md = extract_links("[x](file:notes/x.md) [y](vbscript:msgbox)", &page());
+        assert!(
+            md.is_empty(),
+            "file/vbscript markdown destinations are not wiki links: {md:?}"
+        );
     }
 
     #[test]

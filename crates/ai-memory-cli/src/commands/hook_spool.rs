@@ -30,9 +30,30 @@ use serde::{Deserialize, Serialize};
 
 use super::hook_capture::{BatchOutcome, PostOutcome, build_client, post_batch, post_hook};
 
-/// Drop a spooled event after this many failed drain passes — bounds retries of
-/// a permanently-undeliverable event (e.g. a server URL that never comes back).
-const MAX_ATTEMPTS: u32 = 8;
+/// Default number of failed drain passes before dropping an event — bounds
+/// retries of an event a server keeps refusing or erroring on. An
+/// unreachable endpoint never charges attempts; a dead address is bounded
+/// by the spool's TTL and file cap instead.
+#[cfg(test)]
+const MAX_ATTEMPTS: u32 = crate::config::DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS;
+
+/// Failed drain-pass limit resolved at the hook command boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxAttempts(u32);
+
+impl Default for MaxAttempts {
+    fn default() -> Self {
+        Self::new(crate::config::DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS)
+    }
+}
+
+impl MaxAttempts {
+    /// Preserve an explicitly configured limit, including zero (no attempt drop).
+    #[must_use]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+}
 /// Drop a spooled event older than this regardless of attempts (7 days), so a
 /// long-dead instance can't leave the spool growing without bound.
 const MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -84,8 +105,10 @@ pub struct SpoolEntry {
     /// from any other pool, preventing a misplaced spool from crossing domains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_id: Option<String>,
-    /// Failed delivery attempts so far — incremented on each drain miss and used
-    /// (with `created_ms`) to drop a permanently-undeliverable event.
+    /// Failed delivery attempts so far — incremented only when a delivery
+    /// actually reached a server and missed (never for an endpoint-level
+    /// outage) and used (with `created_ms`) to drop a
+    /// permanently-undeliverable event.
     #[serde(default)]
     pub attempts: u32,
     /// Server profile this event was routed to by its repository's marker
@@ -332,6 +355,7 @@ struct DrainRuntime<'a> {
     trusted_server_url: Option<&'a str>,
     static_bearer: Option<&'a str>,
     expected_pool_id: Option<&'a str>,
+    max_attempts: MaxAttempts,
 }
 
 /// Runtime-only trust boundary for one deployment pool.
@@ -351,6 +375,7 @@ impl<'a> From<TrustedPool<'a>> for DrainRuntime<'a> {
             trusted_server_url: Some(pool.server_url),
             static_bearer: pool.static_bearer,
             expected_pool_id: Some(pool.pool_id),
+            ..Self::default()
         }
     }
 }
@@ -426,6 +451,7 @@ pub async fn drain_exclusive(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
 ) -> Option<DrainResult> {
     match drain_exclusive_result_with_runtime(
         spool,
@@ -433,7 +459,10 @@ pub async fn drain_exclusive(
         total_budget,
         per_event_timeout,
         wait,
-        DrainRuntime::default(),
+        DrainRuntime {
+            max_attempts,
+            ..DrainRuntime::default()
+        },
     )
     .await
     {
@@ -444,6 +473,7 @@ pub async fn drain_exclusive(
 
 /// Run one exclusive production drain. Every request is rebound to
 /// `trusted_server_url`; `static_bearer` exists only in the live process.
+#[allow(clippy::too_many_arguments)]
 pub async fn drain_exclusive_trusted(
     spool: &Path,
     data_dir: &Path,
@@ -452,6 +482,7 @@ pub async fn drain_exclusive_trusted(
     wait: DrainLockWait,
     trusted_server_url: &str,
     static_bearer: Option<&str>,
+    max_attempts: MaxAttempts,
 ) -> Option<DrainResult> {
     match drain_exclusive_result_with_runtime(
         spool,
@@ -463,6 +494,7 @@ pub async fn drain_exclusive_trusted(
             trusted_server_url: Some(trusted_server_url),
             static_bearer,
             expected_pool_id: None,
+            max_attempts,
         },
     )
     .await
@@ -480,6 +512,7 @@ pub async fn drain_exclusive_trusted_pool(
     per_event_timeout: Duration,
     wait: DrainLockWait,
     pool: TrustedPool<'_>,
+    max_attempts: MaxAttempts,
 ) -> Option<DrainResult> {
     match drain_exclusive_result_with_runtime(
         spool,
@@ -487,7 +520,10 @@ pub async fn drain_exclusive_trusted_pool(
         total_budget,
         per_event_timeout,
         wait,
-        pool.into(),
+        DrainRuntime {
+            max_attempts,
+            ..pool.into()
+        },
     )
     .await
     {
@@ -519,13 +555,17 @@ pub async fn drain_exclusive_within_budget(
     data_dir: &Path,
     total_budget: Duration,
     per_event_timeout: Duration,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     drain_exclusive_within_budget_with_runtime(
         spool,
         data_dir,
         total_budget,
         per_event_timeout,
-        DrainRuntime::default(),
+        DrainRuntime {
+            max_attempts,
+            ..DrainRuntime::default()
+        },
     )
     .await
 }
@@ -538,6 +578,7 @@ pub async fn drain_exclusive_within_budget_trusted(
     per_event_timeout: Duration,
     trusted_server_url: &str,
     static_bearer: Option<&str>,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     drain_exclusive_within_budget_with_runtime(
         spool,
@@ -548,6 +589,7 @@ pub async fn drain_exclusive_within_budget_trusted(
             trusted_server_url: Some(trusted_server_url),
             static_bearer,
             expected_pool_id: None,
+            max_attempts,
         },
     )
     .await
@@ -560,13 +602,17 @@ pub async fn drain_exclusive_within_budget_trusted_pool(
     total_budget: Duration,
     per_event_timeout: Duration,
     pool: TrustedPool<'_>,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     drain_exclusive_within_budget_with_runtime(
         spool,
         data_dir,
         total_budget,
         per_event_timeout,
-        pool.into(),
+        DrainRuntime {
+            max_attempts,
+            ..pool.into()
+        },
     )
     .await
 }
@@ -614,6 +660,7 @@ pub async fn drain_until_quiescent(
     total_budget: Duration,
     per_event_timeout: Duration,
     wait: DrainLockWait,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     drain_until_quiescent_with_runtime(
         spool,
@@ -621,12 +668,16 @@ pub async fn drain_until_quiescent(
         total_budget,
         per_event_timeout,
         wait,
-        DrainRuntime::default(),
+        DrainRuntime {
+            max_attempts,
+            ..DrainRuntime::default()
+        },
     )
     .await
 }
 
 /// Hold the drain lock and keep draining a production spool until quiescent.
+#[allow(clippy::too_many_arguments)]
 pub async fn drain_until_quiescent_trusted(
     spool: &Path,
     data_dir: &Path,
@@ -635,6 +686,7 @@ pub async fn drain_until_quiescent_trusted(
     wait: DrainLockWait,
     trusted_server_url: &str,
     static_bearer: Option<&str>,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     drain_until_quiescent_with_runtime(
         spool,
@@ -646,6 +698,7 @@ pub async fn drain_until_quiescent_trusted(
             trusted_server_url: Some(trusted_server_url),
             static_bearer,
             expected_pool_id: None,
+            max_attempts,
         },
     )
     .await
@@ -659,6 +712,7 @@ pub async fn drain_until_quiescent_trusted_pool(
     per_event_timeout: Duration,
     wait: DrainLockWait,
     pool: TrustedPool<'_>,
+    max_attempts: MaxAttempts,
 ) -> std::io::Result<LockedDrainResult> {
     drain_until_quiescent_with_runtime(
         spool,
@@ -666,7 +720,10 @@ pub async fn drain_until_quiescent_trusted_pool(
         total_budget,
         per_event_timeout,
         wait,
-        pool.into(),
+        DrainRuntime {
+            max_attempts,
+            ..pool.into()
+        },
     )
     .await
 }
@@ -732,10 +789,10 @@ async fn drain_until_quiescent_with_runtime(
 /// drain transparently falls back to per-event `POST /hook`.
 ///
 /// A delivered event is deleted; a failed one is charged a retry attempt
-/// (dropped at `MAX_ATTEMPTS`); a `429` (saturation) deletes any accepted prefix
-/// the server reports, then retries the rest untouched so it never burns the
-/// retry budget. OIDC bearer is resolved + refreshed at most once per drain and
-/// cached.
+/// (dropped at the configured limit, unless it is zero); a `429` (saturation)
+/// deletes any accepted prefix the server reports, then retries the rest
+/// untouched so it never burns the retry budget. OIDC bearer is resolved and
+/// refreshed at most once per drain and cached.
 ///
 /// Best-effort: returns counts and never errors, so a session boundary is never
 /// blocked beyond the budget and never fails the agent.
@@ -746,17 +803,40 @@ pub async fn drain(
     total_budget: Duration,
     per_event_timeout: Duration,
 ) -> DrainResult {
+    drain_with_max_attempts(
+        spool,
+        data_dir,
+        total_budget,
+        per_event_timeout,
+        MaxAttempts::new(MAX_ATTEMPTS),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub async fn drain_with_max_attempts(
+    spool: &Path,
+    data_dir: &Path,
+    total_budget: Duration,
+    per_event_timeout: Duration,
+    max_attempts: MaxAttempts,
+) -> DrainResult {
     drain_with_live_token(
         spool,
         data_dir,
         total_budget,
         per_event_timeout,
         live_static_token().as_deref(),
+        max_attempts,
     )
     .await
 }
 
-/// [`drain`] with the current static bearer supplied explicitly.
+/// [`drain_with_max_attempts`] with the current static bearer supplied explicitly.
+///
+/// The live token and retry policy are resolved at the command boundary and
+/// passed down as data. Tests drive this directly, so drain behavior is isolated
+/// from ambient process configuration.
 #[cfg(test)]
 pub async fn drain_with_live_token(
     spool: &Path,
@@ -764,6 +844,7 @@ pub async fn drain_with_live_token(
     total_budget: Duration,
     per_event_timeout: Duration,
     live_token: Option<&str>,
+    max_attempts: MaxAttempts,
 ) -> DrainResult {
     drain_with_runtime(
         spool,
@@ -772,6 +853,7 @@ pub async fn drain_with_live_token(
         per_event_timeout,
         DrainRuntime {
             static_bearer: live_token,
+            max_attempts,
             ..DrainRuntime::default()
         },
     )
@@ -826,6 +908,7 @@ async fn drain_with_runtime(
     let mut oidc_cache: Option<Option<String>> = None; // outer None = not yet resolved
     let mut profile_tokens = ProfileTokens::new(data_dir);
     let mut result = DrainResult::default();
+    let max_attempts = runtime.max_attempts.0;
 
     let mut idx = 0;
     let mut batch_supported = true;
@@ -839,8 +922,11 @@ async fn drain_with_runtime(
     //
     // Recording the dead endpoint lets the pass skip its entries (without
     // charging attempts they did not earn) and carry on to entries addressed
-    // somewhere that answers. A total outage is unchanged: every entry shares
-    // the one dead endpoint, so the pass still ends having burnt one attempt.
+    // somewhere that answers. A total outage keeps the same pass shape —
+    // every entry shares the one dead endpoint — but no longer costs an
+    // attempt: an endpoint-level miss never charges the entry's retry
+    // budget, so an outage is ridden out (bounded by the 10k file cap and
+    // the 7-day TTL) instead of deleting the oldest events.
     let mut unreachable_endpoints: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // Resolved on first need only — a healthy drain never reads the config.
@@ -870,7 +956,7 @@ async fn drain_with_runtime(
             continue;
         }
         if body_is_malformed(&entry) {
-            bump_or_drop(&path, &entry, &mut result);
+            bump_or_drop(&path, &entry, max_attempts, &mut result);
             continue;
         }
 
@@ -917,7 +1003,7 @@ async fn drain_with_runtime(
                     continue;
                 }
                 if body_is_malformed(&next_entry) {
-                    bump_or_drop(&next_path, &next_entry, &mut result);
+                    bump_or_drop(&next_path, &next_entry, max_attempts, &mut result);
                     continue;
                 }
                 // A profile entry never shares a request with another route,
@@ -952,7 +1038,7 @@ async fn drain_with_runtime(
             }
 
             let Some(payload) = batch_payload(&chunk) else {
-                bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                 result.remaining += chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                 break;
             };
@@ -974,7 +1060,7 @@ async fn drain_with_runtime(
                         // (fail-fast). Charge it a failed attempt and skip past it
                         // so a single bad event can't wedge the rest — the
                         // per-event loop also advances past a failed entry.
-                        bump_or_drop(&chunk[k].0, &chunk[k].1, &mut result);
+                        bump_or_drop(&chunk[k].0, &chunk[k].1, max_attempts, &mut result);
                         result.remaining +=
                             chunk.len().saturating_sub(k + 1) + files.len().saturating_sub(idx);
                         break;
@@ -987,7 +1073,12 @@ async fn drain_with_runtime(
                     let sent = delete_accepted_indices(&chunk, &indices);
                     result.sent += sent;
                     if let Some(failed_index) = failed_index.and_then(|i| chunk.get(i).map(|_| i)) {
-                        bump_or_drop(&chunk[failed_index].0, &chunk[failed_index].1, &mut result);
+                        bump_or_drop(
+                            &chunk[failed_index].0,
+                            &chunk[failed_index].1,
+                            max_attempts,
+                            &mut result,
+                        );
                         result.remaining += chunk.len().saturating_sub(sent).saturating_sub(1)
                             + files.len().saturating_sub(idx);
                         break;
@@ -1053,7 +1144,7 @@ async fn drain_with_runtime(
                                 result.remaining += 1;
                             }
                             PostOutcome::Failed => {
-                                bump_or_drop(path, entry, &mut result);
+                                bump_or_drop(path, entry, max_attempts, &mut result);
                             }
                             PostOutcome::Refused => {
                                 // Never retried: see `PostOutcome::Refused`.
@@ -1064,9 +1155,11 @@ async fn drain_with_runtime(
                             }
                             PostOutcome::Unreachable => {
                                 // Same reasoning as the batch arm: the address
-                                // is dead, not the entry. Charge it once, then
-                                // skip its siblings for the rest of the pass.
-                                bump_or_drop(path, entry, &mut result);
+                                // is dead, not the entry — an endpoint-level
+                                // outage never charges the retry budget. Leave
+                                // it queued and skip its siblings for the rest
+                                // of the pass.
+                                result.remaining += 1;
                                 unreachable_endpoints.insert(batch_endpoint(&entry.url));
                             }
                             PostOutcome::Unauthorized => {
@@ -1096,7 +1189,7 @@ async fn drain_with_runtime(
                                     let _ = std::fs::remove_file(path);
                                     result.sent += 1;
                                 } else {
-                                    bump_or_drop(path, entry, &mut result);
+                                    bump_or_drop(path, entry, max_attempts, &mut result);
                                 }
                             }
                         }
@@ -1133,6 +1226,10 @@ async fn drain_with_runtime(
                         (rerooted != base).then_some(rerooted)
                     });
 
+                    // Whether the configured-address retry reached a server
+                    // that answered — any HTTP status is post-connect and
+                    // keeps today's charging semantics for the entry tried.
+                    let mut reroot_answered = false;
                     if let Some(rerooted) = retry {
                         match post_batch(
                             &client,
@@ -1158,17 +1255,37 @@ async fn drain_with_runtime(
                                 result.remaining += chunk.len().saturating_sub(sent);
                                 continue;
                             }
-                            // The configured address is no better. Fall through
-                            // to the skip path below rather than trying again.
-                            _ => {}
+                            // The configured address is itself unreachable:
+                            // still an endpoint-level outage — fall through to
+                            // the no-charge skip path below.
+                            BatchOutcome::Unreachable => {}
+                            // The configured address answered but did not take
+                            // the batch: post-connect, charge conservatively as
+                            // before the outage fix.
+                            _ => {
+                                reroot_answered = true;
+                            }
                         }
                     }
 
-                    // Charge the entry actually tried so a permanently dead
-                    // address still ages out, mark the endpoint, and keep
-                    // going: entries addressed elsewhere are still deliverable.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
-                    result.remaining += chunk.len().saturating_sub(1);
+                    if reroot_answered {
+                        // A server answered and refused: charge the entry
+                        // actually tried, mark the endpoint, and keep going:
+                        // entries addressed elsewhere are still deliverable.
+                        bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
+                        result.remaining += chunk.len().saturating_sub(1);
+                    } else {
+                        // Endpoint-level outage: no server was ever reached,
+                        // so the entry did not fail delivery — leave the whole
+                        // chunk queued WITHOUT charging attempts. Charging
+                        // here burnt the queue head's budget once per pass,
+                        // deleting the OLDEST events at ~1 per `max_attempts`
+                        // passes while the server was down — structural data
+                        // loss ahead of the 7-day TTL. A permanently dead
+                        // address stays bounded by that TTL and the 10k file
+                        // cap instead.
+                        result.remaining += chunk.len();
+                    }
                     unreachable_endpoints.insert(base.clone());
                     continue;
                 }
@@ -1216,7 +1333,7 @@ async fn drain_with_runtime(
 
                     // Same conservative accounting as `Failed`: the server
                     // refused the whole batch, so nothing in it was processed.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                     result.remaining +=
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
@@ -1229,7 +1346,7 @@ async fn drain_with_runtime(
                     // conservatively and leave the rest queued for a future pass so
                     // a timeout cannot burn attempts for events that may never have
                     // been attempted.
-                    bump_or_drop(&chunk[0].0, &chunk[0].1, &mut result);
+                    bump_or_drop(&chunk[0].0, &chunk[0].1, max_attempts, &mut result);
                     result.remaining +=
                         chunk.len().saturating_sub(1) + files.len().saturating_sub(idx);
                     break;
@@ -1260,10 +1377,14 @@ async fn drain_with_runtime(
                     result.dropped += 1;
                 }
                 PostOutcome::Failed => {
-                    bump_or_drop(&path, &entry, &mut result);
+                    bump_or_drop(&path, &entry, max_attempts, &mut result);
                 }
                 PostOutcome::Unreachable => {
-                    bump_or_drop(&path, &entry, &mut result);
+                    // Endpoint-level outage: the address is dead, not the
+                    // entry — leave it queued without charging attempts (the
+                    // batch arm above explains why), and skip its siblings
+                    // for the rest of the pass.
+                    result.remaining += 1;
                     unreachable_endpoints.insert(batch_endpoint(&entry.url));
                 }
                 PostOutcome::Unauthorized => {
@@ -1293,7 +1414,7 @@ async fn drain_with_runtime(
                         let _ = std::fs::remove_file(&path);
                         result.sent += 1;
                     } else {
-                        bump_or_drop(&path, &entry, &mut result);
+                        bump_or_drop(&path, &entry, max_attempts, &mut result);
                     }
                 }
             }
@@ -1609,12 +1730,12 @@ fn batch_payload(items: &[(PathBuf, SpoolEntry)]) -> Option<String> {
 }
 
 /// Charge a spooled entry a failed delivery attempt: drop it once it reaches
-/// `MAX_ATTEMPTS`, else persist the bumped count for the next boundary. Updates
+/// the configured limit (unless zero), else persist the bumped count. Updates
 /// `result.dropped` / `result.remaining` accordingly.
-fn bump_or_drop(path: &Path, entry: &SpoolEntry, result: &mut DrainResult) {
+fn bump_or_drop(path: &Path, entry: &SpoolEntry, max_attempts: u32, result: &mut DrainResult) {
     let mut bumped = entry.clone();
     bumped.attempts = bumped.attempts.saturating_add(1);
-    if bumped.attempts >= MAX_ATTEMPTS {
+    if max_attempts != 0 && bumped.attempts >= max_attempts {
         let _ = std::fs::remove_file(path);
         result.dropped += 1;
     } else {
@@ -1967,6 +2088,202 @@ mod tests {
         assert_eq!(list_entries(&spool).unwrap().0.len(), 2);
     }
 
+    /// Adversarial regression for the outage-charging defect: while the
+    /// server is totally down, every drain pass hits the queue head with an
+    /// endpoint-level unreachable (connect refused — nothing is listening).
+    /// With the default `max_attempts`, the pre-fix drain charged the head
+    /// once per pass, deleting the OLDEST events at ~1 per `max_attempts`
+    /// passes DURING the outage — structural data loss well inside the
+    /// 7-day TTL. An unreachable must not charge the attempt budget.
+    #[tokio::test]
+    async fn unreachable_outage_never_charges_attempt_budget() {
+        // A port with nothing on it: bind, read the address, then drop.
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{dead}/hook?event=e{i}"),
+            );
+        }
+
+        // Far more passes than the default MAX_ATTEMPTS: an outage, however
+        // long, must never consume retry budget.
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let r = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(200),
+                MaxAttempts::new(MAX_ATTEMPTS),
+            )
+            .await;
+            assert_eq!(r.sent, 0);
+            assert_eq!(r.dropped, 0, "an unreachable endpoint must not drop events");
+            assert_eq!(r.remaining, 3);
+        }
+
+        // ALL entries survive the outage untouched.
+        assert_eq!(
+            sorted_attempts(&spool),
+            vec![0, 0, 0],
+            "no entry may be charged while the server is unreachable"
+        );
+    }
+
+    /// The recovery half of the outage contract: once the server comes back
+    /// on the same port, the next pass delivers the entire backlog that
+    /// rode out the outage.
+    #[tokio::test]
+    async fn outage_then_recovery_delivers_the_entire_backlog() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // Phase 1 — outage: nothing listens where the events were captured.
+        let dead_addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        for i in 0..3 {
+            write_spool_entry(
+                &spool,
+                &format!("evt-{i}.json"),
+                format!("http://{dead_addr}/hook?event=e{i}"),
+            );
+        }
+
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            let r = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(200),
+                MaxAttempts::new(MAX_ATTEMPTS),
+            )
+            .await;
+            assert_eq!(r.dropped, 0);
+            assert_eq!(r.remaining, 3);
+        }
+        assert_eq!(sorted_attempts(&spool), vec![0, 0, 0]);
+
+        // Phase 2 — recovery: the server restarts on the same port. The
+        // listener never accepted, so the port carries no TIME_WAIT and the
+        // rebind is immediate.
+        let listener = tokio::net::TcpListener::bind(dead_addr)
+            .await
+            .expect("restart on the same port after the outage");
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 65536];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let (status, body) = if req
+                        .lines()
+                        .next()
+                        .is_some_and(|l| l.contains("/hook/batch"))
+                    {
+                        let payload = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                        let accepted = serde_json::from_str::<serde_json::Value>(payload)
+                            .ok()
+                            .and_then(|v| v.as_array().map(Vec::len))
+                            .unwrap_or(0);
+                        ("200 OK", format!("{{\"accepted\":{accepted}}}"))
+                    } else {
+                        ("202 Accepted", "queued".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let r = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 3, "the whole backlog is delivered after recovery");
+        assert_eq!(r.remaining, 0);
+        assert!(
+            list_entries(&spool).unwrap().0.is_empty(),
+            "spool emptied after the server came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_keeps_entry_when_first_response_is_408() {
+        // A 408 from the server is retryable, not a terminal refusal: the
+        // drain must keep the entry queued (charged one attempt) so a later
+        // pass can still deliver it, subject to the retry limit. Treating
+        // every 4xx as permanent deleted such events on the spot (#1092
+        // regression).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Answer every request (batch first) with 408 until the drain
+            // gives up on this pass.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        enqueue(
+            &spool,
+            &entry_for(
+                format!("http://{addr}/hook?event=e0"),
+                "{}".into(),
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+
+        let r = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(2),
+            Duration::from_millis(500),
+            MaxAttempts::new(MAX_ATTEMPTS),
+        )
+        .await;
+
+        assert_eq!(r.sent, 0);
+        assert_eq!(r.dropped, 0, "a 408 first response must not drop the entry");
+        let (files, _) = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1, "the entry stays queued for the next pass");
+        let entry: SpoolEntry = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(
+            entry.attempts, 1,
+            "the retryable miss is charged one attempt"
+        );
+    }
+
     /// #493: an unreadable spool must not read as an idle pass.
     ///
     /// `list_entries` used to be `read_dir(spool).ok()?`, so a permissions or
@@ -2073,6 +2390,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(100),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2094,6 +2412,7 @@ mod tests {
             tmp.path(),
             Duration::ZERO,
             Duration::from_millis(100),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .unwrap();
@@ -2125,6 +2444,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(2),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .expect("lock acquired");
@@ -2150,6 +2470,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(100),
             DrainLockWait::NoWait,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await
         .unwrap_err();
@@ -2162,34 +2483,232 @@ mod tests {
 
     #[tokio::test]
     async fn drain_drops_event_after_max_attempts() {
+        // Control for the outage fix: a server that ANSWERS with 5xx is a
+        // post-connect failure and keeps today's charging semantics — one
+        // attempt per pass, drop at the limit. (An endpoint-level
+        // unreachable never charges; see
+        // `unreachable_outage_never_charges_attempt_budget`.)
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "500 Internal Server Error").await;
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
-        let e = entry_for(
-            "http://127.0.0.1:1/hook?event=dead".into(),
-            "{}".into(),
-            None,
-            false,
-        );
-        enqueue(&spool, &e).unwrap();
-        let mut dropped = 0;
-        for _ in 0..MAX_ATTEMPTS {
-            dropped += drain(
+        write_spool_entry(&spool, "evt-0.json", format!("http://{addr}/hook?event=e0"));
+        for pass in 1..=MAX_ATTEMPTS {
+            let r = drain_with_max_attempts(
                 &spool,
                 tmp.path(),
                 Duration::from_secs(2),
-                Duration::from_millis(100),
+                Duration::from_millis(500),
+                MaxAttempts::new(MAX_ATTEMPTS),
             )
-            .await
-            .dropped;
+            .await;
+            assert_eq!(
+                r.dropped,
+                usize::from(pass == MAX_ATTEMPTS),
+                "the erroring event is dropped exactly at MAX_ATTEMPTS"
+            );
+            if pass < MAX_ATTEMPTS {
+                assert_eq!(sorted_attempts(&spool), vec![pass]);
+            }
         }
         assert_eq!(
-            dropped, 1,
-            "the dead event is dropped once it hits MAX_ATTEMPTS"
+            req_count.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_ATTEMPTS as usize,
+            "the server answered every pass — post-connect, not an outage"
         );
         assert!(
             list_entries(&spool).unwrap().0.is_empty(),
             "spool is empty after the drop"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_max_attempts_keeps_failing_event_after_twenty_drains() {
+        // An explicit zero means "never drop for attempts": a server that
+        // keeps answering 5xx charges the entry on every pass (post-connect
+        // failures still bump attempts), and twenty charged passes later it
+        // is still queued. Uses the 5xx server because an unreachable
+        // endpoint no longer charges attempts at all.
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count.clone(), "500 Internal Server Error").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=dead"),
+        );
+
+        for _ in 0..20 {
+            let result = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(500),
+                MaxAttempts::new(0),
+            )
+            .await;
+            assert_eq!(result.dropped, 0);
+            assert_eq!(result.remaining, 1);
+        }
+        let files = list_entries(&spool).unwrap().0;
+        assert_eq!(files.len(), 1);
+        let entry: SpoolEntry = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+        assert_eq!(entry.attempts, 20);
+    }
+
+    #[tokio::test]
+    async fn explicit_max_attempts_isolated_from_ambient_zero() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_HOOK_SPOOL_AMBIENT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert_eq!(
+                std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").as_deref(),
+                Ok("0")
+            );
+            // A 5xx server, not a dead port: an unreachable endpoint no
+            // longer charges attempts, and this test asserts a one-pass drop.
+            let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let addr = serve_counting_hook(req_count, "500 Internal Server Error").await;
+            let tmp = tempfile::tempdir().unwrap();
+            let spool = spool_dir(tmp.path());
+            write_spool_entry(
+                &spool,
+                "evt-0.json",
+                format!("http://{addr}/hook?event=dead"),
+            );
+
+            let result = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                MaxAttempts::new(1),
+            )
+            .await;
+
+            assert_eq!(result.dropped, 1);
+            assert!(list_entries(&spool).unwrap().0.is_empty());
+            println!("ambient-zero-isolated");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("commands::hook_spool::tests::explicit_max_attempts_isolated_from_ambient_zero")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("ambient-zero-isolated"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_pool_drain_honors_retry_policy_without_charging_foreign_entries() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(hits.clone(), "500 Internal Server Error").await;
+        let base = format!("http://{addr}");
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        for (name, pool_id) in [("own.json", "personal"), ("foreign.json", "rws")] {
+            let mut entry = entry_for(format!("{base}/hook?event=stop"), "{}".into(), None, false);
+            entry.pool_id = Some(pool_id.into());
+            std::fs::write(spool.join(name), serde_json::to_vec(&entry).unwrap()).unwrap();
+        }
+        let result = drain_exclusive_trusted_pool(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            DrainLockWait::NoWait,
+            TrustedPool {
+                server_url: &base,
+                static_bearer: None,
+                pool_id: "personal",
+            },
+            MaxAttempts::new(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.dropped, 1);
+        assert_eq!(result.remaining, 1);
+        assert!(!spool.join("own.json").exists());
+        let foreign: SpoolEntry =
+            serde_json::from_slice(&std::fs::read(spool.join("foreign.json")).unwrap()).unwrap();
+        assert_eq!(foreign.attempts, 0);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_max_attempts_drops_after_three_drains() {
+        // A 5xx server keeps charging one attempt per pass (post-connect),
+        // so an explicit limit of 3 drops the entry on the third pass.
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count, "500 Internal Server Error").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=dead"),
+        );
+
+        for pass in 1..=3 {
+            let result = drain_with_max_attempts(
+                &spool,
+                tmp.path(),
+                Duration::from_secs(2),
+                Duration::from_millis(100),
+                MaxAttempts::new(3),
+            )
+            .await;
+            assert_eq!(result.dropped, usize::from(pass == 3));
+            assert_eq!(result.remaining, usize::from(pass < 3));
+        }
+        assert!(list_entries(&spool).unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_max_attempts_still_drops_stale_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        std::fs::create_dir_all(&spool).unwrap();
+        let mut entry = entry_for(
+            "http://127.0.0.1:1/hook?event=old".into(),
+            "{}".into(),
+            None,
+            false,
+        );
+        entry.created_ms = now_ms().saturating_sub(MAX_AGE_MS + 1);
+        std::fs::write(
+            spool.join("stale.json"),
+            serde_json::to_vec(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let result = drain_with_max_attempts(
+            &spool,
+            tmp.path(),
+            Duration::from_secs(2),
+            Duration::from_millis(100),
+            MaxAttempts::new(0),
+        )
+        .await;
+
+        assert_eq!(result.dropped, 1);
+        assert!(list_entries(&spool).unwrap().0.is_empty());
     }
 
     #[tokio::test]
@@ -2345,8 +2864,8 @@ mod tests {
         let loaded: SpoolEntry =
             serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
         assert_eq!(
-            loaded.attempts, 1,
-            "the entry actually attempted is charged exactly once"
+            loaded.attempts, 0,
+            "an endpoint-level miss must not charge the entry actually attempted"
         );
     }
 
@@ -2496,6 +3015,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("same"),
+            MaxAttempts::default(),
         )
         .await;
 
@@ -2767,6 +3287,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("rotated-new"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2799,6 +3320,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             None,
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2831,6 +3353,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -2876,6 +3399,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(500),
             Some("A-LIVE"),
+            MaxAttempts::new(MAX_ATTEMPTS),
         )
         .await;
 
@@ -3541,6 +4065,7 @@ mod tests {
                 trusted_server_url: Some(&trusted_url),
                 static_bearer: Some("runtime-secret"),
                 expected_pool_id: None,
+                max_attempts: MaxAttempts::default(),
             },
         )
         .await;
@@ -3606,6 +4131,7 @@ mod tests {
                 trusted_server_url: Some(&default_url),
                 static_bearer: Some("install-secret"),
                 expected_pool_id: Some("personal"),
+                max_attempts: MaxAttempts::default(),
             },
         )
         .await;
@@ -3644,6 +4170,7 @@ mod tests {
                 trusted_server_url: Some(&trusted_url),
                 static_bearer: None,
                 expected_pool_id: None,
+                max_attempts: MaxAttempts::default(),
             },
         )
         .await;
@@ -3680,6 +4207,7 @@ mod tests {
                 trusted_server_url: Some(&trusted_url),
                 static_bearer: Some("rws-secret"),
                 expected_pool_id: Some("rws"),
+                max_attempts: MaxAttempts::default(),
             },
         )
         .await;
@@ -3722,6 +4250,7 @@ mod tests {
                 trusted_server_url: Some(&trusted_url),
                 static_bearer: Some("rws-secret"),
                 expected_pool_id: Some("rws"),
+                max_attempts: MaxAttempts::default(),
             },
         )
         .await;
@@ -3763,6 +4292,7 @@ mod tests {
                 trusted_server_url: Some(&trusted_url),
                 static_bearer: Some("rws-secret"),
                 expected_pool_id: Some("rws"),
+                max_attempts: MaxAttempts::default(),
             },
         )
         .await;
@@ -3882,15 +4412,18 @@ mod tests {
 
     #[tokio::test]
     async fn drain_stays_robust_when_retry_count_cannot_persist() {
+        // A 5xx server, not a dead port: the pass must actually attempt the
+        // bump-persist path this test blocks, and an unreachable endpoint no
+        // longer charges attempts at all.
+        let req_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(req_count, "500 Internal Server Error").await;
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
-        let e = entry_for(
-            "http://127.0.0.1:1/hook?event=stuck".into(),
-            "{}".into(),
-            None,
-            false,
+        write_spool_entry(
+            &spool,
+            "evt-0.json",
+            format!("http://{addr}/hook?event=stuck"),
         );
-        enqueue(&spool, &e).unwrap();
 
         // Make the atomic rewrite fail in a way that survives root (the Docker gate
         // runs as root, so a chmod read-only dir wouldn't fault): occupy the entry's
