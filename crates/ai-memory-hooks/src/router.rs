@@ -16796,7 +16796,10 @@ mod tests {
             "body carries no trace of redaction — the sanitizer never saw \
              enough of the secret to match it: {body:?}"
         );
-        assert!(body.len() <= cap, "body exceeded the {cap}-byte cap: {body:?}");
+        assert!(
+            body.len() <= cap,
+            "body exceeded the {cap}-byte cap: {body:?}"
+        );
     }
 
     #[tokio::test]
@@ -16915,7 +16918,8 @@ mod tests {
             .iter()
             .find(|o| o.kind == ObservationKind::PostToolUse)
             .expect("post-tool-use observation was recorded")
-            .body;
+            .body
+            .clone();
         assert!(body.contains('é'));
         assert!(
             body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
