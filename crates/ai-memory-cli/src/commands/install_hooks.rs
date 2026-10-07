@@ -11467,9 +11467,8 @@ model = "gpt-5"
             "non-2xx still fails the notification: {notify}"
         );
         assert!(
-            extension.contains(
-                "try { await mcpNotify(\"notifications/initialized\"); } catch (_e) {}"
-            ),
+            extension
+                .contains("try { await mcpNotify(\"notifications/initialized\"); } catch (_e) {}"),
             "bootstrap must call mcpNotify: {extension}"
         );
         assert!(
