@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now kept by both, and by the PreCompact and PostCompaction checkpoints,
   which rewrote it the same way. The write no longer stamps
   `observation_generation`. (#1138)
+- Fixed the Pi extension sending `notifications/initialized` as a JSON-RPC
+  request with an id: JSON-RPC 2.0 and MCP notifications do not carry an id and
+  expect no response body, which caused the server to emit `-32601`
+  method-not-found warnings on every Pi launch. The generated extension now
+  uses `mcpNotify` to send notifications without an id and accept empty
+  successful HTTP responses without failing JSON parsing. (#1136)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
