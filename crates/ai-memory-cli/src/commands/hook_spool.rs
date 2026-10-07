@@ -2096,7 +2096,7 @@ mod tests {
                 "the erroring event is dropped exactly at MAX_ATTEMPTS"
             );
             if pass < MAX_ATTEMPTS {
-                assert_eq!(sorted_attempts(&spool), vec![pass as u32]);
+                assert_eq!(sorted_attempts(&spool), vec![pass]);
             }
         }
         assert_eq!(
