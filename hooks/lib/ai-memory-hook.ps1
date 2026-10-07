@@ -673,6 +673,191 @@ function Get-AiMemoryStateDir {
     return ".ai-memory"
 }
 
+# --- offline spool -----------------------------------------------------
+# Parity with the shell bundle (`ai_memory_spool_event` /
+# `ai_memory_drain_spool` / `ai_memory_kick_drain` in hooks/_lib.sh): an
+# undelivered event is written to `<state dir>/hook-spool/` in the same
+# on-disk contract `ai-memory hook-drain` reads — same
+# `<ms:013>-<pid>-<seq:016x>.json` file name, same `SpoolEntry` JSON
+# fields, tmp+rename — so the native drainer, the shell bundle, and this
+# bundle consume one another's entries on a shared data dir. A down server
+# then costs latency instead of the event.
+
+function Get-AiMemorySpoolDir {
+    return (Join-Path (Get-AiMemoryStateDir) "hook-spool")
+}
+
+# Best-effort chmod for the pwsh-on-Unix case: the shell and native writers
+# keep the spool 0700/0600 (the spool holds private capture until it
+# drains). `chmod` is absent or a no-op on Windows, where the profile-scoped
+# data dir already restricts access.
+function Set-AiMemoryPrivateMode {
+    param([string] $Path, [string] $Mode)
+    if (Get-Command chmod -ErrorAction SilentlyContinue) {
+        & chmod $Mode $Path 2>$null
+    }
+}
+
+# Persist one undelivered event. Like every capture path here this is
+# best-effort: each failure is swallowed so a hook never fails because of
+# the spool.
+function Write-AiMemorySpoolEvent {
+    param([string] $Url, [string] $Body)
+    try {
+        $dir = Get-AiMemorySpoolDir
+        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+        Set-AiMemoryPrivateMode -Path $dir -Mode "700"
+        if (-not $script:AiMemorySpoolSeq) { $script:AiMemorySpoolSeq = 0 }
+        $script:AiMemorySpoolSeq = $script:AiMemorySpoolSeq + 1
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        # Same name shape as the shell/native writers, so lexical order is
+        # enqueue order for every reader of the directory.
+        $name = "{0:D13}-{1}-{2:x16}.json" -f $now, $PID, $script:AiMemorySpoolSeq
+        $entry = [ordered]@{
+            url = $Url
+            body = $Body
+            created_ms = $now
+        }
+        if ($env:AI_MEMORY_AUTH_TOKEN) {
+            # The credential this hook's own POST would have carried, stored
+            # in the 0600 entry rather than on any command line.
+            $entry["auth_mode"] = "static"
+            $entry["token"] = $env:AI_MEMORY_AUTH_TOKEN
+        } else {
+            $entry["auth_mode"] = "none"
+        }
+        $entry["attempts"] = 0
+        # PS 5.1 escapes a few ASCII characters (`<`, `&`, …) as \uXXXX. The
+        # emitted JSON stays a valid SpoolEntry; the shell drain leaves such
+        # entries to `ai-memory hook-drain` by design, and the native
+        # drainer and ConvertFrom-Json decode them.
+        $json = ConvertTo-Json -InputObject $entry -Compress
+        $tmp = Join-Path $dir "$name.tmp"
+        $final = Join-Path $dir $name
+        # WriteAllText is UTF-8 without a BOM in both engines, which the
+        # native drainer's parser requires.
+        [IO.File]::WriteAllText($tmp, $json)
+        Set-AiMemoryPrivateMode -Path $tmp -Mode "600"
+        Move-Item -Force -Path $tmp -Destination $final -ErrorAction Stop
+    } catch {
+        if ($tmp -and (Test-Path $tmp -ErrorAction SilentlyContinue)) {
+            Remove-Item -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Deliver the queued backlog, oldest first (name order is enqueue order).
+# Mirrors `ai_memory_drain_spool`: bounded by count so a pass never becomes
+# an unbounded upload, a 2xx or a 4xx retires the entry (delivered, or a
+# permanent rejection that must not be retried), and anything else stops
+# the pass and keeps the remainder for the next one. The per-entry timeout
+# is this bundle's own POST budget. ConvertFrom-Json reads every escape
+# either serializer emits, so entries written by the shell bundle or the
+# native binary drain here too.
+function Invoke-AiMemoryDrainSpool {
+    param([int] $Max = 64)
+    try {
+        $dir = Get-AiMemorySpoolDir
+        if (-not (Test-Path $dir -PathType Container)) { return }
+        # -Filter alone can match 8.3 short names on Windows; the extension
+        # re-check keeps a writer's in-flight `*.json.tmp` out of the pass.
+        $files = @(
+            Get-ChildItem -LiteralPath $dir -Filter "*.json" -File -ErrorAction Stop |
+                Where-Object { $_.Extension -eq ".json" } |
+                Sort-Object Name
+        )
+    } catch {
+        return
+    }
+    $count = 0
+    foreach ($file in $files) {
+        if ($count -ge $Max) { break }
+        $count = $count + 1
+        try {
+            $entry = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            continue
+        }
+        if (-not $entry.url) { continue }
+        $headers = @{}
+        if ($entry.auth_mode -eq "static" -and $entry.token) {
+            $headers["Authorization"] = "Bearer $($entry.token)"
+        }
+        $code = 0
+        try {
+            Invoke-WebRequest `
+                -UseBasicParsing `
+                -TimeoutSec 3 `
+                -Method Post `
+                -Uri ([string]$entry.url) `
+                -Headers $headers `
+                -ContentType "application/json" `
+                -Body ([Text.Encoding]::UTF8.GetBytes([string]$entry.body)) | Out-Null
+            $code = 200
+        } catch {
+            $response = $_.Exception.Response
+            if ($response) {
+                try { $code = [int]$response.StatusCode } catch { $code = 0 }
+            }
+        }
+        if (($code -ge 200 -and $code -lt 300) -or ($code -ge 400 -and $code -lt 500)) {
+            Remove-Item -Force -LiteralPath $file.FullName -ErrorAction SilentlyContinue
+        } else {
+            break
+        }
+    }
+}
+
+# Piggyback drain: a delivery that just succeeded proves the server is
+# reachable, so flush the backlog behind it — detached, so the agent never
+# waits, and a no-op when nothing is queued (every call on a healthy
+# install).
+#
+# Detach idiom: this bundle had no background-job or Start-Process pattern
+# to copy (each hook script is already its own short-lived process), so the
+# kick re-runs the running engine on this same lib file in drain mode
+# through System.Diagnostics.Process:
+# - CreateNoWindow with UseShellExecute=$false never flashes a console
+#   window on Windows and behaves identically under pwsh on Linux/macOS;
+# - RedirectStandardOutput/Error keep the child off THIS hook's stdout
+#   pipe — the agent reads that pipe to EOF, and a detached child holding
+#   the inherited handle would stall the hook's own completion (the shell
+#   bundle's `( ... >/dev/null 2>&1 &)` is that same protection). Drain
+#   mode writes nothing, so the unread redirected pipes never fill.
+function Invoke-AiMemoryKickDrain {
+    try {
+        $dir = Get-AiMemorySpoolDir
+        if (-not (Test-Path $dir -PathType Container)) { return }
+        $queued = @(
+            Get-ChildItem -LiteralPath $dir -Filter "*.json" -File -ErrorAction Stop |
+                Where-Object { $_.Extension -eq ".json" } |
+                Select-Object -First 1
+        )
+        if (-not $queued.Count) { return }
+        if (-not $script:AiMemoryLibFile) { return }
+        # Re-invoke the engine already running this hook; fall back to any
+        # PowerShell on PATH if the current process's binary cannot be
+        # resolved.
+        $engine = $null
+        try { $engine = (Get-Process -Id $PID -ErrorAction Stop).Path } catch { }
+        if (-not $engine) {
+            $cmd = Get-Command pwsh -ErrorAction SilentlyContinue
+            if (-not $cmd) { $cmd = Get-Command powershell -ErrorAction SilentlyContinue }
+            if ($cmd) { $engine = $cmd.Source }
+        }
+        if (-not $engine) { return }
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $engine
+        $startInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" --ai-memory-drain-spool 64' -f $script:AiMemoryLibFile
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $null = [System.Diagnostics.Process]::Start($startInfo)
+    } catch {
+    }
+}
+
 function Get-AiMemorySessionIdPath {
     param([string] $Agent)
     return (Join-Path (Join-Path (Get-AiMemoryStateDir) "hook-state") "$Agent-session-id")
@@ -833,21 +1018,40 @@ function Invoke-AiMemoryHook {
         $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
     }
 
-    # This POST is the only producer on this path (no spool, no drain here).
-    # Session identity and the handoff/briefing GET below are delivery, so an
-    # external owner leaves them, and the stdout contract, alone.
+    # Capture producer path, with the shell bundle's offline-spool parity
+    # (hooks/_lib.sh): a 2xx kicks a detached backlog drain, a terminal 4xx
+    # is a permanent rejection and is dropped, and anything undeliverable
+    # (connection failure, timeout, 5xx) is spooled for the drain to retry.
+    # Session identity and the handoff/briefing GET below are delivery, so
+    # an external owner leaves them, and the stdout contract, alone.
     if (-not (Test-AiMemoryCaptureOwnedExternally)) {
         $BodyBytes = [Text.Encoding]::UTF8.GetBytes($Payload)
+        # The idempotency key is minted before the POST and rides any spooled
+        # replay too, so the server can discard a replay whose original
+        # response was lost after the observation committed — the same
+        # reason the shell bundle mints `ai_memory_ingest_key`. `ps` plus a
+        # GUID's hex fits the server's key grammar.
+        $HookUrl = "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS&ingest_key=ps$([Guid]::NewGuid().ToString('N').Substring(0, 16))"
         try {
             Invoke-WebRequest `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
-                -Uri "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS" `
+                -Uri $HookUrl `
                 -Headers $Headers `
                 -ContentType "application/json; charset=utf-8" `
                 -Body $BodyBytes | Out-Null
+            Invoke-AiMemoryKickDrain
         } catch {
+            $Status = 0
+            if ($_.Exception.Response) {
+                try { $Status = [int]$_.Exception.Response.StatusCode } catch { $Status = 0 }
+            }
+            # 4xx = permanent rejection (not retried); everything else that
+            # failed to deliver is spooled.
+            if ($Status -lt 400 -or $Status -ge 500) {
+                Write-AiMemorySpoolEvent -Url $HookUrl -Body $Payload
+            }
         }
     }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
@@ -989,4 +1193,25 @@ function Invoke-AiMemoryHook {
     } elseif ($AntigravityPreInvocationOutput) {
         [Console]::Out.Write("{}")
     }
+}
+
+# This file's own path, captured at load time: top-level `$PSCommandPath` is
+# the lib's full path whether a hook script dot-sources it or the engine
+# runs it directly in drain mode, so `Invoke-AiMemoryKickDrain`'s child can
+# be pointed back at exactly this file.
+$script:AiMemoryLibFile = $PSCommandPath
+
+# Detached-drain entry mode: `Invoke-AiMemoryKickDrain` re-runs this file as
+# `powershell -NoProfile -ExecutionPolicy Bypass -File <lib>
+# --ai-memory-drain-spool <max>`. The bespoke token cannot arrive from an
+# agent (hook input is stdin JSON, and dot-sourcing passes no arguments),
+# and this mode prints nothing and always exits 0, so a redirected detached
+# child can never pollute or stall a hook's stdout.
+if ($args -contains "--ai-memory-drain-spool") {
+    $AiMemoryDrainMax = 64
+    foreach ($AiMemoryArg in $args) {
+        if ($AiMemoryArg -match '^[0-9]+$') { $AiMemoryDrainMax = [int]$AiMemoryArg }
+    }
+    $null = Invoke-AiMemoryDrainSpool -Max $AiMemoryDrainMax
+    exit 0
 }

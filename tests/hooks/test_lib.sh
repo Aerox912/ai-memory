@@ -640,6 +640,43 @@ assert_eq "post_hook spools an undelivered event" "1" \
 
 unset AI_MEMORY_DATA_DIR
 
+# --- PowerShell bundle spool parity (static) ---------------------------
+# The PS lib shares this offline-spool contract (same <data>/hook-spool
+# dir, same entry writer, same dispatch as `ai_memory_post_hook`: 2xx kicks
+# a detached drain, a terminal 4xx is dropped, everything undeliverable is
+# spooled), so a Windows script install loses no events during a server
+# outage either (#580 parity). Static first — no pwsh needed — then a
+# behavioral probe where pwsh exists.
+PS_LIB="$(dirname "$0")/../../hooks/lib/ai-memory-hook.ps1"
+PS_SPOOL_STATIC=$(grep -q 'function Write-AiMemorySpoolEvent' "$PS_LIB" \
+    && grep -q 'function Invoke-AiMemoryDrainSpool' "$PS_LIB" \
+    && grep -q 'function Invoke-AiMemoryKickDrain' "$PS_LIB" \
+    && grep -Fq '"hook-spool"' "$PS_LIB" \
+    && grep -Fq '"{0:D13}-{1}-{2:x16}.json"' "$PS_LIB" \
+    && grep -Fq '"auth_mode"' "$PS_LIB" \
+    && grep -Fq 'Write-AiMemorySpoolEvent -Url' "$PS_LIB" \
+    && grep -Fq 'Invoke-AiMemoryKickDrain' "$PS_LIB" \
+    && grep -Fq 'if ($Status -lt 400 -or $Status -ge 500) {' "$PS_LIB" \
+    && grep -Fq -- '--ai-memory-drain-spool' "$PS_LIB" \
+    && grep -Fq '$script:AiMemoryLibFile = $PSCommandPath' "$PS_LIB" \
+    && grep -Fq 'RedirectStandardOutput' "$PS_LIB" \
+    && printf ok || printf bad)
+assert_eq "powershell bundle spools undelivered events (static)" "ok" "$PS_SPOOL_STATIC"
+# The ingest key must ride the initial POST too, or an ambiguous delivery
+# and its spooled replay could double-ingest (the reason the shell bundle
+# mints `ai_memory_ingest_key` before the first POST).
+PS_KEY_STATIC=$(grep -Fq '&ingest_key=ps$(' "$PS_LIB" \
+    && printf ok || printf bad)
+assert_eq "powershell POST and spool replay share an ingest key (static)" "ok" "$PS_KEY_STATIC"
+
+if command -v pwsh >/dev/null 2>&1; then
+    PS_SPOOL_OUT=$(pwsh -NoProfile -File "$(dirname "$0")/test_spool_ps.ps1" "$(host_path "$PS_LIB")" 2>&1) \
+        && PASS=$((PASS + $(printf '%s\n' "$PS_SPOOL_OUT" | sed -n 's/.*checks=\([0-9]*\).*/\1/p') )) \
+        || { FAIL=$((FAIL + 1)); printf '  FAIL powershell spool behavioral probe\n%s\n' "$PS_SPOOL_OUT"; }
+else
+    printf '  skip powershell spool behavioral probe (pwsh unavailable)\n'
+fi
+
 # --- external capture ownership (AI_MEMORY_CAPTURE_OWNER) -------------
 # A wrapper, extension or managed launcher that already produces this
 # session's capture events announces itself with AI_MEMORY_CAPTURE_OWNER.

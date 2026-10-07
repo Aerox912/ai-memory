@@ -18,8 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file cap and 7-day spool TTL bounds are unchanged. Also corrected the
   stale `hooks/_lib.sh` comment that claimed the backlog is drained at
   session boundaries only (a piggyback drain also runs after any
-  successful 2xx POST). (#NNN)
-
+  successful 2xx POST). (#1121)
+- Fixed the PowerShell hook bundle silently losing every capture event
+  during a server outage: the `.ps1` path now spools an undeliverable POST
+  (connection failure, timeout, or 5xx) to the same `<data_dir>/hook-spool/`
+  on-disk contract the shell bundle, the native hooks, and
+  `ai-memory hook-drain` share — same `<ms>-<pid>-<seq>.json` entry names,
+  same `SpoolEntry` JSON — and, like `ai_memory_post_hook`, kicks a detached
+  bounded drain (≤64 entries) after the next successful delivery, retires
+  entries on a 2xx or a terminal 4xx, and never spools a routed-repository
+  or externally-owned capture event. The PowerShell POST also mints an
+  idempotency `ingest_key` before its initial attempt and keeps it on the
+  spooled replay, so an ambiguous delivery that committed server-side is
+  discarded on replay instead of double-ingested. (#1122)
 
 ## [2.6.0] - 2026-10-07
 
