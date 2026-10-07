@@ -16,6 +16,9 @@
 //! - **Cross-project links resolve** and carry their real workspace/project.
 //! - **The walk honours per-project authorization (#708):** a viewer never
 //!   sees, nor walks through, a page in a project they cannot read.
+//! - **The walk honours page TTL:** an expired neighbour is neither
+//!   returned nor walked through. The seed lookup is an exact-path read
+//!   and still starts from an expired page.
 
 use ai_memory_core::{NewPage, NewUser, PagePath, ProjectId, Tier, UserId, WorkspaceId};
 use ai_memory_store::{
@@ -435,5 +438,222 @@ async fn the_walk_hides_and_does_not_cross_projects_the_viewer_cannot_read() {
             "secret:notes/s.md".to_string(),
             "secret:notes/t.md".to_string(),
         ]
+    );
+}
+
+fn expired_at() -> jiff::Timestamp {
+    "2000-01-01T00:00:00Z".parse().unwrap()
+}
+
+fn future_at() -> jiff::Timestamp {
+    "2099-01-01T00:00:00Z".parse().unwrap()
+}
+
+fn with_expiry(mut page: NewPage, expires_at: jiff::Timestamp) -> NewPage {
+    page.expires_at = Some(expires_at);
+    page
+}
+
+/// Expired neighbours stay off the retrieval graph the same way #708
+/// hides unreadable projects: they are not returned, and a live page
+/// reachable only through one is not returned either. A live neighbour
+/// and a neighbour whose TTL is still in the future remain visible.
+///
+/// ```text
+///   live.md ◀── a.md ──▶ expired.md ──▶ only_via_expired.md
+///                 │
+///                 └──▶ future.md
+///   live_in.md ──▶ a.md ◀── expired_in.md
+/// ```
+#[tokio::test]
+async fn the_walk_hides_and_does_not_cross_expired_neighbours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+
+    for page in [
+        page_with_links(ws, app, "notes/live.md", vec![]),
+        page_with_links(ws, app, "notes/only_via_expired.md", vec![]),
+        page_with_links(
+            ws,
+            app,
+            "notes/live_in.md",
+            vec![same_project_link("notes/a.md")],
+        ),
+        with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired.md",
+                vec![same_project_link("notes/only_via_expired.md")],
+            ),
+            expired_at(),
+        ),
+        with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired_in.md",
+                vec![same_project_link("notes/a.md")],
+            ),
+            expired_at(),
+        ),
+        with_expiry(
+            page_with_links(ws, app, "notes/future.md", vec![]),
+            future_at(),
+        ),
+        page_with_links(
+            ws,
+            app,
+            "notes/a.md",
+            vec![
+                same_project_link("notes/live.md"),
+                same_project_link("notes/expired.md"),
+                same_project_link("notes/future.md"),
+            ],
+        ),
+    ] {
+        store.writer.upsert_page(page).await.unwrap();
+    }
+
+    let paths = |depth: u8| {
+        let reader = store.reader.clone();
+        async move {
+            let mut seen: Vec<String> = reader
+                .related_walk(ws, app, "notes/a.md".into(), depth, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|n| n.page.path)
+                .collect();
+            seen.sort();
+            seen
+        }
+    };
+
+    assert_eq!(
+        paths(1).await,
+        vec![
+            "notes/future.md".to_string(),
+            "notes/live.md".to_string(),
+            "notes/live_in.md".to_string(),
+        ],
+        "expired outgoing and incoming neighbours are hidden; live and future TTL stay"
+    );
+    assert_eq!(
+        paths(RELATED_WALK_MAX_DEPTH).await,
+        vec![
+            "notes/future.md".to_string(),
+            "notes/live.md".to_string(),
+            "notes/live_in.md".to_string(),
+        ],
+        "only_via_expired is reachable only through expired.md, so it stays hidden"
+    );
+
+    // Exact-path seed lookup still starts from an expired page; its live
+    // neighbour is then a retrieval hop and is returned.
+    let mut from_expired: Vec<String> = store
+        .reader
+        .related_walk(ws, app, "notes/expired.md".into(), 1, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| n.page.path)
+        .collect();
+    from_expired.sort();
+    assert_eq!(
+        from_expired,
+        vec![
+            "notes/a.md".to_string(),
+            "notes/only_via_expired.md".to_string(),
+        ],
+        "walking from an expired seed still returns its live neighbours"
+    );
+}
+
+/// `page_links` is the single-hop primitive the web link panel calls.
+/// Same TTL gate as `related_walk`: expired far ends are omitted, live
+/// and future-TTL far ends remain, in both directions.
+#[tokio::test]
+async fn page_links_hides_expired_neighbours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+
+    for page in [
+        page_with_links(ws, app, "notes/live.md", vec![]),
+        page_with_links(
+            ws,
+            app,
+            "notes/live_in.md",
+            vec![same_project_link("notes/a.md")],
+        ),
+        with_expiry(
+            page_with_links(ws, app, "notes/expired.md", vec![]),
+            expired_at(),
+        ),
+        with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired_in.md",
+                vec![same_project_link("notes/a.md")],
+            ),
+            expired_at(),
+        ),
+        with_expiry(
+            page_with_links(ws, app, "notes/future.md", vec![]),
+            future_at(),
+        ),
+        page_with_links(
+            ws,
+            app,
+            "notes/a.md",
+            vec![
+                same_project_link("notes/live.md"),
+                same_project_link("notes/expired.md"),
+                same_project_link("notes/future.md"),
+            ],
+        ),
+    ] {
+        store.writer.upsert_page(page).await.unwrap();
+    }
+
+    let links = store
+        .reader
+        .page_links(ws, app, "notes/a.md".into(), None)
+        .await
+        .unwrap();
+    let mut outgoing: Vec<&str> = links.links.iter().map(|p| p.path.as_str()).collect();
+    outgoing.sort_unstable();
+    let mut incoming: Vec<&str> = links.backlinks.iter().map(|p| p.path.as_str()).collect();
+    incoming.sort_unstable();
+    assert_eq!(
+        outgoing,
+        vec!["notes/future.md", "notes/live.md"],
+        "expired outgoing neighbour is hidden; live and future TTL stay"
+    );
+    assert_eq!(
+        incoming,
+        vec!["notes/live_in.md"],
+        "expired incoming neighbour is hidden; live backlink stays"
     );
 }
