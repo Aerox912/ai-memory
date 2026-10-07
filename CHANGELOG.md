@@ -75,6 +75,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `class=provider status=400`) instead of the error's `Display`, which for a
   provider failure includes the upstream response body. The default path
   (no `answer`) is unchanged. (#1132)
+- Hermes `post_tool_call` payloads now capture the tool result and a proven
+  outcome. Hermes nests the tool result at `extra.result` and mirrors the
+  call status at `extra.status`; the extractor previously read only
+  top-level `tool_output`/`tool_response`/`result`, so every Hermes
+  observation body read `(no output captured)` and the outcome stayed
+  `unknown` forever. Output now comes from `extra.result` (falling back to
+  `extra.error_message`), and `extra.status` of `ok`/`error` maps to
+  `success`/`error`. Recognized Hermes tool names that execute code or
+  reach the web (`execute_code`, `browser_exec`, `browser_navigate`,
+  `web_extract`, `web_fetch`, `delegate_task`) classify as `non-file`
+  instead of `unknown`, so their output is no longer dropped by the
+  unknown-family body shortcut. Payload shape verified against Hermes
+  `agent/shell_hooks.py` on 2026-10-07. (#1123)
 
 ## [2.6.0] - 2026-10-07
 

@@ -905,6 +905,17 @@ fn safe_tool_body(
                 raw.pointer("/tool_result/text_result_for_llm")
                     .and_then(value_to_text)
                     .or_else(|| extract_content(raw, &["error"]))
+            } else if agent == AgentKind::Hermes {
+                // Hermes 3.x nests the tool result inside `extra.result`
+                // (`agent/shell_hooks.py::_payload_fields` keeps everything
+                // not in the top-level key set inside `extra`). Read only
+                // that documented field plus `error_message` so unrelated
+                // `extra` telemetry (task_id, middleware_trace, …) never
+                // leaks in through an object-stringify fallback.
+                raw.pointer("/extra/result")
+                    .and_then(value_to_text)
+                    .or_else(|| raw.pointer("/extra/error_message").and_then(value_to_text))
+                    .or_else(|| extract_content(raw, &["error"]))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -2202,6 +2213,151 @@ mod tests {
         );
         assert_eq!(unknown.agent, AgentKind::Other);
         assert!(unknown.title_hint.is_none());
+    }
+
+    /// Hermes 3.x puts the tool result inside `extra.result` and mirrors the
+    /// call status in `extra.status` (`ok` | `error`). The extractor must read
+    /// both from the documented `extra` object: output lands in the body
+    /// instead of "(no output captured)", and a proven status maps to a real
+    /// outcome instead of permanent `unknown`. Live-captured 2026-10-07 from
+    /// `agent/shell_hooks.py::_payload_fields` +
+    /// `model_tools.py::_emit_post_tool_call_hook` (Hermes main).
+    #[test]
+    fn hermes_output_and_outcome_come_from_the_extra_object() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "execute_code",
+            "tool_input": {"code": "print(1)"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {
+                "tool_call_id": "call-43",
+                "status": "ok",
+                "result": {"output": "1", "exit_code": 0}
+            }
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.contains("tool_family: non-file"), "body: {body}");
+        assert_eq!(env.title_hint.as_deref(), Some("tool non-file"));
+        assert!(
+            body.contains("outcome: success"),
+            "status ok must map to success — body: {body}"
+        );
+        assert!(
+            body.contains("\"output\": \"1\"") || body.contains("exit_code"),
+            "extra.result content must appear in the body — body: {body}"
+        );
+    }
+
+    #[test]
+    fn hermes_error_status_maps_to_error_outcome() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "terminal",
+            "tool_input": {"command": "false"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {
+                "tool_call_id": "call-44",
+                "status": "error",
+                "error_message": "command failed with exit code 1",
+                "result": "command failed"
+            }
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.contains("outcome: error"), "body: {body}");
+    }
+
+    /// A truly unknown tool name keeps the upstream privacy invariant: the
+    /// family gates output capture, so `unknown` still omits the body. Real
+    /// Hermes tools that execute code or reach the web are named in
+    /// `family()` and classify as `non-file` (see
+    /// `hermes_documented_tool_names_map_to_canonical_families`); a brand-new
+    /// Hermes tool degrades to metadata-only until its name is upstreamed —
+    /// capture fidelity is preserved by extending the list, not by relaxing
+    /// the unknown-family gate.
+    #[test]
+    fn hermes_unknown_family_keeps_metadata_only_invariant() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "brand_new_tool",
+            "tool_input": {"query": "x"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {
+                "tool_call_id": "call-45",
+                "status": "ok",
+                "result": "search hit count: 3"
+            }
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        let body = env.body_excerpt.expect("post-tool-use body");
+        assert!(body.contains("tool_family: unknown"), "body: {body}");
+        assert!(body.contains("outcome: success"), "body: {body}");
+        assert!(
+            !body.contains("search hit count: 3"),
+            "unknown family must not leak output — body: {body}"
+        );
+    }
+
+    /// Real Hermes execution-surface tools classify as non-file so their
+    /// bodies carry the `extra.result` output (live names, 2026-10-07).
+    #[test]
+    fn hermes_execution_tools_classify_non_file_and_capture_output() {
+        for tool in ["execute_code", "browser_exec", "web_extract"] {
+            let raw = serde_json::json!({
+                "hook_event_name": "post_tool_call",
+                "tool_name": tool,
+                "tool_input": {"query": "x"},
+                "session_id": "hermes-session",
+                "cwd": "/repo",
+                "extra": {
+                    "tool_call_id": "call-46",
+                    "status": "ok",
+                    "result": "CAPTURE-ME-42"
+                }
+            });
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("hermes".into()),
+                    ..Default::default()
+                },
+                raw,
+            );
+            let body = env.body_excerpt.unwrap_or_default();
+            assert!(
+                body.contains("tool_family: non-file"),
+                "{tool} should be non-file — body: {body}"
+            );
+            assert!(
+                body.contains("CAPTURE-ME-42"),
+                "{tool} output must be captured — body: {body}"
+            );
+        }
     }
 
     #[test]
