@@ -1,6 +1,8 @@
 //! Wire envelope received on `POST /hook`.
 
-use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, truncate_utf8_bytes};
+use ai_memory_core::{
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, truncate_utf8_bytes,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
@@ -1229,7 +1231,15 @@ fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: us
             continue;
         };
         if text.len() > max_bytes {
-            *field = serde_json::Value::String(truncate_utf8_bytes(&text, max_bytes));
+            // Scrub the full text before capping it. The client cannot see
+            // the server's `[sanitize]` extras, but the built-in patterns
+            // cover the credential classes and the server re-scrubs the
+            // capped field with its configured sanitizer; truncating first
+            // would cut a straddling secret in half and persist an
+            // unmatchable prefix (#1114), the class #980 / #1109 fixed.
+            // Same order as `assistant_capture::transform_for_client`.
+            let scrubbed = Sanitizer::builtin().scrub(&text);
+            *field = serde_json::Value::String(truncate_utf8_bytes(&scrubbed, max_bytes));
             changed = true;
         }
     }
@@ -2488,6 +2498,35 @@ mod tests {
             &mut raw,
             HookEvent::SessionStart
         ));
+    }
+
+    /// Regression for #1114 (client side): an oversized lifecycle body is
+    /// scrubbed with the built-in sanitizer **before** the spool cap runs, so
+    /// a secret straddling the cutoff is redacted whole instead of being cut
+    /// into an unmatchable prefix that the spool — and later the server —
+    /// persists in clear text. Mirrors `transform_for_client` (#196) and the
+    /// #980 / #1109 scrub-before-cap fixes.
+    #[test]
+    fn client_body_cap_scrubs_before_truncating() {
+        // AWS access key id shape: a built-in pattern.
+        let secret = format!("AKIA{}", "A".repeat(16));
+        let mut raw = serde_json::json!({
+            "prompt": format!("{} {secret}", "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES - 14)),
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        let capped = raw["prompt"].as_str().expect("oversized prompt capped");
+        assert!(
+            !capped.contains("AKIA"),
+            "unredacted secret fragment survived the cap: {capped:?}"
+        );
+        assert!(
+            capped.contains("[REDACTED:"),
+            "capped prompt carries no redaction marker: {capped:?}"
+        );
+        assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
     }
 
     /// Kimi Code's content-block `prompt` must flatten into the title
