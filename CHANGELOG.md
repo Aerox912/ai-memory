@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed hook observation bodies being capped *before* the sanitizer ever saw
+  them: excerpt extraction (`tool: …` bodies, user prompts, notifications,
+  post-compaction summaries, extension bodies) applied its 2 KB / 16 KB
+  ceilings at parse time, so a secret straddling the cutoff was cut in half
+  and the surviving prefix, too short to match a pattern, was stored
+  unredacted — the body-side twin of the #980 title-hint leak. The per-event
+  caps (`payload::durable_body_cap`) now run at the ingest funnel, applied to
+  the already-scrubbed text, mirroring `Sanitized::new` and the #1109
+  feedback-reason fix. The stored body shapes and byte limits are unchanged.
+  (#1114)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
