@@ -11394,9 +11394,11 @@ model = "gpt-5"
         assert!(extension.contains(
             "async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void>"
         ));
-        assert!(extension.contains(
-            "body: JSON.stringify({ jsonrpc: \"2.0\", method, params: params ?? {} })"
-        ));
+        assert!(
+            extension.contains(
+                "body: JSON.stringify({ jsonrpc: \"2.0\", method, params: params ?? {} })"
+            )
+        );
         assert!(extension.contains("mcpRpc(\"tools/list\""));
         assert!(extension.contains("pi.registerTool"));
         assert!(extension.contains("label: tool.name"));
@@ -11429,6 +11431,50 @@ model = "gpt-5"
         assert!(
             !extension.contains("pi.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
             "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
+        );
+    }
+
+    /// #1136: `notifications/initialized` is a JSON-RPC notification. The
+    /// generated `mcpNotify` helper must omit `id`, must not parse a 2xx
+    /// body (the server answers 202 empty), and must be the only path
+    /// `bootstrapMcpBridge` uses for that method.
+    #[test]
+    fn pi_mcp_bridge_sends_initialized_as_a_jsonrpc_notification() {
+        let extension =
+            build_pi_extension("http://127.0.0.1:49374/base", Some("tok"), None, "denylist");
+
+        let notify_start = extension
+            .find("async function mcpNotify(")
+            .expect("mcpNotify must be generated");
+        let notify_end = extension[notify_start..]
+            .find("function toolInputSchema")
+            .expect("toolInputSchema follows mcpNotify");
+        let notify = &extension[notify_start..notify_start + notify_end];
+        assert!(
+            notify.contains("JSON.stringify({ jsonrpc: \"2.0\", method, params: params ?? {} })"),
+            "notification JSON must omit id: {notify}"
+        );
+        assert!(
+            !notify.contains("\"id\""),
+            "mcpNotify must not mint an id member: {notify}"
+        );
+        assert!(
+            !notify.contains("response.json"),
+            "empty 202 must not be parsed as JSON: {notify}"
+        );
+        assert!(
+            notify.contains("if (!response.ok)"),
+            "non-2xx still fails the notification: {notify}"
+        );
+        assert!(
+            extension.contains(
+                "try { await mcpNotify(\"notifications/initialized\"); } catch (_e) {}"
+            ),
+            "bootstrap must call mcpNotify: {extension}"
+        );
+        assert!(
+            !extension.contains("mcpRpc(\"notifications/initialized\""),
+            "bootstrap must not send initialized through mcpRpc"
         );
     }
 
