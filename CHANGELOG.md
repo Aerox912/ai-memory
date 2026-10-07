@@ -3166,7 +3166,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   if it opens the file. `docs/install.md` and `docs/usage.md` carry the same note
   beside the `--target AGENTS.md` guidance, and this repository's own `CLAUDE.md`
   now uses the import instead of a prose pointer (#680).
-
 ### Fixed
 - A `purge-session` whose page-file cleanup failed was undone by the next
   watcher pass. The cleanup failure is reported in `files_failed` and leaves
@@ -4652,7 +4651,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a session with nothing else to name drops the clause instead of filling
   it. The predicate lives beside the writer and is derived from the same serde
   representation, so a new `ToolFamily` variant cannot escape it. (#527)
-
 ## [1.36.0-aerox.1] - 2026-08-30
 
 ### Changed
@@ -8733,7 +8731,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v2.6.0-aerox.1...HEAD
+[2.6.0-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v2.6.0-aerox.1
 [2.6.0]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...v2.6.0
 [2.5.2]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...v2.5.2
 [2.5.1]: https://github.com/akitaonrails/ai-memory/compare/v2.5.0...v2.5.1
@@ -8757,11 +8756,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.39.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.39.0
 [1.38.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.38.0
 [1.37.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.37.0
+[1.36.0-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.36.0-aerox.1
 [1.36.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.36.0
 [1.35.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.35.0
 [1.34.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.34.0
 [1.33.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.1
 [1.33.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.33.0
+[1.32.2-aerox.2]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.2-aerox.2
+[1.32.2-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v1.32.2-aerox.1
 [1.32.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.2
 [1.32.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.1
 [1.32.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.32.0
