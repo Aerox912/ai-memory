@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redacted `class`/`status` summary (for example
   `class=provider status=400`) instead of the error's `Display`, which for a
   provider failure includes the upstream response body. The default path
-  (no `answer`) is unchanged. (#PRNUM)
+  (no `answer`) is unchanged. (#1132)
 
 ## [2.6.0] - 2026-10-07
 
