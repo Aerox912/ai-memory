@@ -1175,13 +1175,17 @@ pub(crate) fn finish_run(
             &event.metadata,
         );
         let metadata_json = serde_json::to_string(&metadata)?;
-        let content =
-            ai_memory_core::truncate_utf8_bytes(&event.content, WORKSTREAM_CONTENT_MAX_BYTES);
-        latest += 1;
         // Store-boundary bound (defense in depth): the hook layer already
-        // scrubs and normalizes event content, but the store is the last gate
-        // before durable persistence — bound the free-text `content` so a
-        // caller that ever forgets cannot write unbounded prose to the DB.
+        // scrubs and caps event content, but the store is the last gate
+        // before durable persistence — scrub with the caller's sanitizer and
+        // then bound the free-text `content`, so a caller that ever forgets
+        // cannot write unbounded prose (or a secret straddling the cap, cut
+        // into an unmatched prefix, #1113) to the DB.
+        let content = ai_memory_core::truncate_utf8_bytes(
+            &input.sanitizer.scrub(&event.content),
+            WORKSTREAM_CONTENT_MAX_BYTES,
+        );
+        latest += 1;
         tx.execute(
             "INSERT INTO workstream_events( \
                  workstream_id, sequence, event_id, agent_kind, native_session_id, \

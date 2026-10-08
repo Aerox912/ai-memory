@@ -56,6 +56,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotency `ingest_key` before its initial attempt and keeps it on the
   spooled replay, so an ambiguous delivery that committed server-side is
   discarded on replay instead of double-ingested. (#1122)
+- Fixed the scheduled auto-improve tests' intermittent empty log captures
+  (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
+  `warn!` callsite's first-in-process execution on a bare thread caches
+  `Interest::never()`, after which no per-test `set_default` capture ever
+  sees the event under single-process harnesses (libtest, Windows CI). The
+  tick outcome now carries the typed `failure_summaries` and
+  `skipped_proposals` the warnings mirror, and the tests assert those
+  instead of a captured log stream. Logged messages and levels are
+  unchanged. (#1118)
+- Fixed the managed-workstream ledger capping event content *before* the
+  sanitizer ever saw it: the 64 KiB per-event cap in
+  `hooks::workstream::sanitize_events` truncated first, so a secret
+  straddling the cutoff was cut into a prefix too short to match any
+  pattern and persisted unredacted in the immutable raw segment — the same
+  ordering bug as the #980 title-hint and #1109 feedback-reason leaks. The
+  cap now runs after scrubbing, the server-generated checkpoint and losses
+  boundary events get the same ordering, and the store's `finish_run`
+  scrubs with the caller's sanitizer before its own 16 KiB bound as
+  defense in depth. The stored shapes and byte limits are unchanged.
+  (#1113)
+- Fixed SessionEnd replacing the session page an agent wrote itself through
+  `memory_write_page` with `session_id`: the rule-based summary overwrote it
+  on every substantive session end, and the opt-in SessionEnd worker's skip
+  never applied, since it read the page after that overwrite and compared an
+  observation count that the agent's own tool call, the Stop and the
+  SessionEnd always advance. A session page carrying `consolidated_by: agent`
+  is now kept by both, and by the PreCompact and PostCompaction checkpoints,
+  which rewrote it the same way. The write no longer stamps
+  `observation_generation`. (#1138)
+- Fixed `ai-memory run claude` resuming the launch session forever after a
+  `/clear`: Claude Code continues a cleared conversation in a new session,
+  and the workstream now follows it — the newest one after several clears —
+  so the next launch resumes where the work actually went and that
+  transcript, not the abandoned one, is imported. Only a transcript that
+  records the `/clear` command, names this launch's session as its origin,
+  and stays in this checkout (or a directory below it) is followed. (#1135)
+- Continued the `memory_explore` provider-body redaction (#1103) to
+  `memory_query(answer=true)`: when answer synthesis fails, the
+  `answer_unavailable` note and the server warning now carry only the
+  redacted `class`/`status` summary (for example
+  `class=provider status=400`) instead of the error's `Display`, which for a
+  provider failure includes the upstream response body. The default path
+  (no `answer`) is unchanged. (#1132)
 
 ## [2.6.0] - 2026-10-07
 

@@ -1086,15 +1086,12 @@ fn sanitize_events(
         if event.event_id.trim().is_empty() || event.event_id.len() > MAX_EVENT_ID_BYTES {
             return Err("invalid workstream event id".to_string());
         }
-        if event.content.len() > MAX_EVENT_CONTENT_BYTES {
-            let mut end = MAX_EVENT_CONTENT_BYTES;
-            while !event.content.is_char_boundary(end) {
-                end -= 1;
-            }
-            event.content.truncate(end);
-            event.content.push_str("\n[truncated by ai-memory]");
-        }
+        // Scrub the full content before the cap: truncating first could cut a
+        // secret straddling the cap into a fragment too short for any pattern
+        // to match, persisting the prefix verbatim (#1113, same class as
+        // #980/#1109).
         event.content = sanitizer.scrub(&event.content);
+        truncate_owned(&mut event.content, MAX_EVENT_CONTENT_BYTES);
         if let Some(role) = &event.role
             && (role.len() > 32
                 || !role
@@ -1138,6 +1135,8 @@ fn append_boundary_events(
     if checkpoint.is_empty() {
         checkpoint.push_str("No Git repository checkpoint was available.");
     }
+    // Scrub-then-cap, same ordering as `sanitize_events` above (#1113).
+    let mut checkpoint = sanitizer.scrub(&checkpoint);
     truncate_owned(&mut checkpoint, MAX_EVENT_CONTENT_BYTES);
     request.events.push(NewWorkstreamEvent {
         event_id: format!("managed-run:{run_id}:checkpoint"),
@@ -1146,7 +1145,7 @@ fn append_boundary_events(
         source_record_id: None,
         kind: WorkstreamEventKind::Checkpoint,
         role: None,
-        content: sanitizer.scrub(&checkpoint),
+        content: checkpoint,
         occurred_at: None,
         metadata: serde_json::json!({ "exit_code": request.exit_code }),
     });
@@ -1155,6 +1154,7 @@ fn append_boundary_events(
         for loss in &request.losses {
             let _ = writeln!(content, "- {loss}");
         }
+        let mut content = sanitizer.scrub(&content);
         truncate_owned(&mut content, MAX_EVENT_CONTENT_BYTES);
         request.events.push(NewWorkstreamEvent {
             event_id: format!("managed-run:{run_id}:losses"),
@@ -1163,7 +1163,7 @@ fn append_boundary_events(
             source_record_id: None,
             kind: WorkstreamEventKind::Annotation,
             role: None,
-            content: sanitizer.scrub(&content),
+            content,
             occurred_at: None,
             metadata: serde_json::json!({ "loss_count": request.losses.len() }),
         });
@@ -2002,6 +2002,225 @@ mod tests {
                 .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// A credential straddling the 64 KiB event cap must be scrubbed before
+    /// the cap runs (#1113): truncating first leaves an `sk-` prefix too short
+    /// to match any pattern, persisting it verbatim. The segment file is the
+    /// durable artifact written from the sanitized events.
+    #[tokio::test]
+    async fn finish_run_scrubs_event_content_before_the_byte_cap() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        // The key starts 18 bytes before the cap: capping first would keep
+        // `sk-` plus 15 characters, one short of the 16 the pattern needs.
+        // The space before the tail matters — without it the greedy key
+        // pattern would swallow the tail into the same match and the
+        // scrubbed text would never reach the cap.
+        let credential = format!("sk-{}", "A".repeat(40));
+        let content = format!(
+            "{}{credential} {}",
+            "x".repeat(MAX_EVENT_CONTENT_BYTES - 18),
+            "y".repeat(2 * 1024),
+        );
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: vec![
+                    NewWorkstreamEvent {
+                        event_id: "straddling".into(),
+                        agent: AgentKind::Codex,
+                        native_session_id: "native-1".into(),
+                        source_record_id: Some("record-1".into()),
+                        kind: WorkstreamEventKind::Message,
+                        role: Some("assistant".into()),
+                        content,
+                        occurred_at: None,
+                        metadata: serde_json::Value::Null,
+                    },
+                    NewWorkstreamEvent {
+                        event_id: "control".into(),
+                        agent: AgentKind::Codex,
+                        native_session_id: "native-1".into(),
+                        source_record_id: Some("record-2".into()),
+                        kind: WorkstreamEventKind::Message,
+                        role: Some("assistant".into()),
+                        content: "plain ledger note".into(),
+                        occurred_at: None,
+                        metadata: serde_json::Value::Null,
+                    },
+                ],
+                complete: false,
+                checkpoint: Default::default(),
+                exit_code: None,
+                losses: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(run.workstream_id.to_string())
+            .join("segments");
+        let path = std::fs::read_dir(segment_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(path).unwrap();
+        let events: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let straddling = events
+            .iter()
+            .find(|event| event["event_id"] == "straddling")
+            .unwrap();
+        let stored = straddling["content"].as_str().unwrap();
+        assert!(
+            stored.contains("[REDACTED:api_key]"),
+            "straddling credential must be redacted before the cap: {stored:?}"
+        );
+        assert!(
+            !stored.contains("sk-"),
+            "cap-straddling credential prefix leaked: {stored:?}"
+        );
+        assert!(
+            stored.ends_with("[truncated by ai-memory]"),
+            "len {} tail {:?}",
+            stored.len(),
+            &stored[stored.len().saturating_sub(80)..]
+        );
+        assert!(
+            stored.len() <= MAX_EVENT_CONTENT_BYTES + "\n[truncated by ai-memory]".len(),
+            "stored content exceeds the cap plus its marker: {} bytes",
+            stored.len()
+        );
+        let control = events
+            .iter()
+            .find(|event| event["event_id"] == "control")
+            .unwrap();
+        assert_eq!(control["content"], "plain ledger note");
+        let hits = store
+            .reader
+            .search_workstream_events(
+                run.workstream_id,
+                String::new(),
+                10,
+                state.sanitizer.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|hit| !hit.content.contains("sk-")),
+            "indexed content leaked the credential prefix"
+        );
+    }
+
+    /// The server-generated checkpoint and losses events get the same
+    /// scrub-before-cap ordering (#1113).
+    #[tokio::test]
+    async fn finish_run_scrubs_boundary_events_before_the_byte_cap() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let run = store
+            .writer
+            .prepare_workstream_run(prepare_input(
+                workspace_id,
+                project_id,
+                AgentKind::Codex,
+                "launcher",
+            ))
+            .await
+            .unwrap();
+        let credential = || format!("sk-{}", "A".repeat(40));
+        // "Changed paths:\n" (15) + "- {filler}\n" (2 + 65498 + 1) + "- " (2)
+        // places the key 18 bytes before the cap.
+        let checkpoint = ai_memory_core::WorkstreamCheckpoint {
+            changed_paths: vec!["x".repeat(65_498), credential(), "y".repeat(2 * 1024)],
+            ..Default::default()
+        };
+        // "Transcript extraction losses:\n" (30) + "- {filler}\n" + "- "
+        // places the key at the same offset.
+        let losses = vec!["x".repeat(65_483), credential(), "y".repeat(2 * 1024)];
+        let response = finish_run(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            None,
+            AxumPath(run.run_id.to_string()),
+            Json(FinishManagedRunRequest {
+                native_session_id: Some("native-1".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                checkpoint,
+                exit_code: Some(0),
+                losses,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let segment_dir = temp
+            .path()
+            .join("raw/workstreams")
+            .join(run.workstream_id.to_string())
+            .join("segments");
+        let path = std::fs::read_dir(segment_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let raw = std::fs::read_to_string(path).unwrap();
+        for suffix in ["checkpoint", "losses"] {
+            let event: serde_json::Value = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .find(|event: &serde_json::Value| {
+                    event["event_id"] == format!("managed-run:{}:{suffix}", run.run_id)
+                })
+                .unwrap();
+            let stored = event["content"].as_str().unwrap();
+            assert!(
+                stored.contains("[REDACTED:api_key]"),
+                "{suffix} must be redacted before the cap: {stored:?}"
+            );
+            assert!(
+                !stored.contains("sk-"),
+                "{suffix} leaked the cap-straddling credential prefix"
+            );
+            assert!(stored.ends_with("[truncated by ai-memory]"));
+            assert!(
+                stored.len() <= MAX_EVENT_CONTENT_BYTES + "\n[truncated by ai-memory]".len(),
+                "{suffix} exceeds the cap plus its marker: {} bytes",
+                stored.len()
+            );
+        }
     }
 
     /// The launcher reads whether the run's child linked a session from the

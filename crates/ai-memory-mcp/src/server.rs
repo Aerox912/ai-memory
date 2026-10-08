@@ -3086,11 +3086,24 @@ impl AiMemoryServer {
                             None,
                         ),
                         Err(e) => {
+                            // Redacted fields only: the `Display` of a provider
+                            // failure carries the upstream response body, and
+                            // this note goes back to the tool caller.
                             tracing::warn!(
-                                error = %e,
+                                error_class = %e.class(),
+                                error_status = ?e.http_status(),
                                 "memory_query answer synthesis failed; returning hits without an answer"
                             );
-                            (None, Some(format!("answer synthesis failed: {e}")))
+                            (
+                                None,
+                                Some(format!(
+                                    "answer synthesis failed: class={} status={}",
+                                    e.class(),
+                                    e.http_status()
+                                        .map(|status| status.to_string())
+                                        .unwrap_or_else(|| "none".into())
+                                )),
+                            )
                         }
                     }
                 }
@@ -3905,9 +3918,8 @@ impl AiMemoryServer {
     /// The origin keys consolidation stamps on a session page, so a reader
     /// cannot tell the two writers apart by shape. `consolidated_by` is the
     /// one difference: the server cannot verify which model the agent ran, so
-    /// it records the route and no model name. `observation_generation` is
-    /// the session's observation count at write time, which the SessionEnd
-    /// worker compares to its job's generation before overwriting the page.
+    /// it records the route and no model name, and the automatic SessionEnd
+    /// writers leave a page carrying it alone.
     async fn stamp_session_page(
         &self,
         fm: &mut serde_json::Map<String, serde_json::Value>,
@@ -3933,15 +3945,6 @@ impl AiMemoryServer {
         fm.insert(
             "consolidated_by".into(),
             serde_json::Value::String("agent".into()),
-        );
-        let generation = self
-            .reader
-            .session_observation_count(session_id)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        fm.insert(
-            "observation_generation".into(),
-            serde_json::Value::from(generation),
         );
         Ok(())
     }
@@ -13142,6 +13145,61 @@ mod tests {
         assert!(
             text.contains("\"briefing\":"),
             "expected briefing payload\n{text}"
+        );
+    }
+
+    /// Mutation captured: formatting the `LlmError`'s `Display` into the
+    /// degraded-answer `answer_unavailable` note copies the provider body to
+    /// the tool caller. The failure must degrade with the redacted class/status
+    /// summary only, mirroring the `memory_explore` redaction test.
+    #[tokio::test]
+    async fn memory_query_answer_degrades_with_redacted_summary_not_provider_body() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: None,
+                    answer: Some(true),
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a provider failure must degrade to the hits without an answer, not error");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("answer synthesis failed: class=provider status=400"),
+            "the degraded note must carry only the redacted class/status summary\n{text}"
+        );
+        assert!(
+            !text.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the tool result\n{text}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value.get("answer").is_none(),
+            "a failed synthesis must return no answer\n{text}"
+        );
+        assert!(
+            value.get("hits").is_some(),
+            "the hits must still be returned\n{text}"
         );
     }
 
