@@ -1060,6 +1060,25 @@ impl<'a> ScopeResolver<'a> {
             trimmed_opt(explicit_project),
         ) {
             (Some(workspace), Some(project)) => {
+                // #1152: a `workspace/project` label accidentally passed as
+                // the project argument (with the workspace often the
+                // literal `"default"` because the caller built the args
+                // from a marker via a fallback path) must auto-split and
+                // resolve to (split_ws, split_proj). A project name never
+                // contains `/`, so a single split is unambiguous. The
+                // Display impl of `ProjectNotFoundInWorkspace` already
+                // documents this hint; the fix is to actually act on it.
+                if let Some((ws, proj)) = split_slashed_project(project) {
+                    let retry = Box::pin(self.resolve_existing_args_traced(
+                        Some(ws),
+                        Some(proj),
+                        actor,
+                        need,
+                    ));
+                    if let Ok((scope, _)) = retry.await {
+                        return Ok((scope, ScopeSource::Explicit));
+                    }
+                }
                 let workspace_id = lookup_existing_workspace(self.reader, workspace).await?;
                 let scope = self
                     .resolve_named_in_workspace(workspace_id, workspace, project, need)
@@ -1190,6 +1209,26 @@ impl<'a> ScopeResolver<'a> {
             return Err(ScopeResolutionError::WriterRequired);
         };
         let active = self.active_project.and_then(|a| a.get_for(actor));
+        // #1152: a slashed `project` argument (label jammed into one
+        // field) must auto-split and re-resolve before any create-side
+        // work. Mirrors the read path above; a project name never
+        // contains `/`, so a single split is unambiguous.
+        if let Some(project_str) = trimmed_opt(explicit_project)
+            && let Some((ws, proj)) = split_slashed_project(project_str)
+        {
+            let retry = Box::pin(self.resolve_existing_args(
+                Some(ws),
+                Some(proj),
+                actor,
+                ProjectAccess::Write,
+            ));
+            if let Ok(scope) = retry.await {
+                return Ok(ResolvedWriteScope {
+                    scope,
+                    promoted_from: None,
+                });
+            }
+        }
         let workspace_id = match trimmed_opt(explicit_workspace) {
             Some(workspace) => writer.get_or_create_workspace(workspace.to_owned()).await?,
             None => active
@@ -1251,6 +1290,20 @@ fn trimmed_opt(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// #1152: split a `workspace/project` label carried as the project
+/// argument. Returns the `(workspace, project)` pair only when the input
+/// has exactly one `/` and both sides are non-empty; a project name
+/// itself never contains `/` (enforced by `PagePath`/`ProjectName`),
+/// so a single split is unambiguous. Anything else returns `None` and
+/// the caller treats the input as a plain project name.
+fn split_slashed_project(value: &str) -> Option<(&str, &str)> {
+    let (left, right) = value.split_once('/')?;
+    if left.is_empty() || right.is_empty() || right.contains('/') {
+        return None;
+    }
+    Some((left, right))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,6 +1331,78 @@ mod tests {
         }
         .to_string();
         assert_eq!(plain, "project 'ghost' not found in workspace 'default'");
+    }
+
+    /// Regression for #1152: a `workspace/project` label accidentally passed
+    /// as the project argument (with the workspace hardcoded to the
+    /// literal `"default"` by whatever client-side fallback constructed
+    /// the args from a marker file) must auto-split and resolve to the
+    /// (split_ws, split_proj) scope. Without the split the call falls into
+    /// `ProjectNotFoundInWorkspace` and the handoff the agent was trying
+    /// to write silently disappears, which is the user-reported class.
+    #[tokio::test]
+    async fn slashed_project_argument_splits_to_workspace_and_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let default_scratch = store
+            .writer
+            .get_or_create_project(default_ws, "scratch", None)
+            .await
+            .unwrap();
+        // The real target: a separate workspace, with a project whose
+        // name does NOT contain a slash.
+        let myorg_ws = store.writer.get_or_create_workspace("myorg").await.unwrap();
+        let myproject = store
+            .writer
+            .get_or_create_project(myorg_ws, "myproject", None)
+            .await
+            .unwrap();
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch);
+
+        // Wrong workspace (`"default"`) + a `myorg/myproject` label jammed
+        // into the project field. With auto-split, this resolves to
+        // (myorg, myproject). Without the fix it fails with
+        // `ProjectNotFoundInWorkspace { workspace: "default",
+        // project: "myorg/myproject" }` and the user's handoff is lost.
+        let resolved = resolver
+            .resolve_existing_args(
+                Some("default"),
+                Some("myorg/myproject"),
+                &ActorKey::default(),
+                ProjectAccess::Write,
+            )
+            .await
+            .expect("slashed project argument must auto-split");
+        assert_eq!(
+            resolved.workspace_id, myorg_ws,
+            "split should land in the (myorg) workspace"
+        );
+        assert_eq!(
+            resolved.project_id, myproject,
+            "split should land in the (myproject) project"
+        );
+
+        // Control: a project name that genuinely does not split must
+        // still go through the original `ProjectNotFoundInWorkspace`
+        // path (so a typo is not silently masked).
+        let err = resolver
+            .resolve_existing_args(
+                Some("default"),
+                Some("does-not-exist"),
+                &ActorKey::default(),
+                ProjectAccess::Write,
+            )
+            .await
+            .expect_err("a non-split project miss must surface the original error");
+        assert!(
+            matches!(err, ScopeResolutionError::ProjectNotFoundInWorkspace { .. }),
+            "{err}"
+        );
     }
 
     async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {
