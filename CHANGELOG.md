@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the #980 / #1109 fixes established — so a straddling secret can no longer
   reach the spool (and through it the server) as an unredacted fragment.
   (#1114)
+- Fixed the shell (`hooks/_lib.sh`) and PowerShell (`hooks/lib/ai-memory-hook.ps1`)
+  hook bundles dropping live events and retiring spooled backlog entries on
+  transient 4xx responses. Both hook scripts treated any 4xx status as a
+  permanent rejection, dropping capture events on server queue saturation
+  (`429 Too Many Requests`) or timeouts (`408`, `425`) instead of spooling
+  them, and deleting pending spool files during drain passes. Transient
+  408, 425, and 429 responses are now recognized as retryable: live events
+  are spooled and the drain pass pauses without deleting queued entries. (#1146)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
