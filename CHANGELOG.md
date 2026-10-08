@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the scheduled auto-improve tests' intermittent empty log captures
+  (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
+  `warn!` callsite's first-in-process execution on a bare thread caches
+  `Interest::never()`, after which no per-test `set_default` capture ever
+  sees the event under single-process harnesses (libtest, Windows CI). The
+  tick outcome now carries the typed `failure_summaries` and
+  `skipped_proposals` the warnings mirror, and the tests assert those
+  instead of a captured log stream. Logged messages and levels are
+  unchanged. (#1118)
 - Fixed hook observation bodies being capped *before* the sanitizer ever saw
   them: excerpt extraction (`tool: …` bodies, user prompts, notifications,
   post-compaction summaries, extension bodies) applied its 2 KB / 16 KB
