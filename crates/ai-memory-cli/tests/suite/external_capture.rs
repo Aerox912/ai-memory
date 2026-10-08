@@ -422,6 +422,52 @@ mod slow {
         );
     }
 
+    /// Post a batch the way a real spool drain does when the shared server is
+    /// saturated: a 429 (ingest shed) or a 200 with `failed_index` (fail-fast
+    /// on a transient processing error — the SessionEnd item writes the
+    /// session page, git checkpoint, and handoff inline, inside the response
+    /// window) acknowledges exactly the items that committed, so resend only
+    /// the rest, bounded. Ingest keys make resending an item an earlier
+    /// attempt did accept a replay, so the drain still converges to
+    /// exactly-once.
+    async fn post_batch_until_accepted(client: &reqwest::Client, endpoint: &str, items: &[Value]) {
+        let mut pending = items.to_vec();
+        let mut ack = Value::Null;
+        for attempt in 0..10u64 {
+            let response = client
+                .post(endpoint)
+                .bearer_auth(TOKEN)
+                .json(&pending)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            ack = response.json().await.unwrap();
+            assert!(
+                status.is_success() || status == reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "{status} {ack}"
+            );
+            // `accepted_indices` is present exactly when the acknowledged
+            // items are not the contiguous leading prefix, where the legacy
+            // `accepted` count would under-report.
+            let accepted: Vec<u64> = match ack["accepted_indices"].as_array() {
+                Some(indices) => indices.iter().filter_map(Value::as_u64).collect(),
+                None => (0..ack["accepted"].as_u64().unwrap()).collect(),
+            };
+            if accepted.len() == pending.len() {
+                return;
+            }
+            pending = pending
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !accepted.contains(&(*idx as u64)))
+                .map(|(_, item)| item.clone())
+                .collect();
+            tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
+        }
+        panic!("batch never fully accepted after 10 attempts: {ack}");
+    }
+
     #[tokio::test]
     async fn fifteen_external_sessions_share_one_server_and_retry_completed_batches() {
         let fixture = Fixture::start().await;
@@ -438,16 +484,7 @@ mod slow {
             let endpoint = format!("{}/hook/batch", fixture.base);
             tasks.spawn(async move {
                 for _ in 0..2 {
-                    let response = client
-                        .post(&endpoint)
-                        .bearer_auth(TOKEN)
-                        .json(&items)
-                        .send()
-                        .await
-                        .unwrap();
-                    assert!(response.status().is_success(), "{}", response.status());
-                    let ack: Value = response.json().await.unwrap();
-                    assert_eq!(ack["accepted"], 3, "{ack}");
+                    post_batch_until_accepted(&client, &endpoint, &items).await;
                 }
                 sid
             });
