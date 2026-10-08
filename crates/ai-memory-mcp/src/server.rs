@@ -3086,11 +3086,24 @@ impl AiMemoryServer {
                             None,
                         ),
                         Err(e) => {
+                            // Redacted fields only: the `Display` of a provider
+                            // failure carries the upstream response body, and
+                            // this note goes back to the tool caller.
                             tracing::warn!(
-                                error = %e,
+                                error_class = %e.class(),
+                                error_status = ?e.http_status(),
                                 "memory_query answer synthesis failed; returning hits without an answer"
                             );
-                            (None, Some(format!("answer synthesis failed: {e}")))
+                            (
+                                None,
+                                Some(format!(
+                                    "answer synthesis failed: class={} status={}",
+                                    e.class(),
+                                    e.http_status()
+                                        .map(|status| status.to_string())
+                                        .unwrap_or_else(|| "none".into())
+                                )),
+                            )
                         }
                     }
                 }
@@ -13142,6 +13155,61 @@ mod tests {
         assert!(
             text.contains("\"briefing\":"),
             "expected briefing payload\n{text}"
+        );
+    }
+
+    /// Mutation captured: formatting the `LlmError`'s `Display` into the
+    /// degraded-answer `answer_unavailable` note copies the provider body to
+    /// the tool caller. The failure must degrade with the redacted class/status
+    /// summary only, mirroring the `memory_explore` redaction test.
+    #[tokio::test]
+    async fn memory_query_answer_degrades_with_redacted_summary_not_provider_body() {
+        let (tmp, store, _server, ws, proj) = setup_server().await;
+        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+
+        let result = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: None,
+                    answer: Some(true),
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a provider failure must degrade to the hits without an answer, not error");
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            text.contains("answer synthesis failed: class=provider status=400"),
+            "the degraded note must carry only the redacted class/status summary\n{text}"
+        );
+        assert!(
+            !text.contains("SENTINEL_PRIVATE_BODY"),
+            "provider body leaked into the tool result\n{text}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value.get("answer").is_none(),
+            "a failed synthesis must return no answer\n{text}"
+        );
+        assert!(
+            value.get("hits").is_some(),
+            "the hits must still be returned\n{text}"
         );
     }
 
