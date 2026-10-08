@@ -134,6 +134,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ai-memory's MCP tools. The wrapper now runs `mcp-bridge` through its
   checksum-verified native host client, which also repairs existing entries.
   (#1147)
+- Fixed the cross-project profile promoting a single project's "always" /
+  "never" / "by default" sentences as general preferences: only an explicit
+  cross-project scope ("in all my projects", "every project", "everywhere",
+  and the Portuguese equivalents) now waives the `min_projects` threshold,
+  in both the zero-LLM detector and the LLM classifier prompt. (#1148)
 
 ## [2.6.0] - 2026-10-07
 

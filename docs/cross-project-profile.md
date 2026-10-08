@@ -179,8 +179,11 @@ text an agent merely *saw* cannot become your preference.
 **2. Converge.** Statements are grouped by topic across projects. A group
 becomes an entry when:
 
-- you stated it as general ("in all my projects", "always", "by default",
-  "from now on"), or
+- you explicitly scoped it beyond the project ("in all my projects",
+  "every project", "across projects", "everywhere", or the Portuguese
+  equivalents). A bare "always", "never", "by default" or "from now on" still
+  makes a candidate, but it can describe one file, app or task, so it has to
+  earn the project threshold below, or
 - the same choice shows up in at least `min_projects` projects (default 2).
 
 A habit seen in only one project stays that project's business; `profile

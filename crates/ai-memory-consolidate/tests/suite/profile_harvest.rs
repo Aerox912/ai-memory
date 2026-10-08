@@ -307,6 +307,43 @@ async fn one_project_exceptions_stay_local_but_general_rules_travel() {
     assert!(pages[0].1.contains("commit messages in English"));
 }
 
+/// A bare "always" / "never" / "sempre" in one project is a project rule, not
+/// a cross-project statement: it needs `min_projects` projects before it
+/// reaches the profile (#1148). An explicit cross-project scope still travels
+/// from one project (control).
+#[tokio::test]
+async fn a_bare_always_in_one_project_is_not_promoted() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(
+        &fx,
+        alpha,
+        "Always run the payment tests before you push.",
+        1,
+    )
+    .await;
+    prompt(&fx, alpha, "Never deploy the campaign page on Fridays.", 2).await;
+    prompt(&fx, alpha, "Sempre rode o lint do módulo de checkout.", 3).await;
+
+    let report = pass(&fx, &single_user()).await;
+    assert!(
+        profile_pages(&fx, "_global").is_empty(),
+        "a one-project 'always' must not become a profile entry: {report:?}"
+    );
+
+    prompt(
+        &fx,
+        alpha,
+        "Em todos os meus projetos, escreva as mensagens de commit em inglês.",
+        4,
+    )
+    .await;
+    pass(&fx, &single_user()).await;
+    let pages = profile_pages(&fx, "_global");
+    assert_eq!(pages.len(), 1, "{pages:?}");
+    assert!(pages[0].1.contains("commit"), "{pages:?}");
+}
+
 /// Tool output that reads like a preference is never harvested; the user's
 /// own prompt with the same words is (control).
 #[tokio::test]
@@ -363,11 +400,11 @@ async fn an_opted_out_project_is_never_harvested() {
     prompt(
         &fx,
         client,
-        "Always deploy with the AcmeCorp internal pipeline.",
+        "Always deploy with the AcmeCorp internal pipeline in every project.",
         1,
     )
     .await;
-    prompt(&fx, mine, "Always deploy with fly.io.", 2).await;
+    prompt(&fx, mine, "Always deploy with fly.io in every project.", 2).await;
 
     pass(&fx, &single_user()).await;
     let statements = candidate_statements(&fx);
@@ -413,7 +450,7 @@ async fn the_latest_ruling_supersedes_and_the_old_version_stays() {
 async fn a_hand_edited_entry_is_never_clobbered() {
     let fx = fixture().await;
     let alpha = project(&fx, "alpha").await;
-    prompt(&fx, alpha, "Always use pnpm.", 1).await;
+    prompt(&fx, alpha, "Always use pnpm in every project.", 1).await;
     pass(&fx, &single_user()).await;
     let (path, _, body) = profile_pages(&fx, "_global")[0].clone();
     let global = ai_memory_store::lookup_global_scope(&fx.store.reader)
@@ -451,7 +488,7 @@ async fn a_hand_edited_entry_is_never_clobbered() {
         .unwrap();
 
     let beta = project(&fx, "beta").await;
-    prompt(&fx, beta, "Always use pnpm!", 5).await;
+    prompt(&fx, beta, "Always use pnpm in every project!", 5).await;
     let report = pass(&fx, &single_user()).await;
     assert_eq!(
         report.skipped_manual,
@@ -471,7 +508,7 @@ async fn a_hand_edited_entry_is_never_clobbered() {
 async fn a_forgotten_entry_is_not_recreated_until_said_again() {
     let fx = fixture().await;
     let alpha = project(&fx, "alpha").await;
-    prompt(&fx, alpha, "Always use pnpm.", 1).await;
+    prompt(&fx, alpha, "Always use pnpm in every project.", 1).await;
     pass(&fx, &single_user()).await;
     let path = profile_pages(&fx, "_global")[0].0.clone();
     let global = ai_memory_store::lookup_global_scope(&fx.store.reader)
@@ -496,7 +533,7 @@ async fn a_forgotten_entry_is_not_recreated_until_said_again() {
     // Said again, later than the entry was written.
     let beta = project(&fx, "beta").await;
     let later = (jiff::Timestamp::now().as_microsecond() - T0) / DAY_US + 1;
-    prompt(&fx, beta, "Always use pnpm.", later).await;
+    prompt(&fx, beta, "Always use pnpm in every project.", later).await;
     let report = pass(&fx, &single_user()).await;
     assert_eq!(report.entries_written, 1, "{report:?}");
     assert_eq!(profile_pages(&fx, "_global").len(), 1);
@@ -515,7 +552,7 @@ async fn a_private_profile_never_harvests_another_operator() {
         shared,
         Some("alice"),
         ObservationKind::UserPrompt,
-        "Always use pnpm.",
+        "Always use pnpm in every project.",
         1,
     )
     .await;
@@ -524,7 +561,7 @@ async fn a_private_profile_never_harvests_another_operator() {
         shared,
         Some("bob"),
         ObservationKind::UserPrompt,
-        "Always use yarn berry.",
+        "Always use yarn berry in every project.",
         2,
     )
     .await;
@@ -576,7 +613,7 @@ async fn a_team_profile_never_harvests_a_restricted_project() {
         secret,
         Some("alice"),
         ObservationKind::UserPrompt,
-        "Always use the ProjectZebra vault.",
+        "Always use the ProjectZebra vault in every project.",
         1,
     )
     .await;
@@ -585,7 +622,7 @@ async fn a_team_profile_never_harvests_a_restricted_project() {
         open,
         Some("alice"),
         ObservationKind::UserPrompt,
-        "Always use pnpm.",
+        "Always use pnpm in every project.",
         2,
     )
     .await;
@@ -595,7 +632,7 @@ async fn a_team_profile_never_harvests_a_restricted_project() {
         open,
         Some("bob"),
         ObservationKind::UserPrompt,
-        "Always use pnpm.",
+        "Always use pnpm in every project.",
         3,
     )
     .await;
@@ -674,7 +711,7 @@ async fn a_personal_profile_admits_one_operators_habit() {
         one,
         None,
         ObservationKind::UserPrompt,
-        "Always run the ZebraWipe script before tests.",
+        "Always run the ZebraWipe script before tests in every project.",
         1,
     )
     .await;
@@ -829,7 +866,13 @@ async fn injected_instructions_stay_data() {
 async fn a_provider_failure_falls_back_to_the_zero_llm_path() {
     let fx = fixture().await;
     let alpha = project(&fx, "alpha").await;
-    prompt(&fx, alpha, "Always use pnpm for installs.", 1).await;
+    prompt(
+        &fx,
+        alpha,
+        "Always use pnpm for installs in every project.",
+        1,
+    )
+    .await;
     let llm = FakeProfileLlm {
         fail: true,
         ..FakeProfileLlm::default()
@@ -838,7 +881,11 @@ async fn a_provider_failure_falls_back_to_the_zero_llm_path() {
     assert!(report.llm_fallbacks >= 1, "{report:?}");
     let pages = profile_pages(&fx, "_global");
     assert_eq!(pages.len(), 1, "{report:?}");
-    assert!(pages[0].1.contains("Always use pnpm for installs."));
+    assert!(
+        pages[0]
+            .1
+            .contains("Always use pnpm for installs in every project.")
+    );
 }
 
 /// The core scenario on the LLM path: a habit said loosely in one project is
