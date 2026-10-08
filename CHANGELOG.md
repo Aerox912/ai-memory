@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under the same access checks as passing them separately. A write never
   creates a project whose name contains `/` any more; it is refused with the
   hint instead. (#1152, #1154)
+- Fixed every Pi turn failing with a 400 on Moonshot/Kimi models: the
+  generated Pi extension registered the MCP tools with schemas containing
+  `$ref`, which Moonshot rejects. Its bridge now requests the `?flavor=moonshot`
+  schemas, with every reference inlined, which any provider accepts. Re-run
+  `ai-memory install-hooks --agent pi --apply` to regenerate the extension.
+  (#1157)
 
 ## [2.6.1] - 2026-10-08
 
