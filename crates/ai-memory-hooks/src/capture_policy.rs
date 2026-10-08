@@ -309,6 +309,21 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             }
             None => ToolOutcome::Unknown,
         },
+        // Hermes mirrors the call status in `extra.status` (`ok` | `error`,
+        // set by `model_tools.py::_emit_post_tool_call_hook` from the same
+        // result the model sees). `ok` proves success and a non-empty
+        // `error_message` proves failure; anything else stays unknown.
+        AgentKind::Hermes => {
+            let status = raw
+                .get("extra")
+                .and_then(|extra| extra.get("status"))
+                .and_then(Value::as_str);
+            match status {
+                Some("ok") => ToolOutcome::Success,
+                Some("error") => ToolOutcome::Error,
+                _ => ToolOutcome::Unknown,
+            }
+        }
         // Codex PostToolUse also fires for failed commands. Its native exec
         // response is output text, with no separate success/exit-code field;
         // neither the event nor arbitrary response JSON proves an outcome.
@@ -848,6 +863,13 @@ fn family(name: &str) -> ToolFamily {
         "bash" | "shell" | "shell_command" | "exec" | "execute" | "run_command" | "web_search"
         | "search_web" | "manage_task" | "manage_subagents" | "terminal" | "execute_bash"
         | "execute_cmd" => ToolFamily::NonFile,
+        // Hermes Agent tool surface (agent/shell_hooks.py envelope; tool
+        // names from model_tools registry, live-captured 2026-10-07). These
+        // execute code, drive a browser, or fetch the web — none touch
+        // workspace file paths, so they are non-file rather than unknown:
+        // family `unknown` drops the tool output from observation bodies.
+        "execute_code" | "browser_exec" | "browser_navigate" | "web_extract" | "web_fetch"
+        | "delegate_task" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
