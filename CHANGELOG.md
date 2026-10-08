@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed a `workspace/project` label passed as the project failing to resolve
+  (for example `workspace: "default", project: "myorg/myproject"`): when no
+  project has that exact name, the label's own workspace and project are used,
+  under the same access checks as passing them separately. A write never
+  creates a project whose name contains `/` any more; it is refused with the
+  hint instead. (#1152, #1154)
+
 ## [2.6.1] - 2026-10-08
 
 ### Fixed
@@ -15,21 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "myorg/myproject"` with the default workspace): project names never contain
   `/`, so the error now names the separate `workspace` and `project` arguments
   to pass. (#1152)
-
-- A `workspace/project` label accidentally passed as the `project`
-  argument to a scope-resolving tool (with the workspace often the
-  literal `"default"` because a client-side fallback built the args
-  from a marker) now auto-splits and resolves to the
-  `(split_ws, split_proj)` scope. The split is unambiguous because a
-  project name never contains `/`; a non-split project name goes
-  through the original `ProjectNotFoundInWorkspace` path unchanged.
-  The Display hint from 7e1b50f3 is for humans reading the error;
-  this auto-split is for the agent that constructed the malformed
-  args in the first place and would otherwise retry with the same
-  wrong shape, losing the handoff it was trying to write. Both the
-  read path (`ScopeResolver::resolve_existing_args_traced`) and the
-  write path (`ScopeResolver::resolve_write_args`) get the same
-  one-shot retry. (#1152)
 - Fixed the cross-project profile rewriting a settled entry whenever new
   evidence merely agreed with it: a statement now changes only when the ruling
   or its scope does (the LLM merge reports `changed`), so the line every project
