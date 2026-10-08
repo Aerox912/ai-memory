@@ -295,3 +295,58 @@ fn powershell_drain_delivers_and_retires_entries() {
         "2xx and terminal 4xx both retire their entries"
     );
 }
+
+#[test]
+fn powershell_drain_keeps_backlog_on_429_saturation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let receiver = thread::spawn(move || {
+        // 429 indicates server queue saturation (backpressure):
+        // the drain must stop and keep the entry queued rather than retiring it.
+        serve_one(
+            &listener,
+            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = home.path().join("data");
+    let spool = data_dir.join("hook-spool");
+    std::fs::create_dir_all(&spool).unwrap();
+    let body = r#"{"e":"saturated"}"#;
+    std::fs::write(
+        spool.join("0000000000007-1-0000000000000001.json"),
+        serde_json::json!({
+            "url": format!("{server}/hook?event=stop&agent=codex&ingest_key=pscccccccccccccccc"),
+            "body": body,
+            "created_ms": 7_u64,
+            "auth_mode": "none",
+            "attempts": 0,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let program = format!(
+        ". '{lib}'; Invoke-AiMemoryDrainSpool -Max 8",
+        lib = hook_lib()
+    );
+    let output = run_powershell(
+        &program,
+        home.path(),
+        &[("AI_MEMORY_DATA_DIR", data_dir.to_str().unwrap())],
+    );
+    assert!(
+        output.status.success(),
+        "PowerShell drain failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (_headers, received_body) = receiver.join().unwrap();
+    assert_eq!(received_body, body.as_bytes());
+    assert_eq!(
+        spool_files(&data_dir).len(),
+        1,
+        "a 429 response must keep the entry queued"
+    );
+}

@@ -114,6 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method-not-found warnings on every Pi launch. The generated extension now
   uses `mcpNotify` to send notifications without an id and accept empty
   successful HTTP responses without failing JSON parsing. (#1136)
+- Fixed the shell (`hooks/_lib.sh`) and PowerShell (`hooks/lib/ai-memory-hook.ps1`)
+  hooks dropping live events and deleting spooled entries on a `408`, `425` or
+  `429` response, which they treated as a permanent rejection. They now keep
+  those events queued like other transient failures, matching the native
+  spool (`429` retries for free; `408`/`425` retry under its attempt budget
+  since #1092), and a drain pass stops without deleting queued entries. (#1146)
 
 ## [2.6.0] - 2026-10-07
 
