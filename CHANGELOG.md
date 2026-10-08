@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed an explicit-scope miss giving no hint when an agent passed a
+  `workspace/project` label as the project (for example `project:
+  "myorg/myproject"` with the default workspace): project names never contain
+  `/`, so the error now names the separate `workspace` and `project` arguments
+  to pass. (#1152)
 - Fixed the cross-project profile rewriting a settled entry whenever new
   evidence merely agreed with it: a statement now changes only when the ruling
   or its scope does (the LLM merge reports `changed`), so the line every project
