@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the shell (`hooks/_lib.sh`) and PowerShell (`hooks/lib/ai-memory-hook.ps1`)
+  hooks dropping live events and deleting spooled entries on a `408`, `425` or
+  `429` response, which they treated as a permanent rejection. They now keep
+  those events queued like other transient failures, matching the native
+  spool (`429` retries for free; `408`/`425` retry under its attempt budget
+  since #1092), and a drain pass stops without deleting queued entries. (#1146)
+- Fixed the scheduled auto-improve tests' intermittent empty log captures
+  (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
+  `warn!` callsite's first-in-process execution on a bare thread caches
+  `Interest::never()`, after which no per-test `set_default` capture ever
+  sees the event under single-process harnesses (libtest, Windows CI). The
+  tick outcome now carries the typed `failure_summaries` and
+  `skipped_proposals` the warnings mirror, and the tests assert those
+  instead of a captured log stream. Logged messages and levels are
+  unchanged. (#1118)
 - Fixed hook observation bodies being capped *before* the sanitizer ever saw
   them: excerpt extraction (`tool: …` bodies, user prompts, notifications,
   post-compaction summaries, extension bodies) applied its 2 KB / 16 KB
@@ -25,46 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the #980 / #1109 fixes established — so a straddling secret can no longer
   reach the spool (and through it the server) as an unredacted fragment.
   (#1114)
-- Fixed the shell (`hooks/_lib.sh`) and PowerShell (`hooks/lib/ai-memory-hook.ps1`)
-  hook bundles dropping live events and retiring spooled backlog entries on
-  transient 4xx responses. Both hook scripts treated any 4xx status as a
-  permanent rejection, dropping capture events on server queue saturation
-  (`429 Too Many Requests`) or timeouts (`408`, `425`) instead of spooling
-  them, and deleting pending spool files during drain passes. Transient
-  408, 425, and 429 responses are now recognized as retryable: live events
-  are spooled and the drain pass pauses without deleting queued entries. (#1146)
-- Fixed the hook spool charging a spooled event's retry budget while the
-  server was unreachable: an endpoint-level delivery failure (connection
-  refused, timeout, DNS — the existing `Unreachable` classification) no
-  longer increments `attempts`, so a total outage no longer deletes the
-  oldest events at roughly one per `max_attempts` drain passes while the
-  server is down. Post-connect failures (a server that answers with 5xx or
-  a protocol error) keep the previous charging semantics, and the 10,000
-  file cap and 7-day spool TTL bounds are unchanged. Also corrected the
-  stale `hooks/_lib.sh` comment that claimed the backlog is drained at
-  session boundaries only (a piggyback drain also runs after any
-  successful 2xx POST). (#1121)
-- Fixed the PowerShell hook bundle silently losing every capture event
-  during a server outage: the `.ps1` path now spools an undeliverable POST
-  (connection failure, timeout, or 5xx) to the same `<data_dir>/hook-spool/`
-  on-disk contract the shell bundle, the native hooks, and
-  `ai-memory hook-drain` share — same `<ms>-<pid>-<seq>.json` entry names,
-  same `SpoolEntry` JSON — and, like `ai_memory_post_hook`, kicks a detached
-  bounded drain (≤64 entries) after the next successful delivery, retires
-  entries on a 2xx or a terminal 4xx, and never spools a routed-repository
-  or externally-owned capture event. The PowerShell POST also mints an
-  idempotency `ingest_key` before its initial attempt and keeps it on the
-  spooled replay, so an ambiguous delivery that committed server-side is
-  discarded on replay instead of double-ingested. (#1122)
-- Fixed the scheduled auto-improve tests' intermittent empty log captures
-  (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
-  `warn!` callsite's first-in-process execution on a bare thread caches
-  `Interest::never()`, after which no per-test `set_default` capture ever
-  sees the event under single-process harnesses (libtest, Windows CI). The
-  tick outcome now carries the typed `failure_summaries` and
-  `skipped_proposals` the warnings mirror, and the tests assert those
-  instead of a captured log stream. Logged messages and levels are
-  unchanged. (#1118)
 - Fixed the managed-workstream ledger capping event content *before* the
   sanitizer ever saw it: the 64 KiB per-event cap in
   `hooks::workstream::sanitize_events` truncated first, so a secret
@@ -92,6 +67,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transcript, not the abandoned one, is imported. Only a transcript that
   records the `/clear` command, names this launch's session as its origin,
   and stays in this checkout (or a directory below it) is followed. (#1135)
+- Fixed the hook spool charging a spooled event's retry budget while the
+  server was unreachable: an endpoint-level delivery failure (connection
+  refused, timeout, DNS — the existing `Unreachable` classification) no
+  longer increments `attempts`, so a total outage no longer deletes the
+  oldest events at roughly one per `max_attempts` drain passes while the
+  server is down. Post-connect failures (a server that answers with 5xx or
+  a protocol error) keep the previous charging semantics, and the 10,000
+  file cap and 7-day spool TTL bounds are unchanged. Also corrected the
+  stale `hooks/_lib.sh` comment that claimed the backlog is drained at
+  session boundaries only (a piggyback drain also runs after any
+  successful 2xx POST). (#1121)
+- Fixed the PowerShell hook bundle silently losing every capture event
+  during a server outage: the `.ps1` path now spools an undeliverable POST
+  (connection failure, timeout, or 5xx) to the same `<data_dir>/hook-spool/`
+  on-disk contract the shell bundle, the native hooks, and
+  `ai-memory hook-drain` share — same `<ms>-<pid>-<seq>.json` entry names,
+  same `SpoolEntry` JSON — and, like `ai_memory_post_hook`, kicks a detached
+  bounded drain (≤64 entries) after the next successful delivery, retires
+  entries on a 2xx or a terminal 4xx, and never spools a routed-repository
+  or externally-owned capture event. The PowerShell POST also mints an
+  idempotency `ingest_key` before its initial attempt and keeps it on the
+  spooled replay, so an ambiguous delivery that committed server-side is
+  discarded on replay instead of double-ingested. (#1122)
 - Continued the `memory_explore` provider-body redaction (#1103) to
   `memory_query(answer=true)`: when answer synthesis fails, the
   `answer_unavailable` note and the server warning now carry only the
