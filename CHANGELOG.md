@@ -101,7 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `class=provider status=400`) instead of the error's `Display`, which for a
   provider failure includes the upstream response body. The default path
   (no `answer`) is unchanged. (#1132)
-- Fixed Hermes `post_tool_call` captures losing the tool result and outcome. Hermes nests the tool result at `extra.result` and mirrors the
+- Fixed Hermes `post_tool_call` captures losing the tool result and
+  outcome. Hermes nests the tool result at `extra.result` and mirrors the
   call status at `extra.status`; the extractor previously read only
   top-level `tool_output`/`tool_response`/`result`, so every Hermes
   observation body read `(no output captured)` and the outcome stayed
