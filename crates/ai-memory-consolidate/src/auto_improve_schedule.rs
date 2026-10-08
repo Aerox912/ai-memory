@@ -116,6 +116,16 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub parked: usize,
     /// Cross-session ("experience") passes that ran this tick.
     pub experience_runs: usize,
+    /// Redacted class/status summaries of this tick's review and experience
+    /// failures, pushed in the same arms that log the `error_summary`
+    /// warnings, so the warnings' content is observable without log capture
+    /// (a callsite's cached `Interest` is process-wide and can be silenced by
+    /// a sibling test under a single-process harness).
+    pub failure_summaries: Vec<String>,
+    /// The proposals behind `skipped`: everything the store declined to
+    /// stage this tick. The per-session path warns about each of these; the
+    /// typed copy lets the unattended path be asserted without log capture.
+    pub skipped_proposals: Vec<SkippedProposal>,
 }
 
 struct ScheduledAutoImproveContext<'a> {
@@ -214,6 +224,9 @@ pub async fn run_auto_improve_scheduler_tick(
                         Ok(Some(run)) => {
                             outcome.experience_runs += 1;
                             outcome.skipped += run.skipped.len();
+                            outcome
+                                .skipped_proposals
+                                .extend(run.skipped.iter().cloned());
                             if let Err(e) = writer
                                 .mark_experience_pass_run(scope.workspace_id, scope.project_id)
                                 .await
@@ -243,6 +256,7 @@ pub async fn run_auto_improve_scheduler_tick(
                             // anyhow chain is transparent to the provider
                             // error and would print the response body.
                             let error_summary = redacted_scheduler_error_summary(&e);
+                            outcome.failure_summaries.push(error_summary.clone());
                             tracing::warn!(
                                 workspace = %scope.workspace_name,
                                 project = %scope.project_name,
@@ -307,6 +321,9 @@ pub async fn run_auto_improve_scheduler_tick(
                 Ok(run) => {
                     outcome.reviewed += 1;
                     outcome.skipped += run.skipped.len();
+                    outcome
+                        .skipped_proposals
+                        .extend(run.skipped.iter().cloned());
                     info!(
                         workspace = %scope.workspace_name,
                         project = %scope.project_name,
@@ -347,6 +364,7 @@ pub async fn run_auto_improve_scheduler_tick(
                     // of the anyhow chain would leak the provider body to
                     // both.
                     let error_summary = redacted_scheduler_error_summary(&e);
+                    outcome.failure_summaries.push(error_summary.clone());
                     let attempts = match ctx
                         .writer
                         .record_auto_improve_claim_failure(
@@ -642,7 +660,6 @@ mod tests {
     use ai_memory_store::Store;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -843,14 +860,14 @@ mod tests {
         };
 
         let expected = "auto-improve failed: class=provider status=400";
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+
+        // The failure warning is asserted from the typed tick outcome
+        // (`failure_summaries`, pushed in the same arm that logs the
+        // `error_summary` warning) rather than a capturing subscriber: a
+        // callsite's cached `Interest` is computed process-wide by whichever
+        // thread first executes it, and under a single-process harness a
+        // sibling test can register these `warn!` callsites with no
+        // subscriber installed, silencing them for this test.
 
         // Attempt 1: retryable provider 400 → the claim records the attempt
         // (not parked). The persisted column carries only class/status.
@@ -903,23 +920,21 @@ mod tests {
             3,
             "the parked claim must not call the LLM"
         );
-        drop(guard);
 
         // No warning may carry the body; the class/status label must stay
-        // diagnosable.
-        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            !logged.contains("SENTINEL_PRIVATE_BODY"),
-            "no provider body may reach the scheduler log: {logged}"
-        );
-        assert!(
-            logged.contains("scheduled auto-improve failed"),
-            "the failure event must fire: {logged}"
-        );
-        assert!(
-            logged.contains("class=provider status=400"),
-            "the redacted class/status must stay diagnosable: {logged}"
-        );
+        // diagnosable. Every failing tick reported exactly one summary.
+        for (tick, outcome) in [(1, &first), (2, &second), (3, &third)] {
+            assert_eq!(
+                outcome.failure_summaries,
+                [expected],
+                "tick {tick} must warn with class/status only"
+            );
+            assert!(
+                !outcome.failure_summaries[0].contains("SENTINEL_PRIVATE_BODY"),
+                "no provider body may reach the scheduler log: {}",
+                outcome.failure_summaries[0]
+            );
+        }
 
         // Crash contract: a process death right after the write (before the
         // warning) leaves only the redacted value. A fresh handle on the
@@ -939,7 +954,13 @@ mod tests {
     }
 
     /// An experience pass failure must warn with the redacted class/status
-    /// and never the provider body.
+    /// and never the provider body. The warning's content is asserted from
+    /// the typed tick outcome (`failure_summaries`, pushed in the same arm
+    /// that logs the `error_summary` warning) rather than a capturing
+    /// subscriber: a callsite's cached `Interest` is computed process-wide by
+    /// whichever thread first executes it, and under a single-process harness
+    /// a sibling test can register the `warn!` callsite with no subscriber
+    /// installed, silencing it for this test.
     #[tokio::test]
     async fn experience_pass_failure_warns_class_status_not_body() {
         let tmp = TempDir::new().unwrap();
@@ -1014,38 +1035,25 @@ mod tests {
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceSentinelLlm);
 
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
         let outcome =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
                 .await
                 .unwrap();
-        drop(guard);
 
         assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
         assert_eq!(
             outcome.errors, 1,
             "the experience failure must be reported once: {outcome:?}"
         );
-
-        let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            !logged.contains("SENTINEL_PRIVATE_BODY"),
-            "no provider body may reach the experience log: {logged}"
+        assert_eq!(
+            outcome.failure_summaries,
+            ["auto-improve failed: class=provider status=400"],
+            "the failure warning must carry class/status only"
         );
         assert!(
-            logged.contains("experience pass failed"),
-            "the failure warning must fire: {logged}"
-        );
-        assert!(
-            logged.contains("class=provider status=400"),
-            "the redacted class/status must stay diagnosable: {logged}"
+            !outcome.failure_summaries[0].contains("SENTINEL_PRIVATE_BODY"),
+            "no provider body may reach the experience log: {}",
+            outcome.failure_summaries[0]
         );
     }
 
@@ -1504,30 +1512,6 @@ mod tests {
 
     const COLLIDING_PATH: &str = "procedures/release.md";
 
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturedLogWriter(Arc::clone(&self.0))
-        }
-    }
-
     async fn seed_reviewable_session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> SessionId {
         let session_id = SessionId::new();
         store
@@ -1610,11 +1594,17 @@ mod tests {
     }
 
     /// The unattended path has no response for anyone to read, so a proposal the
-    /// store declines has exactly two places left to surface: the typed tick
-    /// outcome and the warning log. Without both, a run that lost its only
-    /// proposal to a collision is byte-identical to a run that produced nothing.
+    /// store declines must surface in the typed tick outcome (which the warning
+    /// log mirrors). Without it, a run that lost its only proposal to a
+    /// collision is byte-identical to a run that produced nothing. The
+    /// assertion reads `skipped_proposals` — pushed from the same `run.skipped`
+    /// the warning loop logs — rather than a capturing subscriber: a callsite's
+    /// cached `Interest` is computed process-wide by whichever thread first
+    /// executes it, and under a single-process harness a sibling test can
+    /// register the `warn!` callsite with no subscriber installed, silencing it
+    /// for this test.
     #[tokio::test]
-    async fn a_scheduled_run_reports_a_collision_in_its_outcome_and_its_log() {
+    async fn a_scheduled_run_reports_a_collision_in_its_outcome() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
@@ -1664,23 +1654,11 @@ mod tests {
         );
         assert_eq!(run.skipped[0].target_path, COLLIDING_PATH);
 
-        // `#[tokio::test]` runs a current-thread runtime, so the thread-local
-        // default subscriber installed here stays in force across the awaits.
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .without_time()
-            // ANSI escapes would split `skipped=1` across colour codes.
-            .with_ansi(false)
-            .finish();
         let tick_session = seed_reviewable_session(&store, ws, proj).await;
-        let guard = tracing::subscriber::set_default(subscriber);
         let tick =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
                 .await
                 .unwrap();
-        drop(guard);
         assert_eq!(tick.errors, 0);
         assert!(
             tick.reviewed >= 1,
@@ -1689,11 +1667,11 @@ mod tests {
         assert_eq!(tick.skipped, 1, "the tick must count the dropped proposal");
         assert_ne!(tick_session, session_id);
 
-        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            captured.contains("scheduled auto-improve proposal was not staged")
-                && captured.contains(COLLIDING_PATH),
-            "the log must name the dropped target: {captured}"
+        assert_eq!(
+            tick.skipped_proposals.len(),
+            1,
+            "the tick must carry the dropped proposal, not just the count"
         );
+        assert_eq!(tick.skipped_proposals[0].target_path, COLLIDING_PATH);
     }
 }
