@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed automatic handoffs carrying harness scaffolding as the user's
+  request: a user turn that opens with a markup block whose opening tag has
+  no attributes (for example the `<task-notification>` block Claude Code
+  delivers when a background task, agent or workflow completes) no longer
+  becomes the handoff's `Started:` / `Last:` summary, its `Continue from:`
+  line, or its `Unresolved question:` line. The handoff now uses the last
+  prompt the user actually wrote, and falls back to the no-prompt summary
+  when every prompt in the session is such a block. Prompts that only
+  contain markup later in the text, pastes with attributes such as
+  `<pasted_content id="…">`, and stored observations are unchanged.
+
 ## [2.6.1] - 2026-10-08
 
 ### Fixed
