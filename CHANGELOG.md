@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed explicit in-session "consolidate this session" requests reaching the
+  server's model: the routing instructions and the managed learning and
+  durable-pages skills now send them to the agent route (`memory_read_session_observations`, then
+  `memory_write_page` with `session_id`) and give the agent the server's
+  multi-page layout (session, concept, decision, gotcha and rule pages, at
+  most five). `memory_consolidate` stays for other sessions and headless
+  runs. (#1140)
 - Fixed the scheduled auto-improve tests' intermittent empty log captures
   (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
   `warn!` callsite's first-in-process execution on a bare thread caches

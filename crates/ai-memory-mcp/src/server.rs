@@ -309,8 +309,15 @@ again, and say which you applied.\n\
   retract a specific `message_id`, or omit it to clear every pending message \
   this project has sent. Scoped to the sender, so it only affects your own \
   outbound mail.\n\
-- `memory_consolidate` — when the user asks to compile session \
-  observations into wiki pages. Also runs on PreCompact, and at \
+- `memory_consolidate` — compiles session observations into wiki \
+  pages on the SERVER'S model. For an explicit, in-session \
+  'consolidate this session' request about the session you are \
+  participating in, prefer the agent route so YOUR model writes the \
+  pages: `memory_read_session_observations`, then `memory_write_page` \
+  with `session_id` (path `sessions/<session_id>.md`, splitting durable \
+  decisions/gotchas/concepts into their own pages with the same \
+  `session_id`). Keep `memory_consolidate` for sessions you did not \
+  take part in and headless runs. Also runs on PreCompact, and at \
   session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set. \
   The target project's `_prompts/consolidation.md` page supplies bounded, \
   untrusted advisory preferences; `instructions` overrides it for one call.\n\
