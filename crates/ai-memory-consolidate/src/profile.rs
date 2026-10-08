@@ -88,8 +88,9 @@ const PREFERENCE_MARKERS: &[&str] = &[
     "by default",
     "i usually",
     "in all my projects",
-    "in every project",
+    "every project",
     "across all my projects",
+    "across projects",
     "everywhere",
     // Portuguese, in line with the recall router's pt-BR markers.
     "sempre",
@@ -107,24 +108,23 @@ const PREFERENCE_MARKERS: &[&str] = &[
     "por padrao",
     "eu costumo",
     "em todos os meus projetos",
+    "em todos os projetos",
     "em todo projeto",
 ];
 
-/// Words that mark a statement as holding everywhere (design §5.2).
+/// Phrases that mark a statement as holding across projects (design §5.2).
+/// An explicit cross-project scope only: a bare "always" or "by default" is
+/// compatible with one file, app or task ("always run the tests for foo.rs")
+/// and must not waive the `min_projects` bar (#1148).
 const GENERAL_MARKERS: &[&str] = &[
-    "always",
-    "by default",
-    "from now on",
     "in all my projects",
-    "in every project",
+    "every project",
     "across all my projects",
+    "across projects",
     "everywhere",
-    "sempre",
-    "por padrão",
-    "por padrao",
-    "a partir de agora",
-    "daqui pra frente",
+    // Portuguese, in line with the recall router's pt-BR markers.
     "em todos os meus projetos",
+    "em todos os projetos",
     "em todo projeto",
 ];
 
@@ -592,10 +592,36 @@ fn has_phrase(padded: &str, phrase: &str) -> bool {
 }
 
 /// Whether a sentence carries a preference marker at all (the loose gate the
-/// LLM classifier sees).
+/// LLM classifier sees). Sentences that read like agent output never pass.
 fn has_marker(sentence: &str) -> bool {
     let padded = padded_lower(sentence);
-    PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m))
+    PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m)) && !looks_agent_written(sentence)
+}
+
+/// Whether a sentence reads like agent output rather than a person typing a
+/// preference: markdown emphasis or a `file.ext:line` reference. On hosts
+/// where agents brief each other through the prompt channel, the user-prompt
+/// text is often a lead agent's task brief or a pasted review, full of
+/// "always"/"never" that only hold for that task (#1148).
+fn looks_agent_written(sentence: &str) -> bool {
+    if sentence.contains("**") || sentence.contains("__") {
+        return true;
+    }
+    sentence.split_whitespace().any(|word| {
+        let word = word.trim_matches(|c: char| {
+            !(c.is_alphanumeric() || matches!(c, '.' | ':' | '/' | '_' | '-'))
+        });
+        let Some((path, line)) = word.rsplit_once(':') else {
+            return false;
+        };
+        let line = line.split(['-', ':']).next().unwrap_or("");
+        let has_ext = path.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && (1..=6).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+        has_ext && !line.is_empty() && line.chars().all(|c| c.is_ascii_digit())
+    })
 }
 
 /// The preference-shaped sentences of user-written `text`, zero-LLM.
@@ -613,7 +639,10 @@ pub fn detect_preferences(text: &str) -> Vec<DetectedPreference> {
 }
 
 fn classify_sentence(sentence: &str) -> Option<DetectedPreference> {
-    if sentence.contains('?') || sentence.len() > SENTENCE_MAX_BYTES {
+    if sentence.contains('?')
+        || sentence.len() > SENTENCE_MAX_BYTES
+        || looks_agent_written(sentence)
+    {
         return None;
     }
     let padded = padded_lower(sentence);
@@ -670,6 +699,88 @@ pub fn topic_key(statement: &str) -> String {
         .into_iter()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Words that flip a ruling. [`STOP_WORDS`] drops them for topic matching,
+/// but "always use pnpm" and "never use pnpm" are opposite rulings.
+const NEGATIONS: &[&str] = &[
+    "never", "not", "no", "don", "dont", "avoid", "stop", "nunca", "não", "nao", "evite", "evitar",
+];
+
+/// A statement's ruling as a word sequence: its topic words in the order the
+/// user said them (so "pnpm over npm" and "npm over pnpm" differ), with every
+/// negation kept as `not` (so "always" and "never" differ).
+fn ruling_sequence(statement: &str) -> Vec<String> {
+    statement
+        .to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '+' || c == '#'))
+        .filter_map(|w| {
+            if NEGATIONS.contains(&w) {
+                Some("not".to_owned())
+            } else if w.chars().count() >= 2 && !STOP_WORDS.contains(&w) {
+                Some(w.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether two statements make the same ruling in different words.
+/// Conservative by design: a rewording it cannot recognise counts as a
+/// change, which the latest ruling then wins.
+fn same_ruling(a: &str, b: &str) -> bool {
+    let sequence = ruling_sequence(a);
+    sequence.iter().any(|w| w != "not") && sequence == ruling_sequence(b)
+}
+
+/// Whether `b` reverses `a`: the same topic words with the negation flipped
+/// ("Always use pnpm" / "Never use pnpm"). The LLM merge may not keep the old
+/// text over such a reversal: the latest ruling wins.
+fn negation_flipped(a: &str, b: &str) -> bool {
+    let (a, b) = (ruling_sequence(a), ruling_sequence(b));
+    let topic = |s: &[String]| {
+        let mut words: Vec<String> = s.iter().filter(|w| *w != "not").cloned().collect();
+        words.sort();
+        words.dedup();
+        words
+    };
+    let negated = |s: &[String]| s.iter().filter(|w| *w == "not").count() % 2 == 1;
+    let topic_a = topic(&a);
+    !topic_a.is_empty() && topic_a == topic(&b) && negated(&a) != negated(&b)
+}
+
+/// The statement, reasoning and scope a managed entry page currently shows.
+struct StoredText {
+    statement: String,
+    reasoning: Option<String>,
+    applies_to: Vec<String>,
+}
+
+impl StoredText {
+    fn of(path: &str, title: &str, body: &str, frontmatter: &serde_json::Value) -> Option<Self> {
+        let entry = ProfileEntry::from_page(path, title, body, frontmatter)?;
+        let mut applies_to = entry.applies_to;
+        applies_to.sort();
+        applies_to.dedup();
+        Some(Self {
+            reasoning: rendered_reasoning(body, &entry.statement),
+            statement: entry.statement,
+            applies_to,
+        })
+    }
+}
+
+/// The reasoning paragraph [`render_entry`] writes between the statement and
+/// the evidence list, if any.
+fn rendered_reasoning(body: &str, statement: &str) -> Option<String> {
+    let after = body.split_once(&format!("\n{statement}\n"))?.1;
+    let reasoning = after
+        .split("\n## In your words")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!reasoning.is_empty()).then(|| reasoning.to_owned())
 }
 
 fn key_tokens(key: &str) -> BTreeSet<String> {
@@ -902,6 +1013,19 @@ struct Member<'a> {
 }
 
 fn group_by_topic<'a>(rows: &[&'a ProfileCandidateRow]) -> Vec<Vec<Member<'a>>> {
+    group_by_topic_counted(rows).0
+}
+
+/// [`group_by_topic`], also returning how many token-set comparisons it made.
+///
+/// A candidate joins the group holding its most similar member (single link,
+/// ties to the older group). Two facts keep a pass near-linear instead of
+/// comparing every candidate with every member (UniiChat's "never scan"):
+/// a group sharing no token with the candidate scores zero, below the
+/// threshold, so only groups reached through an inverted token index are
+/// scored; and members with identical token sets score identically, so each
+/// group compares each distinct set once.
+fn group_by_topic_counted<'a>(rows: &[&'a ProfileCandidateRow]) -> (Vec<Vec<Member<'a>>>, usize) {
     let mut sorted: Vec<&ProfileCandidateRow> = rows.to_vec();
     sorted.sort_by(|a, b| {
         a.candidate
@@ -911,30 +1035,51 @@ fn group_by_topic<'a>(rows: &[&'a ProfileCandidateRow]) -> Vec<Vec<Member<'a>>> 
             .then_with(|| a.candidate.topic_key.cmp(&b.candidate.topic_key))
     });
     let mut groups: Vec<Vec<Member<'a>>> = Vec::new();
+    let mut distinct: Vec<BTreeSet<BTreeSet<String>>> = Vec::new();
+    let mut index: std::collections::HashMap<String, BTreeSet<usize>> =
+        std::collections::HashMap::new();
+    let mut comparisons = 0;
     for row in sorted {
         let tokens = key_tokens(&row.candidate.topic_key);
         if tokens.is_empty() {
             continue;
         }
-        let best = groups
+        let reachable: BTreeSet<usize> = tokens
             .iter()
-            .enumerate()
-            .map(|(idx, group)| {
-                let score = group
-                    .iter()
-                    .map(|m| topic_similarity(&m.tokens, &tokens))
-                    .fold(0.0, f64::max);
-                (idx, score)
-            })
-            .filter(|(_, score)| *score >= TOPIC_OVERLAP_THRESHOLD)
-            .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
-        let member = Member { row, tokens };
-        match best {
-            Some((idx, _)) => groups[idx].push(member),
-            None => groups.push(vec![member]),
+            .filter_map(|token| index.get(token))
+            .flatten()
+            .copied()
+            .collect();
+        let mut best: Option<(usize, f64)> = None;
+        // Ascending group order, keeping the first maximum: ties go to the
+        // older group, as the per-member scan did.
+        for idx in reachable {
+            let score = distinct[idx]
+                .iter()
+                .map(|set| {
+                    comparisons += 1;
+                    topic_similarity(set, &tokens)
+                })
+                .fold(0.0, f64::max);
+            if score >= TOPIC_OVERLAP_THRESHOLD && best.is_none_or(|(_, top)| score > top) {
+                best = Some((idx, score));
+            }
         }
+        let idx = match best {
+            Some((idx, _)) => idx,
+            None => {
+                groups.push(Vec::new());
+                distinct.push(BTreeSet::new());
+                groups.len() - 1
+            }
+        };
+        for token in &tokens {
+            index.entry(token.clone()).or_default().insert(idx);
+        }
+        distinct[idx].insert(tokens.clone());
+        groups[idx].push(Member { row, tokens });
     }
-    groups
+    (groups, comparisons)
 }
 
 fn project_label(row: &ProfileCandidateRow) -> String {
@@ -1101,8 +1246,13 @@ pub fn converge(
     }
 
     // Statements: group by topic, admit, latest ruling wins.
+    let mut used_quotes: BTreeSet<String> = BTreeSet::new();
     for group in group_by_topic(&statement_rows) {
         let projects: BTreeSet<String> = group.iter().map(|m| project_label(m.row)).collect();
+        // One instruction fanned out to several checkouts at once (a lead
+        // agent's brief to its workers) is one piece of evidence, not one per
+        // project (#1148).
+        let independent = independent_projects(&group);
         let general = group
             .iter()
             .any(|m| m.row.candidate.generality == ProfileGenerality::General);
@@ -1122,7 +1272,7 @@ pub fn converge(
         let projects_short = if general {
             0
         } else {
-            min_projects.saturating_sub(projects.len())
+            min_projects.saturating_sub(independent)
         };
         // Only a team profile counts people; a personal one (or a single-user
         // server, where evidence carries no contributor) needs none.
@@ -1134,10 +1284,19 @@ pub fn converge(
         if projects_short > 0 || contributors_short > 0 {
             plan.waiting.push(WaitingGroup {
                 statement: newest.row.candidate.statement.clone(),
-                projects: projects.len(),
+                projects: independent,
                 needs: projects_short,
                 contributors_needed: contributors_short,
             });
+            continue;
+        }
+        // One quote backs one entry: a group whose every quote already
+        // backs an entry admitted in this pass adds nothing new (#1148).
+        let quotes: BTreeSet<String> = group
+            .iter()
+            .map(|m| normalized_quote(&m.row.candidate.quote))
+            .collect();
+        if quotes.is_subset(&used_quotes) {
             continue;
         }
         // An entry the user removed stays removed until they say it again.
@@ -1201,7 +1360,7 @@ pub fn converge(
                     .unwrap_or(0),
             ),
             last_seen: date_of(newest.row.candidate.observed_at),
-            confidence: confidence_of(projects.len(), general, best_candidate),
+            confidence: confidence_of(independent, general, best_candidate),
             generality: if general {
                 ProfileGenerality::General
             } else {
@@ -1219,8 +1378,47 @@ pub fn converge(
             matched.as_deref(),
         );
         taken.insert(path);
+        used_quotes.extend(quotes);
     }
     plan
+}
+
+/// A quote reduced to its words, so the same brief pasted with different
+/// whitespace or punctuation compares equal.
+fn normalized_quote(quote: &str) -> String {
+    padded_lower(quote).trim().to_owned()
+}
+
+/// How long after one occurrence the same quote in another project still
+/// counts as the same message rather than a second, independent statement.
+/// A lead agent fans one brief out to its workers within minutes; a person
+/// repeating a habit in another project does so on another day.
+const FAN_OUT_WINDOW_US: i64 = 60 * 60 * 1_000_000;
+
+/// How many projects carry independent evidence for a group. The same quote
+/// seen in several projects within [`FAN_OUT_WINDOW_US`] of an occurrence
+/// already counted is one message fanned out, so it counts once.
+fn independent_projects(group: &[Member<'_>]) -> usize {
+    let mut occurrences: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+    for member in group {
+        occurrences
+            .entry(normalized_quote(&member.row.candidate.quote))
+            .or_default()
+            .push((member.row.candidate.observed_at, project_label(member.row)));
+    }
+    let mut projects = BTreeSet::new();
+    for mut seen in occurrences.into_values() {
+        seen.sort();
+        let mut last_counted: Option<i64> = None;
+        for (at, project) in seen {
+            if last_counted.is_some_and(|last| at - last < FAN_OUT_WINDOW_US) {
+                continue;
+            }
+            last_counted = Some(at);
+            projects.insert(project);
+        }
+    }
+    projects.len()
 }
 
 /// Route an admitted entry: skip it when its page is hand-edited, count it
@@ -1229,7 +1427,7 @@ fn place(
     plan: &mut ConvergePlan,
     existing: &[ExistingEntry],
     claimed: &mut BTreeSet<String>,
-    entry: EntryPlan,
+    mut entry: EntryPlan,
     matched: Option<&str>,
 ) {
     if let Some(path) = matched {
@@ -1243,9 +1441,29 @@ fn place(
                 plan.unchanged += 1;
                 return;
             }
+            keep_settled_text(page, &mut entry);
         }
     }
     plan.writes.push(entry);
+}
+
+/// New evidence that only corroborates an entry (the same ruling, the same
+/// scope) updates its evidence and leaves its statement and reasoning, and so
+/// its digest line, exactly as they were: a settled line changes only when
+/// the ruling or its scope does (design §3, "settled lines don't churn").
+fn keep_settled_text(page: &ExistingEntry, entry: &mut EntryPlan) {
+    let title = page
+        .frontmatter
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let Some(stored) = StoredText::of(&page.path, title, &page.body, &page.frontmatter) else {
+        return;
+    };
+    if stored.applies_to == entry.applies_to && same_ruling(&stored.statement, &entry.statement) {
+        entry.statement = stored.statement;
+        entry.reasoning = stored.reasoning;
+    }
 }
 
 /// Whether a managed page was rendered from exactly this evidence. Compared
@@ -1370,6 +1588,9 @@ pub struct ClassifyResponse {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeResponse {
+    /// Whether the evidence changes the entry's ruling or scope. When false,
+    /// the current entry stands and the restatement is ignored.
+    pub changed: bool,
     /// The entry as one imperative line (≤ 200 characters).
     pub statement: String,
     /// The user's reasoning, in their words where possible; empty for none.
@@ -1949,16 +2170,40 @@ async fn converge_target(
     .map_err(|e| e.to_string())?;
     let mut written = Vec::new();
     for mut entry in plan.writes {
+        let stored = existing_pages
+            .iter()
+            .find(|p| p.path == entry.path)
+            .and_then(|p| StoredText::of(&p.path, &p.title, &p.body, &p.frontmatter));
+        // `place` already kept a settled entry's text; nothing to restate.
+        let settled = stored
+            .as_ref()
+            .is_some_and(|stored| stored.statement == entry.statement);
         if let Some(llm) = llm
             && *merge_budget > 0
+            && !settled
         {
             *merge_budget -= 1;
-            let current = existing_pages
-                .iter()
-                .find(|p| p.path == entry.path)
-                .and_then(|p| ProfileEntry::from_page(&p.path, &p.title, &p.body, &p.frontmatter))
-                .map(|e| e.statement);
-            match merge_entry(llm.as_ref(), wiki.sanitizer(), current.as_deref(), &entry).await {
+            let current = stored.as_ref().map(|stored| stored.statement.as_str());
+            match merge_entry(llm.as_ref(), wiki.sanitizer(), current, &entry).await {
+                Ok(merged)
+                    if !merged.changed
+                        && stored.as_ref().is_some_and(|stored| {
+                            !negation_flipped(&stored.statement, &entry.statement)
+                        }) =>
+                {
+                    // The evidence corroborates the entry: it stands as written.
+                    report.llm_calls += 1;
+                    if let Some(stored) = stored {
+                        entry.statement = stored.statement;
+                        entry.reasoning = stored.reasoning;
+                        entry.applies_to = stored.applies_to;
+                    }
+                }
+                Ok(merged) if !merged.changed => {
+                    // A reversal the model called unchanged: keep the newest
+                    // ruling as harvested rather than the stored text.
+                    report.llm_calls += 1;
+                }
                 Ok(merged) => {
                     report.llm_calls += 1;
                     let statement = clean_line(&merged.statement, STATEMENT_MAX_BYTES);
@@ -2233,6 +2478,78 @@ mod tests {
         1_790_000_000_000_000 + n * 86_400_000_000
     }
 
+    /// Agent output in the prompt channel (a lead agent's brief, a pasted
+    /// review) is not the user stating a preference (#1148).
+    #[test]
+    fn agent_written_sentences_are_not_candidates() {
+        for text in [
+            "Always check src/router.rs:120 before you touch the gate.",
+            "Never edit crates/store/src/ops.rs:600-640 by hand.",
+            "**Never** run the migration twice.",
+            "Always keep __init__ files empty.",
+        ] {
+            assert!(looks_agent_written(text), "{text}");
+            assert!(detect_preferences(text).is_empty(), "{text}");
+            assert!(!has_marker(text), "{text}");
+        }
+        for text in [
+            "Always use pnpm for installs.",
+            "I prefer a 3:2 split for the sidebar layout.",
+            "Never commit generated files like build.rs output.",
+        ] {
+            assert!(!looks_agent_written(text), "{text}");
+            assert!(!detect_preferences(text).is_empty(), "{text}");
+        }
+    }
+
+    /// The same brief fanned out to two workers' checkouts within minutes is
+    /// one message; the same words typed in two projects days apart is a
+    /// habit (#1148).
+    #[test]
+    fn a_fanned_out_brief_counts_once_and_a_repeated_habit_twice() {
+        let brief = "Always run the full suite before you reply.";
+        let alpha = row("worker-a", brief, day(1), ProfileGenerality::Project);
+        let beta = row(
+            "worker-b",
+            brief,
+            day(1) + 60_000_000,
+            ProfileGenerality::Project,
+        );
+        let plan = converge(&[&alpha, &beta], &[], &[], 2, 1);
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert_eq!(plan.waiting.len(), 1);
+        assert_eq!(plan.waiting[0].needs, 1);
+
+        let later = row("worker-b", brief, day(3), ProfileGenerality::Project);
+        let plan = converge(&[&alpha, &later], &[], &[], 2, 1);
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].projects, 2);
+    }
+
+    /// One quote backs one entry even when it was classified into two
+    /// topics: no `-2`/`-3` duplicates of the same sentence (#1148).
+    #[test]
+    fn one_quote_backs_one_entry() {
+        let quote = "In all my projects, use pnpm and keep commits small.";
+        let mut pnpm = row(
+            "alpha",
+            "Use pnpm for every project.",
+            day(1),
+            ProfileGenerality::General,
+        );
+        pnpm.candidate.quote = quote.to_owned();
+        let mut commits = row(
+            "alpha",
+            "Keep commits small everywhere.",
+            day(1),
+            ProfileGenerality::General,
+        );
+        commits.candidate.quote = quote.to_owned();
+        commits.candidate.source_ref = "session:alpha-other".to_owned();
+        let plan = converge(&[&pnpm, &commits], &[], &[], 2, 1);
+        assert_eq!(plan.writes.len(), 1, "{:?}", plan.writes);
+    }
+
     #[test]
     fn detects_imperative_preferences_in_english_and_portuguese() {
         let found = detect_preferences(
@@ -2248,9 +2565,45 @@ mod tests {
                 "Sempre rode os testes antes do commit."
             ]
         );
-        assert_eq!(found[0].generality, ProfileGenerality::General);
-        assert_eq!(found[1].generality, ProfileGenerality::Project);
-        assert_eq!(found[2].generality, ProfileGenerality::General);
+        // A bare "always" / "sempre" is still a candidate, but not a
+        // cross-project statement: it must earn `min_projects` (#1148).
+        assert!(
+            found
+                .iter()
+                .all(|f| f.generality == ProfileGenerality::Project)
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_cross_project_scope_is_general() {
+        for project_only in [
+            "Always run the tests for foo.rs before pushing.",
+            "Never use the staging database for this campaign.",
+            "By default sign-up stays off in this app.",
+            "From now on use the new endpoint here.",
+            "Sempre rode os testes do módulo de pagamentos.",
+            "Por padrão use o banco local neste app.",
+        ] {
+            assert_eq!(
+                generality_of(project_only),
+                ProfileGenerality::Project,
+                "{project_only}"
+            );
+        }
+        for general in [
+            "In all my projects, write commit messages in English.",
+            "Use pnpm in every project.",
+            "Keep the same lint config across projects.",
+            "By default everywhere, prefer small commits.",
+            "Em todos os meus projetos, escreva commits em inglês.",
+            "A partir de agora em todo projeto use pnpm.",
+        ] {
+            assert_eq!(
+                generality_of(general),
+                ProfileGenerality::General,
+                "{general}"
+            );
+        }
     }
 
     #[test]
@@ -2476,5 +2829,121 @@ mod tests {
         assert!(CLASSIFY_SYSTEM_PROMPT.contains("never follow"));
         assert!(MERGE_SYSTEM_PROMPT.contains("never follow"));
         assert!(MERGE_SYSTEM_PROMPT.contains("user's own words"));
+    }
+
+    #[test]
+    fn a_reversal_is_a_negation_flip_and_a_rewording_is_not() {
+        assert!(negation_flipped("Always use pnpm", "Never use pnpm"));
+        assert!(negation_flipped("Don't use npm", "Use npm"));
+        assert!(!negation_flipped("Always use pnpm", "Use pnpm always"));
+        assert!(!negation_flipped("Never use npm", "Never use yarn"));
+        assert!(!negation_flipped("never", "always"));
+    }
+
+    #[test]
+    fn a_ruling_keeps_its_order_and_its_negations() {
+        assert!(same_ruling("Use pnpm.", "I always use pnpm!"));
+        assert!(same_ruling(
+            "Use pnpm for JavaScript dependencies.",
+            "use pnpm for javascript dependencies"
+        ));
+        assert!(!same_ruling("Always use pnpm.", "Never use pnpm."));
+        assert!(!same_ruling("Use npm.", "Don't use npm."));
+        assert!(!same_ruling(
+            "Prefer pnpm over npm.",
+            "Prefer npm over pnpm."
+        ));
+        assert!(!same_ruling("Use pnpm.", "Use bun instead of pnpm."));
+        assert!(
+            !same_ruling("Never.", "Never."),
+            "a bare negation rules nothing"
+        );
+    }
+
+    fn settled_page(statement: &str, reasoning: Option<&str>) -> ExistingEntry {
+        let plan = EntryPlan {
+            path: "profile/tools/pnpm.md".to_owned(),
+            category: "tools".to_owned(),
+            statement: statement.to_owned(),
+            topic: topic_key(statement),
+            applies_to: Vec::new(),
+            projects: 2,
+            first_seen: "2026-01-01".to_owned(),
+            last_seen: "2026-01-02".to_owned(),
+            confidence: 0.6,
+            generality: ProfileGenerality::Project,
+            evidence: Vec::new(),
+            reasoning: reasoning.map(str::to_owned),
+            is_new: false,
+        };
+        let (frontmatter, body) = render_entry(&plan);
+        ExistingEntry {
+            path: plan.path,
+            tokens: topic_tokens(statement),
+            managed: true,
+            frontmatter,
+            body,
+        }
+    }
+
+    fn incoming(statement: &str) -> EntryPlan {
+        EntryPlan {
+            path: "profile/tools/pnpm.md".to_owned(),
+            category: "tools".to_owned(),
+            statement: statement.to_owned(),
+            topic: topic_key(statement),
+            applies_to: Vec::new(),
+            projects: 3,
+            first_seen: "2026-01-01".to_owned(),
+            last_seen: "2026-01-09".to_owned(),
+            confidence: 0.7,
+            generality: ProfileGenerality::Project,
+            evidence: Vec::new(),
+            reasoning: None,
+            is_new: false,
+        }
+    }
+
+    /// Corroborating evidence keeps the stored statement and reasoning; a
+    /// reversed ruling or a narrower scope still replaces them.
+    #[test]
+    fn corroboration_keeps_the_settled_text() {
+        let page = settled_page("Use pnpm.", Some("Faster installs."));
+        let mut same = incoming("I always use pnpm!");
+        keep_settled_text(&page, &mut same);
+        assert_eq!(same.statement, "Use pnpm.");
+        assert_eq!(same.reasoning.as_deref(), Some("Faster installs."));
+
+        let mut reversed = incoming("Never use pnpm.");
+        keep_settled_text(&page, &mut reversed);
+        assert_eq!(reversed.statement, "Never use pnpm.");
+
+        let mut narrower = incoming("I always use pnpm!");
+        narrower.applies_to = vec!["javascript".to_owned()];
+        keep_settled_text(&page, &mut narrower);
+        assert_eq!(narrower.statement, "I always use pnpm!");
+    }
+
+    /// Grouping compares a candidate only with groups sharing a token, once
+    /// per distinct token set: 4,000 candidates on 400 topics take a few
+    /// thousand comparisons, where the per-member scan took millions.
+    #[test]
+    fn grouping_compares_with_groups_not_every_member() {
+        let rows: Vec<ProfileCandidateRow> = (0..4_000)
+            .map(|i| {
+                let topic = i % 400;
+                row(
+                    &format!("p{}", i % 7),
+                    &format!("use tool{topic} for build{topic}"),
+                    day(i64::from(i)),
+                    ProfileGenerality::Project,
+                )
+            })
+            .collect();
+        let refs: Vec<&ProfileCandidateRow> = rows.iter().collect();
+        let (groups, comparisons) = group_by_topic_counted(&refs);
+        assert_eq!(groups.len(), 400);
+        assert!(groups.iter().all(|g| g.len() == 10));
+        assert!(comparisons <= 4_000, "comparisons: {comparisons}");
     }
 }

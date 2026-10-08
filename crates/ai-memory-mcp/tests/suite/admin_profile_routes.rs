@@ -125,7 +125,7 @@ async fn call(
 #[tokio::test]
 async fn rebuild_converges_and_review_reports_entries_and_waiting_habits() {
     let fx = fixture().await;
-    prompt(&fx, "alpha", "Always use pnpm.").await;
+    prompt(&fx, "alpha", "Always use pnpm in every project.").await;
     prompt(&fx, "alpha", "I prefer tabs over spaces.").await;
 
     let (status, report) = call(
@@ -221,8 +221,13 @@ async fn review_and_rebuild_are_root_only_on_a_multi_user_server() {
 #[tokio::test]
 async fn apply_lists_the_lines_for_a_project_and_honours_consume() {
     let fx = fixture().await;
-    prompt(&fx, "alpha", "Always use pnpm.").await;
-    prompt(&fx, "alpha", "Always keep tests beside the code.").await;
+    prompt(&fx, "alpha", "Always use pnpm in every project.").await;
+    prompt(
+        &fx,
+        "alpha",
+        "Always keep tests beside the code in every project.",
+    )
+    .await;
     let (status, report) = call(
         router(&fx, ProfileSettings::default()),
         "POST",

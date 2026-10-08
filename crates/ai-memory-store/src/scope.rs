@@ -13,7 +13,7 @@ use ai_memory_core::{
     ActiveProject, ActiveProjectLookup, ActorKey, ProjectId, ReadPointer, UserId, WorkspaceId,
 };
 
-use crate::error::StoreError;
+use crate::error::{AmbiguousProjectHolders, StoreError};
 use crate::project_authz::{GrantLevel, ProjectAccess, ProjectPrincipal};
 use crate::{ReaderPool, WriterHandle};
 
@@ -182,6 +182,8 @@ pub enum ScopeResolutionError {
         workspace: String,
         /// Project name supplied by the caller.
         project: String,
+        /// The projects that answer to the name, when the lookup knows them.
+        holders: AmbiguousProjectHolders,
     },
     /// A project-only read did not resolve in either the actor's active
     /// workspace or the server's default workspace.
@@ -257,12 +259,30 @@ impl fmt::Display for ScopeResolutionError {
                 write!(
                     f,
                     "project '{project}' not found in workspace '{workspace}'"
-                )
+                )?;
+                // A project name never contains '/', so this is a
+                // `workspace/project` label passed as the project (#1152).
+                if let Some((ws, proj)) = project.split_once('/')
+                    && !ws.is_empty()
+                    && !proj.is_empty()
+                    && !proj.contains('/')
+                {
+                    write!(
+                        f,
+                        "; project names never contain '/': pass workspace \"{ws}\" and \
+                         project \"{proj}\" as separate arguments"
+                    )?;
+                }
+                Ok(())
             }
-            ScopeResolutionError::ProjectNameAmbiguous { workspace, project } => {
+            ScopeResolutionError::ProjectNameAmbiguous {
+                workspace,
+                project,
+                holders,
+            } => {
                 write!(
                     f,
-                    "project '{project}' is ambiguous in workspace '{workspace}'"
+                    "project '{project}' is ambiguous in workspace '{workspace}'{holders}"
                 )
             }
             ScopeResolutionError::ProjectNotFoundInActiveOrDefault { project } => {
@@ -290,10 +310,13 @@ impl From<StoreError> for ScopeResolutionError {
 
 fn project_lookup_error(error: StoreError, workspace: &str, project: &str) -> ScopeResolutionError {
     match error {
-        StoreError::ProjectNameAmbiguous(_) => ScopeResolutionError::ProjectNameAmbiguous {
-            workspace: workspace.to_owned(),
-            project: project.to_owned(),
-        },
+        StoreError::ProjectNameAmbiguous { holders, .. } => {
+            ScopeResolutionError::ProjectNameAmbiguous {
+                workspace: workspace.to_owned(),
+                project: project.to_owned(),
+                holders,
+            }
+        }
         StoreError::Forbidden(message) => ScopeResolutionError::Forbidden(format!(
             "not authorized for {project}: this needs write access. {message}"
         )),
@@ -1235,6 +1258,27 @@ mod tests {
     use ai_memory_core::NewUser;
 
     use crate::{AccessMode, GrantLevel};
+
+    /// A `workspace/project` label passed as the project names the split
+    /// (#1152); an ordinary miss keeps the plain message.
+    #[test]
+    fn a_slashed_project_name_points_at_the_separate_arguments() {
+        let glued = ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: "default".into(),
+            project: "myorg/myproject".into(),
+        }
+        .to_string();
+        assert!(
+            glued.contains("pass workspace \"myorg\" and project \"myproject\""),
+            "{glued}"
+        );
+        let plain = ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: "default".into(),
+            project: "ghost".into(),
+        }
+        .to_string();
+        assert_eq!(plain, "project 'ghost' not found in workspace 'default'");
+    }
 
     async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {
         store

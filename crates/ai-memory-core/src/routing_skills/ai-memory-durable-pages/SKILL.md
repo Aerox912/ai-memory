@@ -37,6 +37,18 @@ TTL, normal search, recent, and briefing reads hide the page; the next forget
 sweep deletes it. A TTL outranks `pinned`, so do not combine them unless the user
 has deliberately requested that behavior.
 
+## Writing a session's pages yourself
+
+When the user asks to consolidate the session you are taking part in, write its pages with your own model instead of the server's: read the session's raw observations first (the retrieval skill covers that read), then write each page with `memory_write_page` passing the same `session_id`, which records the session as evidence and settles its queued consolidation job. Match the server's multi-page layout, at most five pages:
+
+- `sessions/<session_id>.md`: the session narrative, `tier: "episodic"`, `kind: "fact"`.
+- `concepts/<slug>.md`: evergreen concept pages, `tier: "semantic"`, `kind: "fact"`.
+- `decisions/<short>.md`: ADR-style records of a choice made, `tier: "semantic"`, `kind: "decision"`.
+- `gotchas/<slug>.md`: failure modes and surprises, `tier: "semantic"`, `kind: "gotcha"`.
+- `_rules/<slug>.md`: a durable project convention written as a standalone instruction, `tier: "semantic"`, `kind: "rule"`.
+
+Only split out what the session actually established; a short session is one session page. Record what was said and done, and never turn a user's question into a confirmed decision.
+
 ## Project rules belong in instructions first
 
 If the user asks to create a durable project rule such as always do X or never do Y, update the project's canonical agent instruction file when the repository says one exists. Use a durable page only when the user explicitly wants the rule in the wiki too, or when no canonical instruction file applies.

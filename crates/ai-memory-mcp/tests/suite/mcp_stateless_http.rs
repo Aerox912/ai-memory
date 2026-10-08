@@ -28,6 +28,12 @@ use tower::ServiceExt;
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
 const TOOLS_CALL_STATUS: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_status","arguments":{}}}"#;
 const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#;
+/// Exact JSON the generated Pi `mcpNotify` posts (#1136).
+const INITIALIZED_NOTIFICATION: &str =
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+/// The previous Pi `mcpRpc` shape: a notification sent as a request (#1136).
+const INITIALIZED_AS_REQUEST: &str =
+    r#"{"jsonrpc":"2.0","id":63,"method":"notifications/initialized","params":{}}"#;
 
 /// Build a `/mcp` router exactly like `serve.rs` does, toggling stateful
 /// mode. Returns the `Store` too so the writer actor stays alive for the
@@ -164,6 +170,76 @@ async fn stateless_initialize_returns_json_result() {
     assert!(
         body.contains("serverInfo") || body.contains("protocolVersion"),
         "initialize result should carry server info: {body}"
+    );
+}
+
+/// #1136: JSON-RPC 2.0 notifications have no `id`. Streamable HTTP in the
+/// default stateless JSON mode must accept `notifications/initialized` with
+/// 202 and an empty body, which is what the generated Pi `mcpNotify` now
+/// posts and treats as success without calling `response.json()`.
+#[tokio::test]
+async fn stateless_initialized_notification_is_accepted_empty() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let initialized = router.clone().oneshot(post(INITIALIZE)).await.unwrap();
+    assert_eq!(initialized.status(), StatusCode::OK);
+
+    let resp = router
+        .clone()
+        .oneshot(post(INITIALIZED_NOTIFICATION))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "a JSON-RPC notification must be 202 Accepted"
+    );
+    let body = body_string(resp).await;
+    assert!(
+        body.is_empty(),
+        "notification response must be empty so clients do not parse JSON, got: {body:?}"
+    );
+
+    let listed = router.oneshot(post(TOOLS_LIST)).await.unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = body_string(listed).await;
+    let json: serde_json::Value =
+        serde_json::from_str(&listed_body).expect("tools/list returns JSON");
+    assert!(
+        json.get("error").is_none(),
+        "tools/list after the notification must succeed: {listed_body}"
+    );
+    assert!(
+        listed_body.contains("memory_status"),
+        "tools/list should name a real tool: {listed_body}"
+    );
+}
+
+/// #1136 adversarial control: the previous Pi generator assigned an `id`,
+/// so rmcp treated `notifications/initialized` as a request method and
+/// returned JSON-RPC -32601. This is the warning operators saw on every
+/// Pi launch. Restoring that payload must still fail this way; a blanket
+/// accept of the method name would hide a client regression.
+#[tokio::test]
+async fn stateless_initialized_sent_as_a_request_is_method_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let (router, _store) = make_router(&tmp, false).await;
+
+    let resp = router.oneshot(post(INITIALIZED_AS_REQUEST)).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a JSON-RPC *request* still gets an HTTP 200 envelope, got {}",
+        resp.status()
+    );
+    let body = body_string(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("expected JSON-RPC error body: {body}\n{e}"));
+    assert_eq!(
+        json["error"]["code"].as_i64(),
+        Some(-32601),
+        "request-shaped initialized must be method-not-found, got: {body}"
     );
 }
 

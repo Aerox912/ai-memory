@@ -12,11 +12,11 @@ use ai_memory_core::{
     PrepareManagedRunResponse, Sanitizer, SessionId,
 };
 use ai_memory_workstream::{
-    AmbiguousNativeSession, ExportedTranscript, FORWARDED_ENV_NAMES, JailChecklistItem,
-    JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode, LaunchPlan,
-    LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
+    AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, FORWARDED_ENV_NAMES,
+    JailChecklistItem, JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode,
+    LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_yolo, build_ai_jail_invocation,
-    build_launch_plan, build_launch_plan_with_env_lookup, claude_attached_background_session,
+    build_launch_plan, build_launch_plan_with_env_lookup, claude_continued_session,
     claude_live_background_attach_id, claude_session_ran_in_background, clean_path,
     crush_global_config_path, discover_native_session, export_transcript,
     has_native_session_selector, inside_ai_jail_here, inspect_repository,
@@ -2204,10 +2204,10 @@ fn own_native_session(
 }
 
 /// A Claude session that attached to a background session (`/resume` on one
-/// the Claude Code daemon hosts) went on in that session's transcript, so the
-/// workstream follows it. Otherwise the next launch resumes the foreground
-/// session, which holds none of the conversation.
-fn follow_claude_background_session(
+/// the Claude Code daemon hosts) or was `/clear`ed went on in another
+/// transcript, so the workstream follows it. Otherwise the next launch resumes
+/// the launch session, which holds none of the later conversation.
+fn follow_claude_continued_session(
     plan: &LaunchPlan,
     harness: ManagedHarness,
     home: &Path,
@@ -2218,25 +2218,23 @@ fn follow_claude_background_session(
     if harness != ManagedHarness::Claude {
         return own;
     }
-    match claude_attached_background_session(
-        home,
-        cwd,
-        plan.session_dir.as_deref(),
-        &own,
-        started_at,
-    ) {
-        Ok(Some(background)) => {
+    match claude_continued_session(home, cwd, plan.session_dir.as_deref(), &own, started_at) {
+        Ok(Some(continuation)) => {
+            let how = match &continuation {
+                ClaudeContinuation::Background(_) => "continued in background session",
+                ClaudeContinuation::Cleared(_) => "was cleared into session",
+            };
             eprintln!(
-                "ai-memory: Claude session {} continued in background session {}; the workstream now follows it",
+                "ai-memory: Claude session {} {how} {}; the workstream now follows it",
                 display_session_id(&own),
-                display_session_id(&background)
+                display_session_id(continuation.session_id())
             );
-            background
+            continuation.session_id().to_owned()
         }
         Ok(None) => own,
         Err(error) => {
             eprintln!(
-                "ai-memory: could not check whether Claude session {} moved to a background session ({error}); keeping it",
+                "ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
                 display_session_id(&own)
             );
             own
@@ -2261,7 +2259,7 @@ async fn resolve_native_session_after_run(
         NativeSessionIdentity::parse(id, sanitizer)?;
     }
     if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status, sanitizer) {
-        return Ok(Some(follow_claude_background_session(
+        return Ok(Some(follow_claude_continued_session(
             plan, harness, home, cwd, own, started_at,
         )));
     }
@@ -7017,6 +7015,68 @@ mod tests {
         // that transcript, so the workstream must not stay on "fg".
         std::fs::write(project.join("bg.jsonl"), record("bg", Some("bg"))).unwrap();
         assert_eq!(resolve(&plan).await.as_deref(), Some("bg"));
+    }
+
+    #[tokio::test]
+    async fn a_claude_run_that_was_cleared_follows_the_new_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let project = temp.path().join(".claude/projects/-repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - std::time::Duration::from_secs(60);
+        let turn = |session: &str| {
+            serde_json::json!({
+                "type": "user",
+                "sessionId": session,
+                "session_id": "launch",
+                "cwd": cwd,
+            })
+        };
+        std::fs::write(
+            project.join("launch.jsonl"),
+            format!("{}\n", turn("launch")),
+        )
+        .unwrap();
+        let mut plan =
+            build_launch_plan(ManagedHarness::Claude, None, Vec::new(), Some("launch")).unwrap();
+        // CLAUDE_CONFIG_DIR in the developer's environment would point the
+        // scan away from the transcripts planted under `temp`.
+        plan.session_dir = None;
+        let resolve = || {
+            let plan = plan.clone();
+            let home = temp.path().to_path_buf();
+            let cwd = cwd.clone();
+            async move {
+                resolve_native_session_after_run(
+                    &plan,
+                    ManagedHarness::Claude,
+                    &home,
+                    &cwd,
+                    started_at,
+                    None,
+                    &Sanitizer::builtin(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(resolve().await.as_deref(), Some("launch"));
+
+        // `/clear` inside the resumed session: the conversation goes on in a
+        // new transcript, so the next launch must resume that one.
+        let clear = serde_json::json!({
+            "type": "user",
+            "sessionId": "cleared",
+            "cwd": cwd,
+            "message": {"role": "user", "content": "<command-name>/clear</command-name>"},
+        });
+        std::fs::write(
+            project.join("cleared.jsonl"),
+            format!("{clear}\n{}\n", turn("cleared")),
+        )
+        .unwrap();
+        assert_eq!(resolve().await.as_deref(), Some("cleared"));
     }
 
     /// A session linked during the run was reported by this run's child, so

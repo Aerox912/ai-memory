@@ -800,7 +800,9 @@ function Invoke-AiMemoryDrainSpool {
                 try { $code = [int]$response.StatusCode } catch { $code = 0 }
             }
         }
-        if (($code -ge 200 -and $code -lt 300) -or ($code -ge 400 -and $code -lt 500)) {
+        if ($code -eq 408 -or $code -eq 425 -or $code -eq 429) {
+            break
+        } elseif (($code -ge 200 -and $code -lt 300) -or ($code -ge 400 -and $code -lt 500)) {
             Remove-Item -Force -LiteralPath $file.FullName -ErrorAction SilentlyContinue
         } else {
             break
@@ -1047,9 +1049,9 @@ function Invoke-AiMemoryHook {
             if ($_.Exception.Response) {
                 try { $Status = [int]$_.Exception.Response.StatusCode } catch { $Status = 0 }
             }
-            # 4xx = permanent rejection (not retried); everything else that
-            # failed to deliver is spooled.
-            if ($Status -lt 400 -or $Status -ge 500) {
+            # 4xx = permanent rejection (not retried); 408/425/429 (transient timeout
+            # / saturation) and everything else that failed to deliver is spooled.
+            if ($Status -lt 400 -or $Status -ge 500 -or $Status -eq 408 -or $Status -eq 425 -or $Status -eq 429) {
                 Write-AiMemorySpoolEvent -Url $HookUrl -Body $Payload
             }
         }

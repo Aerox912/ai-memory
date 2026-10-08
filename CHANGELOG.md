@@ -7,6 +7,172 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1-aerox.1] - 2026-10-08
+
+### Changed
+- Integrated canonical AI Memory through `d1da5898`, including the 2.6.1 sanitizer, retention, session-page, hook retry, and profile fixes, while preserving file-backed authentication, runtime-only native hook credentials, trusted pool routing, and native Windows/WSL packaging.
+- Adopted the canonical full-tier nextest CI runner without reducing test coverage or retrying failed tests automatically.
+
+## [2.6.1] - 2026-10-08
+
+### Fixed
+- Fixed an explicit-scope miss giving no hint when an agent passed a
+  `workspace/project` label as the project (for example `project:
+  "myorg/myproject"` with the default workspace): project names never contain
+  `/`, so the error now names the separate `workspace` and `project` arguments
+  to pass. (#1152)
+- Fixed the cross-project profile rewriting a settled entry whenever new
+  evidence merely agreed with it: a statement now changes only when the ruling
+  or its scope does (the LLM merge reports `changed`), so the line every project
+  receives stays put. The profile digest also moved to the front of the
+  session-start payload, ahead of the handoff and brief that change every
+  session, so it stays in the harness's cacheable prompt prefix; its footer now
+  asks the agent to open an entry before relying on its one-line summary; and
+  topic grouping no longer compares every candidate with every other, which
+  grew quadratically on long-lived installs. See
+  `docs/design-cross-project-profile.md` §11. (#1000)
+- Fixed hook observation bodies being capped *before* the sanitizer ever saw
+  them: excerpt extraction (`tool: …` bodies, user prompts, notifications,
+  post-compaction summaries, extension bodies) applied its 2 KB / 16 KB
+  ceilings at parse time, so a secret straddling the cutoff was cut in half
+  and the surviving prefix, too short to match a pattern, was stored
+  unredacted — the body-side twin of the #980 title-hint leak. The per-event
+  caps (`payload::durable_body_cap`) now run at the ingest funnel, applied to
+  the already-scrubbed text, mirroring `Sanitized::new` and the #1109
+  feedback-reason fix. The stored body shapes and byte limits are unchanged.
+  (#1114)
+- Fixed the native hook's client-side spool cap truncating oversized
+  lifecycle bodies (user prompts, notifications, post-compaction summaries)
+  before any scrubbing: the capped field is now scrubbed with the built-in
+  sanitizer first and truncated second — the order `assistant_capture` and
+  the #980 / #1109 fixes established — so a straddling secret can no longer
+  reach the spool (and through it the server) as an unredacted fragment.
+  (#1114)
+- Fixed the managed-workstream ledger capping event content *before* the
+  sanitizer ever saw it: the 64 KiB per-event cap in
+  `hooks::workstream::sanitize_events` truncated first, so a secret
+  straddling the cutoff was cut into a prefix too short to match any
+  pattern and persisted unredacted in the immutable raw segment — the same
+  ordering bug as the #980 title-hint and #1109 feedback-reason leaks. The
+  cap now runs after scrubbing, the server-generated checkpoint and losses
+  boundary events get the same ordering, and the store's `finish_run`
+  scrubs with the caller's sanitizer before its own 16 KiB bound as
+  defense in depth. The stored shapes and byte limits are unchanged.
+  (#1113)
+- Fixed SessionEnd replacing the session page an agent wrote itself through
+  `memory_write_page` with `session_id`: the rule-based summary overwrote it
+  on every substantive session end, and the opt-in SessionEnd worker's skip
+  never applied, since it read the page after that overwrite and compared an
+  observation count that the agent's own tool call, the Stop and the
+  SessionEnd always advance. A session page carrying `consolidated_by: agent`
+  is now kept by both, and by the PreCompact and PostCompaction checkpoints,
+  which rewrote it the same way. The write no longer stamps
+  `observation_generation`. (#1138)
+- Fixed `ai-memory run claude` resuming the launch session forever after a
+  `/clear`: Claude Code continues a cleared conversation in a new session,
+  and the workstream now follows it — the newest one after several clears —
+  so the next launch resumes where the work actually went and that
+  transcript, not the abandoned one, is imported. Only a transcript that
+  records the `/clear` command, names this launch's session as its origin,
+  and stays in this checkout (or a directory below it) is followed. (#1135)
+- Fixed `ai-memory backfill` failing on every Antigravity CLI session: it and
+  `ai-memory run` now import the session's user prompts from `agy`'s
+  `history.jsonl`, keeping only lines whose conversation and workspace match
+  the checkout. (#1134)
+- Fixed the hook spool charging a spooled event's retry budget while the
+  server was unreachable: an endpoint-level delivery failure (connection
+  refused, timeout, DNS — the existing `Unreachable` classification) no
+  longer increments `attempts`, so a total outage no longer deletes the
+  oldest events at roughly one per `max_attempts` drain passes while the
+  server is down. Post-connect failures (a server that answers with 5xx or
+  a protocol error) keep the previous charging semantics, and the 10,000
+  file cap and 7-day spool TTL bounds are unchanged. Also corrected the
+  stale `hooks/_lib.sh` comment that claimed the backlog is drained at
+  session boundaries only (a piggyback drain also runs after any
+  successful 2xx POST). (#1121)
+- Fixed the PowerShell hook bundle silently losing every capture event
+  during a server outage: the `.ps1` path now spools an undeliverable POST
+  (connection failure, timeout, or 5xx) to the same `<data_dir>/hook-spool/`
+  on-disk contract the shell bundle, the native hooks, and
+  `ai-memory hook-drain` share — same `<ms>-<pid>-<seq>.json` entry names,
+  same `SpoolEntry` JSON — and, like `ai_memory_post_hook`, kicks a detached
+  bounded drain (≤64 entries) after the next successful delivery, retires
+  entries on a 2xx or a terminal 4xx, and never spools a routed-repository
+  or externally-owned capture event. The PowerShell POST also mints an
+  idempotency `ingest_key` before its initial attempt and keeps it on the
+  spooled replay, so an ambiguous delivery that committed server-side is
+  discarded on replay instead of double-ingested. (#1122)
+- Continued the `memory_explore` provider-body redaction (#1103) to
+  `memory_query(answer=true)`: when answer synthesis fails, the
+  `answer_unavailable` note and the server warning now carry only the
+  redacted `class`/`status` summary (for example
+  `class=provider status=400`) instead of the error's `Display`, which for a
+  provider failure includes the upstream response body. The default path
+  (no `answer`) is unchanged. (#1132)
+- Fixed Hermes `post_tool_call` captures losing the tool result and
+  outcome. Hermes nests the tool result at `extra.result` and mirrors the
+  call status at `extra.status`; the extractor previously read only
+  top-level `tool_output`/`tool_response`/`result`, so every Hermes
+  observation body read `(no output captured)` and the outcome stayed
+  `unknown` forever. Output now comes from `extra.result` (falling back to
+  `extra.error_message`), and `extra.status` of `ok`/`error` maps to
+  `success`/`error`. Recognized Hermes tool names that execute code or
+  reach the web (`execute_code`, `browser_exec`, `browser_navigate`,
+  `web_extract`, `web_fetch`, `delegate_task`) classify as `non-file`
+  instead of `unknown`, so their output is no longer dropped by the
+  unknown-family body shortcut. Payload shape verified against Hermes
+  `agent/shell_hooks.py` on 2026-10-07. (#1123)
+- Fixed the Pi extension sending `notifications/initialized` as a JSON-RPC
+  request with an id: JSON-RPC 2.0 and MCP notifications do not carry an id and
+  expect no response body, which caused the server to emit `-32601`
+  method-not-found warnings on every Pi launch. The generated extension now
+  uses `mcpNotify` to send notifications without an id and accept empty
+  successful HTTP responses without failing JSON parsing. (#1136)
+- Fixed the shell (`hooks/_lib.sh`) and PowerShell (`hooks/lib/ai-memory-hook.ps1`)
+  hooks dropping live events and deleting spooled entries on a `408`, `425` or
+  `429` response, which they treated as a permanent rejection. They now keep
+  those events queued like other transient failures, matching the native
+  spool (`429` retries for free; `408`/`425` retry under its attempt budget
+  since #1092), and a drain pass stops without deleting queued entries. (#1146)
+- Fixed expired pages still showing in `page_links`, `related_walk` and
+  `cross_project_edges`: the web link panel, `memory_read_page
+  include_related`, and the web / `/api/v1` graph view now hide a page (and
+  any edge touching it) once its TTL has passed. Search, recent, briefing, and
+  `graph_neighbors_for_project` already applied the retrieval TTL
+  (`expires_at` is null or still in the future); these three queries only
+  filtered `is_latest`. An expired neighbour is neither returned nor
+  walked through. Exact-path reads of an expired page are unchanged. (#1141)
+- Fixed the session-aware MCP bridge failing on Docker-wrapper installs: the
+  wrapper sent `mcp-bridge` to the helper container, where the registered
+  `127.0.0.1` server URL is unreachable, so every session started without
+  ai-memory's MCP tools. The wrapper now runs `mcp-bridge` through its
+  checksum-verified native host client, which also repairs existing entries.
+  (#1147)
+- Fixed the cross-project profile promoting a single project's "always" /
+  "never" / "by default" sentences as general preferences: only an explicit
+  cross-project scope ("in all my projects", "every project", "everywhere",
+  and the Portuguese equivalents) now waives the `min_projects` threshold,
+  in both the zero-LLM detector and the LLM classifier prompt. (#1148)
+- Fixed explicit in-session "consolidate this session" requests reaching the
+  server's model: the routing instructions and the managed learning and
+  durable-pages skills now send them to the agent route (`memory_read_session_observations`, then
+  `memory_write_page` with `session_id`) and give the agent the server's
+  multi-page layout (session, concept, decision, gotcha and rule pages, at
+  most five). `memory_consolidate` stays for other sessions and headless
+  runs. (#1140)
+- Fixed the "project 'X' is ambiguous" refusal giving no clue which projects
+  collided. It now names each project that answers to the name and the key it
+  answers by (its name, its canonical key, or its legacy key), so an operator
+  whose undeclared clone created `acme-widget` with `widget` as its legacy key
+  can see which project to purge or rename. A restricted project is reported
+  as "a restricted project", never by name, matching the project list. (#1144)
+- Fixed the cross-project profile learning from agent-written prompt text
+  and counting one fanned-out brief as several projects: sentences that read
+  like agent output (markdown bold, `file.ext:line` references) are no longer
+  candidates, the same sentence arriving in several projects within an hour
+  counts as one project toward `min_projects`, and one sentence backs at most
+  one entry. (#1148)
+
 ## [2.6.0-aerox.1] - 2026-10-07
 
 ### Changed
@@ -8731,7 +8897,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v2.6.0-aerox.1...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v2.6.1-aerox.1...HEAD
+[2.6.1-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v2.6.1-aerox.1
+[2.6.1]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...v2.6.1
 [2.6.0-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v2.6.0-aerox.1
 [2.6.0]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...v2.6.0
 [2.5.2]: https://github.com/akitaonrails/ai-memory/compare/v2.5.1...v2.5.2

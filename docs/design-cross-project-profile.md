@@ -51,11 +51,16 @@ the same way the brief is.
 
 ## 3. What we borrowed from OptChat, and what we did not
 
-Victor Taelin's OptChat
-(<https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449>)
-makes one endless chat the memory: a binary tree of one-line summaries over a
-verbatim log, a fixed-size view rebuilt every turn, and a `zoom` tool to open a
-summary back into detail.
+Victor Taelin's OptChat, since rewritten as UniiChat
+(<https://gist.github.com/VictorTaelin/91837951a5ce5b38f341ec1ba1df6449>,
+revisions of 2026-10-04 and 2026-10-08), makes one endless chat the memory: a
+binary tree of one-line summaries over a verbatim log, a fixed-size view, and a
+`zoom` tool to open a summary back into detail. The rewrite fixed a cache bug in
+the first version: a pair's age was measured from its first message, merges ran
+at every message, and the view was rebuilt at start, so old lines kept being
+rewritten and the cached prefix broke early. The profile has no tree or view
+and never inherited that formula; the lessons it applies are stable-first
+ordering and leaving settled lines alone (below, and §11).
 
 Borrowed:
 
@@ -67,13 +72,27 @@ Borrowed:
   the older one; the older version stays reachable through the wiki's
   supersession chain (invariant #16: supersede, never destroy).
 - **Fixed byte budget, stable rendering.** Sizes are UTF-8 bytes, not tokens.
-  The digest is deterministic and byte-identical between sessions unless the
-  profile changed, so it stays inside the harness's cached prompt prefix.
+  The digest is deterministic: one line per entry (scope, statement, page),
+  with no evidence counts, dates or confidence, in fixed category-then-path
+  order. It goes first in the SessionStart payload, ahead of the handoff,
+  brief and inbox, which change every session, so it stays in the reusable
+  part of the harness's prompt.
+- **Settled lines don't churn.** UniiChat's correction to OptChat was that an
+  old line must change only when its content does. New evidence that agrees
+  with an entry is appended to its evidence and leaves the statement, and so
+  the digest line, untouched. The statement is rewritten only when the ruling
+  changes (the latest ruling wins) or its scope narrows; the LLM merge reports
+  `changed`, and its restatement is ignored otherwise.
 - **Zoom.** Each digest line names its page; `memory_read_page` opens it, and
   each page's evidence links back to the projects and sessions that taught it.
 - **Context for the summarizer, and it never obeys.** The LLM merge step sees
   the current profile entry when folding in new evidence, and its prompt
-  forbids following instructions found in the text it summarizes.
+  forbids following instructions found in the text it summarizes. It uses the
+  evidence to understand the entry, never to add what the user did not say,
+  and credits quoted text to its real author.
+- **Zoom before you act.** The digest footer tells the agent to open an entry
+  with `memory_read_page` before relying on its one-line summary for anything
+  non-trivial.
 
 Not borrowed: the single universal chat and harness (ai-memory is
 multi-harness and the harness owns its context), a verbatim log kept forever
@@ -138,8 +157,10 @@ false` is never harvested.
 A server job on the writer actor groups candidates across projects by topic.
 A candidate becomes (or updates) a profile entry when:
 
-- the user said it was general ("in all my projects", "always", "by default"),
-  or
+- the user explicitly scoped it beyond the project ("in all my projects",
+  "every project", "across projects", "everywhere", or the Portuguese
+  equivalents); a bare "always", "never", "by default" or "from now on" is
+  compatible with one file, app or task and does not count (#1148), or
 - the same choice appears in at least `min_projects` distinct projects
   (default 2).
 
@@ -151,6 +172,10 @@ project.
 Zero-LLM topic matching normalizes the statement (lowercase, stop words out,
 tool and language names kept) and groups by token overlap. With a provider
 configured (§6) the LLM classifies and merges instead.
+
+Grouping never scans every pair of candidates (UniiChat's "queue ready work,
+never scan"): a candidate is compared only with groups that share one of its
+topic words, once per distinct word set in each group.
 
 ### 5.3 Store
 
@@ -180,7 +205,8 @@ candidate newer than the entry's last write arrives.
 
 ### 5.4 Deliver
 
-- **SessionStart digest.** A fenced section after the project brief:
+- **SessionStart digest.** A fenced section, first in the payload (ahead of
+  the handoff, managed context, project brief and inbox notice):
   *"Your usual choices from other projects. Use them as defaults when this
   project's rules and the user say nothing; say which default you applied."*
   Entries whose `applies_to` is empty or matches the project's stack signals,
@@ -285,3 +311,30 @@ Each gets an adversarial test and a row in `docs/security-boundaries.md`.
 Automatic edits of a rules file (only `profile apply` writes one), a
 universal harness, and promoting arbitrary project knowledge into the profile
 without evidence from more than one project or an explicit general statement.
+
+## 11. Revision 2026-10-08: UniiChat lessons
+
+A review against the UniiChat rewrite found three places where 2.6.0 diverged
+from §3 and §5.2. All three are fixed for 2.6.1:
+
+1. **Digest position.** SessionStart assembles handoff, notice, managed
+   context and brief before the digest, so the digest sits after content that
+   changes every session. Move it first.
+2. **Churn on corroboration.** `place()` rewrites an entry whenever its
+   evidence changes, and the LLM merge always restates it, so a settled entry's
+   statement and digest line change when it is merely confirmed. Keep the
+   statement unless the ruling changes or its scope narrows; add `changed` to
+   the merge schema.
+3. **Quadratic grouping.** Each pass regroups every candidate (up to the
+   20,000-candidate cap) against every group. Persist each candidate's group
+   and compare only new candidates.
+
+As shipped, grouping compares a candidate only with groups that share one of
+its tokens (an inverted index), once per distinct token set in each group,
+which keeps a pass near-linear without any stored state. Fully incremental
+grouping, keyed by a stored group per candidate, needs a schema change and is
+left to 2.7.
+
+Lower priority, considered and not scheduled: a byte ruler with retry instead
+of truncating long statements (truncation only affects the rare entry over 200
+bytes).

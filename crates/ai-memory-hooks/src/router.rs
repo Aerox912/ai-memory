@@ -16,8 +16,8 @@ use ai_memory_consolidate::{Consolidator, ConsolidatorError, redacted_error_summ
 use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
-    NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
-    WorkstreamEvent, WorkstreamEventKind,
+    NewSession, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer, SessionId,
+    WorkspaceId, WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle,
@@ -42,7 +42,7 @@ use crate::capture_policy::{
 use crate::log;
 use crate::payload::{
     HookEnvelope, HookEvent, HookQuery, ProjectSource, ProjectStrategy, body_is_subagent,
-    parse_agent,
+    durable_body_cap, parse_agent,
 };
 use crate::synth::synthesize_session_page;
 
@@ -1586,9 +1586,9 @@ async fn fetch_and_accept_handoff_at(
     let profile_md =
         render_requested_profile_digest(state, &query, ws, proj, viewer, profile_flags.consume)
             .await;
-    // Handoff first: it is a short curated pointer and must not be buried
-    // under a ledger that can run tens of KB. The existing ledger-then-brief
-    // order is preserved. Claim both single-use inputs only after every
+    // Handoff right after the profile digest: it is a short curated pointer
+    // and must not be buried under a ledger that can run tens of KB. The
+    // existing ledger-then-brief order is preserved. Claim both single-use inputs only after every
     // fallible read and render has succeeded, and in one transaction so a
     // failed or racing managed claim cannot consume the handoff by itself.
     // Same reasoning as the SessionEnd insert: the session-start claim is how
@@ -1729,15 +1729,19 @@ async fn fetch_and_accept_handoff_at(
         // because the count could not be read.
         Err(_) => None,
     };
+    // The profile digest goes first: it changes only when the profile does,
+    // while everything after it changes every session, so leading with it
+    // keeps it in the reusable part of the harness's prompt cache (design:
+    // docs/design-cross-project-profile.md §3).
     Ok(combine_handoff_and_brief(
-        handoff_md,
+        profile_md,
         combine_handoff_and_brief(
-            handoff_notice,
+            handoff_md,
             combine_handoff_and_brief(
-                managed_md,
+                handoff_notice,
                 combine_handoff_and_brief(
-                    brief_md,
-                    combine_handoff_and_brief(profile_md, inbox_notice),
+                    managed_md,
+                    combine_handoff_and_brief(brief_md, inbox_notice),
                 ),
             ),
         ),
@@ -3292,6 +3296,21 @@ async fn process(
     }
 }
 
+/// Durable body for a hook observation: scrub the **full** excerpt first,
+/// then apply the per-event ceiling to the redacted text.
+///
+/// The cap used to run inside excerpt extraction in `payload`, before the
+/// sanitizer ever saw the text — a secret straddling the cutoff was cut in
+/// half, leaving a prefix too short to match a pattern, stored in clear text
+/// (#1114). This is the body-side twin of the #980 title-hint fix: scrub and
+/// cap together, in that order, at the persistence boundary.
+fn durable_body(event: HookEvent, excerpt: Option<&str>, sanitizer: &Sanitizer) -> String {
+    let Some(excerpt) = excerpt else {
+        return String::new();
+    };
+    truncate_utf8_bytes(&sanitizer.scrub(excerpt), durable_body_cap(event))
+}
+
 async fn process_authorized(
     state: &HookState,
     env: HookEnvelope,
@@ -3534,7 +3553,7 @@ async fn process_authorized(
                 .title_hint
                 .clone()
                 .unwrap_or_else(|| kind.as_str().to_string()),
-            body: env.body_excerpt.clone().unwrap_or_default(),
+            body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
         };
@@ -3841,29 +3860,37 @@ async fn process_authorized(
         } else {
             None
         };
-        let page_id = state
-            .wiki
-            .write_page(ai_memory_wiki::WritePageRequest {
-                workspace_id: new_page.workspace_id,
-                project_id: new_page.project_id,
-                path: new_page.path.clone(),
-                frontmatter: new_page.frontmatter_json.clone(),
-                body: new_page.body.clone(),
-                tier: new_page.tier,
-                pinned: new_page.pinned,
-                title: None,
-                admission_ctx: None,
-                author_id: None,
-                // Attribute to the operator who OWNED the session, read back
-                // from the session row, not to whoever delivered this
-                // SessionEnd — a spool drain, an operator finalizing a stuck
-                // session, or a shared hook token can all carry a different
-                // identity. NULL stays anonymous/shared, including rows that
-                // predate owner recording.
-                actor: session_actor.clone(),
-                evidence: Vec::new(),
-            })
-            .await?;
+        let page_id =
+            match agent_session_page_id(state, page_ws, page_proj, session_id, &new_page.path)
+                .await?
+            {
+                Some(page_id) => page_id,
+                None => {
+                    state
+                        .wiki
+                        .write_page(ai_memory_wiki::WritePageRequest {
+                            workspace_id: new_page.workspace_id,
+                            project_id: new_page.project_id,
+                            path: new_page.path.clone(),
+                            frontmatter: new_page.frontmatter_json.clone(),
+                            body: new_page.body.clone(),
+                            tier: new_page.tier,
+                            pinned: new_page.pinned,
+                            title: None,
+                            admission_ctx: None,
+                            author_id: None,
+                            // Attribute to the operator who OWNED the session, read back
+                            // from the session row, not to whoever delivered this
+                            // SessionEnd — a spool drain, an operator finalizing a stuck
+                            // session, or a shared hook token can all carry a different
+                            // identity. NULL stays anonymous/shared, including rows that
+                            // predate owner recording.
+                            actor: session_actor.clone(),
+                            evidence: Vec::new(),
+                        })
+                        .await?
+                }
+            };
         if track_page_write && previous_page_id != Some(page_id) {
             state.ingest_metrics.record_persisted(now_unix_ms());
         }
@@ -4446,6 +4473,16 @@ async fn consolidate_or_synth(
     } else {
         None
     };
+    // A page the agent wrote itself is kept through a compaction as it is at
+    // SessionEnd: the checkpoint would replace it with the server's model or
+    // the rule-based summary.
+    let path = PagePath::new(format!("sessions/{session_id}.md"))?;
+    if agent_session_page_id(state, workspace_id, project_id, session_id, &path)
+        .await?
+        .is_some()
+    {
+        return Ok(CheckpointOutcome { fallback_reason });
+    }
     let fallback_from_llm = state.consolidator.is_some();
     if let Some(c) = state.consolidator.as_ref() {
         let result = c
@@ -4554,6 +4591,47 @@ async fn consolidate_or_synth(
         });
     debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
     Ok(CheckpointOutcome { fallback_reason })
+}
+
+/// The id of `sessions/<id>.md` when the agent wrote it itself through
+/// `memory_write_page` with the session's id, which the automatic writers
+/// keep instead of replacing with the rule-based summary. The agent's own
+/// tool call, the Stop and the SessionEnd always land after that write, so
+/// no observation count separates a current page from a stale one. A page
+/// that cannot be read is replaced as before, with a warning.
+async fn agent_session_page_id(
+    state: &HookState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    path: &PagePath,
+) -> anyhow::Result<Option<PageId>> {
+    match state
+        .wiki
+        .session_page_written_by_agent(workspace_id, project_id, session_id)
+    {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(error) => {
+            warn!(
+                session = %session_id,
+                %error,
+                "could not read the session page; writing the rule-based summary",
+            );
+            return Ok(None);
+        }
+    }
+    let page_id = state
+        .reader
+        .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_owned())
+        .await?;
+    if page_id.is_some() {
+        info!(
+            session = %session_id,
+            "session page was written by the agent; keeping it over the rule-based summary",
+        );
+    }
+    Ok(page_id)
 }
 
 fn short_id(s: &str) -> String {
@@ -11308,6 +11386,110 @@ mod tests {
         );
     }
 
+    /// Deliver `session-start` and `user-prompt-submit`, write the session
+    /// page with `frontmatter` as `memory_write_page` would, then deliver a
+    /// later prompt (the agent's write is never the session's last event) and
+    /// `closing`. Returns the latest session page body.
+    async fn written_page_after(frontmatter: serde_json::Value, closing: &'static str) -> String {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "22222222-2222-2222-2222-222222222222";
+        let deliver = |event: &'static str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "consolidate this session" }),
+            )
+        };
+        for event in ["session-start", "user-prompt-submit"] {
+            process(&state, deliver(event), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        let path = format!("sessions/{sid}.md");
+        state
+            .wiki
+            .write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                path: ai_memory_core::PagePath::new(path.clone()).unwrap(),
+                frontmatter,
+                body: "# Agent page\n\nCompiled by the agent's own model.".into(),
+                tier: ai_memory_core::Tier::Episodic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        for event in ["user-prompt-submit", closing] {
+            process(&state, deliver(event), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        state
+            .reader
+            .page_body_by_ids(state.workspace_id, state.project_id, &path)
+            .await
+            .unwrap()
+            .expect("the session page must exist after SessionEnd")
+            .body
+    }
+
+    /// The agent wrote the session page itself, and the session went on after
+    /// the write: SessionEnd keeps the agent's page instead of replacing it
+    /// with the rule-based summary.
+    #[tokio::test]
+    async fn session_end_keeps_a_session_page_the_agent_wrote() {
+        let body = written_page_after(
+            serde_json::json!({ "consolidated": true, "consolidated_by": "agent" }),
+            "session-end",
+        )
+        .await;
+        assert!(body.contains("Compiled by the agent's own model"), "{body}");
+    }
+
+    /// Control: the same page without `consolidated_by: agent` is replaced by
+    /// the rule-based summary, as before.
+    #[tokio::test]
+    async fn session_end_replaces_a_session_page_no_agent_wrote() {
+        let body =
+            written_page_after(serde_json::json!({ "consolidated": true }), "session-end").await;
+        assert!(
+            !body.contains("Compiled by the agent's own model"),
+            "{body}"
+        );
+    }
+
+    /// A compaction checkpoint keeps the agent's page as SessionEnd does,
+    /// and still replaces a page no agent wrote (control).
+    #[tokio::test]
+    async fn compaction_checkpoint_keeps_a_session_page_the_agent_wrote() {
+        for closing in ["pre-compact", "post-compaction"] {
+            let kept = written_page_after(
+                serde_json::json!({ "consolidated": true, "consolidated_by": "agent" }),
+                closing,
+            )
+            .await;
+            assert!(
+                kept.contains("Compiled by the agent's own model"),
+                "{closing}: {kept}"
+            );
+            let replaced =
+                written_page_after(serde_json::json!({ "consolidated": true }), closing).await;
+            assert!(
+                !replaced.contains("Compiled by the agent's own model"),
+                "{closing}: {replaced}"
+            );
+        }
+    }
+
     /// A substantive SessionEnd must write the heuristic `sessions/<id>.md`
     /// page even with `consolidate_on_session_end` enabled but no LLM provider.
     #[tokio::test]
@@ -16735,6 +16917,184 @@ mod tests {
         );
     }
 
+    /// Shared shape for the #1114 body-side regressions: a secret straddling
+    /// a per-event byte cap used to be cut in half at excerpt extraction,
+    /// before the sanitizer ever ran, so the surviving prefix was too short
+    /// to match and was stored unredacted. Each test drives the full ingest
+    /// funnel with a `{20,}`-length pattern and asserts the stored body
+    /// carries the redaction marker, no secret fragment, and the cap.
+    async fn assert_body_scrubbed_before_cap(
+        state: &HookState,
+        event: &str,
+        kind: ObservationKind,
+        body_key: &str,
+        padding: usize,
+        cap: usize,
+    ) {
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: event.into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                body_key: format!("{} {secret}", "x".repeat(padding)),
+            }),
+        );
+        process(state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == kind)
+            .unwrap_or_else(|| panic!("{event} observation was recorded"))
+            .body
+            .clone();
+        assert!(
+            !body.contains(&secret) && !body.contains("SECRETZ"),
+            "unredacted secret fragment survived the cap: {body:?}"
+        );
+        assert!(
+            body.contains("REDACT"),
+            "body carries no trace of redaction — the sanitizer never saw \
+             enough of the secret to match it: {body:?}"
+        );
+        assert!(
+            body.len() <= cap,
+            "body exceeded the {cap}-byte cap: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_1114_user_prompt_body_is_sanitized_before_the_16kib_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        assert_body_scrubbed_before_cap(
+            &state,
+            "user-prompt",
+            ObservationKind::UserPrompt,
+            "prompt",
+            crate::payload::USER_PROMPT_EXCERPT_MAX_BYTES - 14,
+            crate::payload::USER_PROMPT_EXCERPT_MAX_BYTES,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_1114_post_compaction_body_is_sanitized_before_the_16kib_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        assert_body_scrubbed_before_cap(
+            &state,
+            "post-compaction",
+            ObservationKind::PostCompaction,
+            "summary",
+            crate::payload::POST_COMPACTION_EXCERPT_MAX_BYTES - 14,
+            crate::payload::POST_COMPACTION_EXCERPT_MAX_BYTES,
+        )
+        .await;
+    }
+
+    /// The tool excerpt surface: the cap runs on the whole durable body
+    /// (`tool: …\n---\n…`), so the padding lands inside the tool result.
+    #[tokio::test]
+    async fn issue_1114_tool_body_is_sanitized_before_the_2kb_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-1114",
+                "tool_response": format!("{} {secret}", "x".repeat(1_920)),
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation was recorded")
+            .body
+            .clone();
+        assert!(
+            !body.contains(&secret) && !body.contains("SECRETZ"),
+            "unredacted secret fragment survived the cap: {body:?}"
+        );
+        assert!(body.contains("REDACT"), "no redaction marker: {body:?}");
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "body exceeded the 2 KB cap: {body:?}"
+        );
+    }
+
+    /// The per-event caps keep splitting on UTF-8 boundaries through the
+    /// funnel (`truncate_utf8_bytes`), so a multibyte tool result is capped
+    /// without producing invalid bytes.
+    #[tokio::test]
+    async fn tool_body_cap_keeps_the_utf8_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "PostToolUse".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "tool_name": "Read",
+                "tool_use_id": "call-utf8",
+                "tool_response": "é".repeat(2_000), // 2 bytes each: 2x the cap
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let body = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::PostToolUse)
+            .expect("post-tool-use observation was recorded")
+            .body
+            .clone();
+        assert!(body.contains('é'));
+        assert!(
+            body.len() <= crate::payload::TOOL_EXCERPT_MAX_BYTES,
+            "body exceeded the 2 KB cap: {body:?}"
+        );
+        assert!(body.ends_with('…'));
+    }
+
     #[test]
     fn codex_native_patch_capture_backstop_discards_unproven_output() {
         for protocol in [
@@ -18234,6 +18594,63 @@ mod tests {
         assert!(!settled.contains("ai-memory profile apply"), "{settled}");
     }
 
+    /// The digest leads the session-start payload: the handoff and brief that
+    /// follow change every session, so a digest placed after them could never
+    /// sit in a reusable cached prefix. Two starts with different batons share
+    /// a byte-identical digest prefix.
+    #[tokio::test]
+    async fn the_profile_digest_leads_the_session_start_payload() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_global_profile(&state).await;
+        let cwd = "/home/u/digest-first";
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let mut prefixes = Vec::new();
+        for marker in ["BATON-ONE", "BATON-TWO"] {
+            state
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id: ws,
+                    project_id: proj,
+                    from_session_id: None,
+                    from_agent: AgentKind::Codex,
+                    to_agent: None,
+                    cwd: None,
+                    summary: marker.to_string(),
+                    open_questions: Vec::new(),
+                    next_steps: Vec::new(),
+                    files_touched: Vec::new(),
+                    owner_user: None,
+                })
+                .await
+                .unwrap();
+            let text = session_start_text(&state, profile_query(cwd, "claude-code"))
+                .await
+                .expect("digest and handoff are delivered");
+            let digest_at = text
+                .find("ai-memory: your usual choices")
+                .expect("the digest is delivered");
+            let baton_at = text.find(marker).expect("the handoff is delivered");
+            assert!(digest_at < baton_at, "the digest must come first: {text}");
+            prefixes.push(text[..baton_at].to_owned());
+        }
+        let digest_one = &prefixes[0][..prefixes[0].rfind("_\n").unwrap()];
+        let digest_two = &prefixes[1][..prefixes[1].rfind("_\n").unwrap()];
+        assert_eq!(
+            digest_one, digest_two,
+            "the digest prefix must be byte-stable"
+        );
+    }
+
     /// `[profile] consume = false`, a client that already delivered the digest
     /// this session, and `inject_on_session_start = false` each suppress it.
     #[tokio::test]
@@ -18349,7 +18766,15 @@ mod tests {
     async fn a_habit_from_two_projects_reaches_a_new_projects_first_session() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
-        for (index, project) in ["alpha", "beta"].into_iter().enumerate() {
+        // Worded differently per project: the same sentence in two projects
+        // at once reads as one fanned-out brief and counts once (#1148).
+        for (index, (project, habit)) in [
+            ("alpha", "I prefer tabs over spaces."),
+            ("beta", "I really prefer tabs over spaces here too."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let proj = state
                 .writer
                 .get_or_create_project(state.workspace_id, project, None)
@@ -18381,7 +18806,7 @@ mod tests {
                         extension: None,
                         source_event: None,
                         title: "prompt".into(),
-                        body: "I prefer tabs over spaces.".into(),
+                        body: habit.into(),
                         importance: 5,
                     },
                     &ai_memory_core::Sanitizer::builtin(),

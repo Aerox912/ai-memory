@@ -577,7 +577,8 @@ const TEAM_DIGEST_PRECEDENCE: &str = "> Team defaults: choices several operators
      repository's rules file (`AGENTS.md`, `CLAUDE.md`), then this project's memory all take \
      precedence.\n";
 const DIGEST_BOUNDARY: &str = "> **Security boundary:** ";
-const DIGEST_FOOTER: &str = "\n_Open an entry with `memory_read_page` for its reasoning and evidence; \
+const DIGEST_FOOTER: &str = "\n_Each line is a summary: before relying on one for anything \
+     non-trivial, open it with `memory_read_page` for its reasoning and evidence; \
      `memory_query` finds the rest of the profile._\n";
 const DIGEST_BASELINE: &str = "\n_This project has no memory yet, so this is the baseline from your \
      other projects. You can offer the user `ai-memory profile apply` to write these choices into \
@@ -601,8 +602,9 @@ pub fn is_team_profile(share: EffectiveProfileShare, distinguishes_operators: bo
 /// kept only when the project shows that stack, or when no stack is known
 /// yet (a brand-new project gets the whole baseline). Order is fixed
 /// (category, then path) and nothing time-dependent is printed, so the text
-/// is byte-identical between sessions until the profile itself changes and
-/// stays inside a harness's cached prompt prefix. `budget` is in UTF-8 bytes
+/// is byte-identical between sessions until the profile itself changes; the
+/// router puts it first in the SessionStart payload so it stays inside a
+/// harness's cached prompt prefix. `budget` is in UTF-8 bytes
 /// and bounds the whole section; entries that do not fit are counted.
 /// Returns `None` when no entry applies.
 #[must_use]

@@ -12,9 +12,10 @@ each one, decide:
   correction or habit of the user (what they want done, or never done, or
   usually do). A question, a one-off task ("fix this test"), a description
   of the code, a complaint, or a fact about the world is not one: keep false.
-- generality: "general" when the user said it holds beyond this project
-  ("in all my projects", "always", "by default", "from now on"), "project"
-  otherwise.
+- generality: "general" only when the user explicitly scoped the sentence
+  beyond this project ("in all my projects", "every project", "across
+  projects", "everywhere"). A bare "always", "never", "by default" or "from
+  now on" about one file, app or task stays "project".
 - category: one of the categories listed in the request.
 - statement: the preference as one short imperative line, at most 200
   characters, as close to the user's own words as possible. Keep tool,

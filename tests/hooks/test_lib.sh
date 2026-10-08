@@ -638,6 +638,42 @@ printf '%s' '{"e":"unreachable"}' \
 assert_eq "post_hook spools an undelivered event" "1" \
     "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
 
+# A 429 saturation response must spool the event for retry, while terminal 4xx is dropped.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+curl() {
+    cat >/dev/null
+    printf '429'
+    return 0
+}
+printf '%s' '{"e":"saturated"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "post_hook spools on 429 saturation" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+
+rm -f "$TMP/spool-data/hook-spool/"*.json
+curl() {
+    cat >/dev/null
+    printf '400'
+    return 0
+}
+printf '%s' '{"e":"bad-request"}' \
+    | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
+assert_eq "post_hook drops terminal 400 refusal" "0" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+
+# A 429 saturation response during drain must keep the entry queued rather than retiring it.
+rm -f "$TMP/spool-data/hook-spool/"*.json
+ai_memory_spool_event "http://127.0.0.1:49374/hook?event=stop&agent=cursor" '{"e":"drain-saturated"}'
+curl() {
+    cat >/dev/null
+    printf '429'
+    return 0
+}
+ai_memory_drain_spool 64 >/dev/null 2>&1
+assert_eq "drain keeps entry queued on 429 saturation" "1" \
+    "$(ls "$TMP/spool-data/hook-spool/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+unset -f curl
+
 unset AI_MEMORY_DATA_DIR
 
 # --- PowerShell bundle spool parity (static) ---------------------------
@@ -656,7 +692,8 @@ PS_SPOOL_STATIC=$(grep -q 'function Write-AiMemorySpoolEvent' "$PS_LIB" \
     && grep -Fq '"auth_mode"' "$PS_LIB" \
     && grep -Fq 'Write-AiMemorySpoolEvent -Url' "$PS_LIB" \
     && grep -Fq 'Invoke-AiMemoryKickDrain' "$PS_LIB" \
-    && grep -Fq 'if ($Status -lt 400 -or $Status -ge 500) {' "$PS_LIB" \
+    && grep -Fq 'if ($Status -lt 400 -or $Status -ge 500 -or $Status -eq 408 -or $Status -eq 425 -or $Status -eq 429) {' "$PS_LIB" \
+    && grep -Fq 'if ($code -eq 408 -or $code -eq 425 -or $code -eq 429) {' "$PS_LIB" \
     && grep -Fq -- '--ai-memory-drain-spool' "$PS_LIB" \
     && grep -Fq '$script:AiMemoryLibFile = $PSCommandPath' "$PS_LIB" \
     && grep -Fq 'RedirectStandardOutput' "$PS_LIB" \
