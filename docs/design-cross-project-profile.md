@@ -138,8 +138,10 @@ false` is never harvested.
 A server job on the writer actor groups candidates across projects by topic.
 A candidate becomes (or updates) a profile entry when:
 
-- the user said it was general ("in all my projects", "always", "by default"),
-  or
+- the user explicitly scoped it beyond the project ("in all my projects",
+  "every project", "across projects", "everywhere", or the Portuguese
+  equivalents); a bare "always", "never", "by default" or "from now on" is
+  compatible with one file, app or task and does not count (#1148), or
 - the same choice appears in at least `min_projects` distinct projects
   (default 2).
 

@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the cross-project profile promoting a single project's "always" /
+  "never" / "by default" sentences as general preferences: only an explicit
+  cross-project scope ("in all my projects", "every project", "everywhere",
+  and the Portuguese equivalents) now waives the `min_projects` threshold,
+  in both the zero-LLM detector and the LLM classifier prompt. (#1148)
 - Fixed the scheduled auto-improve tests' intermittent empty log captures
   (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
   `warn!` callsite's first-in-process execution on a bare thread caches

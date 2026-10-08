@@ -88,8 +88,9 @@ const PREFERENCE_MARKERS: &[&str] = &[
     "by default",
     "i usually",
     "in all my projects",
-    "in every project",
+    "every project",
     "across all my projects",
+    "across projects",
     "everywhere",
     // Portuguese, in line with the recall router's pt-BR markers.
     "sempre",
@@ -107,24 +108,23 @@ const PREFERENCE_MARKERS: &[&str] = &[
     "por padrao",
     "eu costumo",
     "em todos os meus projetos",
+    "em todos os projetos",
     "em todo projeto",
 ];
 
-/// Words that mark a statement as holding everywhere (design §5.2).
+/// Phrases that mark a statement as holding across projects (design §5.2).
+/// An explicit cross-project scope only: a bare "always" or "by default" is
+/// compatible with one file, app or task ("always run the tests for foo.rs")
+/// and must not waive the `min_projects` bar (#1148).
 const GENERAL_MARKERS: &[&str] = &[
-    "always",
-    "by default",
-    "from now on",
     "in all my projects",
-    "in every project",
+    "every project",
     "across all my projects",
+    "across projects",
     "everywhere",
-    "sempre",
-    "por padrão",
-    "por padrao",
-    "a partir de agora",
-    "daqui pra frente",
+    // Portuguese, in line with the recall router's pt-BR markers.
     "em todos os meus projetos",
+    "em todos os projetos",
     "em todo projeto",
 ];
 
@@ -2248,9 +2248,45 @@ mod tests {
                 "Sempre rode os testes antes do commit."
             ]
         );
-        assert_eq!(found[0].generality, ProfileGenerality::General);
-        assert_eq!(found[1].generality, ProfileGenerality::Project);
-        assert_eq!(found[2].generality, ProfileGenerality::General);
+        // A bare "always" / "sempre" is still a candidate, but not a
+        // cross-project statement: it must earn `min_projects` (#1148).
+        assert!(
+            found
+                .iter()
+                .all(|f| f.generality == ProfileGenerality::Project)
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_cross_project_scope_is_general() {
+        for project_only in [
+            "Always run the tests for foo.rs before pushing.",
+            "Never use the staging database for this campaign.",
+            "By default sign-up stays off in this app.",
+            "From now on use the new endpoint here.",
+            "Sempre rode os testes do módulo de pagamentos.",
+            "Por padrão use o banco local neste app.",
+        ] {
+            assert_eq!(
+                generality_of(project_only),
+                ProfileGenerality::Project,
+                "{project_only}"
+            );
+        }
+        for general in [
+            "In all my projects, write commit messages in English.",
+            "Use pnpm in every project.",
+            "Keep the same lint config across projects.",
+            "By default everywhere, prefer small commits.",
+            "Em todos os meus projetos, escreva commits em inglês.",
+            "A partir de agora em todo projeto use pnpm.",
+        ] {
+            assert_eq!(
+                generality_of(general),
+                ProfileGenerality::General,
+                "{general}"
+            );
+        }
     }
 
     #[test]
