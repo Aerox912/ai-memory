@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed `ai-memory backfill` failing on every Antigravity CLI session: it and
+  `ai-memory run` now import the session's user prompts from `agy`'s
+  `history.jsonl`, keeping only lines whose conversation and workspace match
+  the checkout. (#1134)
 - Fixed the scheduled auto-improve tests' intermittent empty log captures
   (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
   `warn!` callsite's first-in-process execution on a bare thread caches
