@@ -7887,17 +7887,25 @@ impl ReaderPool {
                 readable_repository_predicate("fp.project_id", viewer),
                 readable_repository_predicate("tp.project_id", viewer),
             );
-            let base = format!(
-                "SELECT fw.name, fpr.name, fp.path, tw.name, tpr.name, tp.path \
-                 FROM links l \
-                 JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1 \
-                 JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1 \
-                 JOIN projects fpr ON fpr.id = fp.project_id \
-                 JOIN workspaces fw ON fw.id = fp.workspace_id \
-                 JOIN projects tpr ON tpr.id = tp.project_id \
-                 JOIN workspaces tw ON tw.id = tp.workspace_id \
-                 WHERE fp.project_id != tp.project_id{visible}"
-            );
+            // An edge to or from an expired page is hidden like the page
+            // itself (#1141); `now` is bound at the placeholder each query
+            // passes in.
+            let base = |now_param: &str| {
+                format!(
+                    "SELECT fw.name, fpr.name, fp.path, tw.name, tpr.name, tp.path \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id AND fp.is_latest = 1{from_ttl} \
+                     JOIN pages tp ON tp.id = l.to_page_id AND tp.is_latest = 1{to_ttl} \
+                     JOIN projects fpr ON fpr.id = fp.project_id \
+                     JOIN workspaces fw ON fw.id = fp.workspace_id \
+                     JOIN projects tpr ON tpr.id = tp.project_id \
+                     JOIN workspaces tw ON tw.id = tp.workspace_id \
+                     WHERE fp.project_id != tp.project_id{visible}",
+                    from_ttl = not_expired("fp", now_param),
+                    to_ttl = not_expired("tp", now_param),
+                )
+            };
+            let now = now_us();
             let map_row = |row: &rusqlite::Row<'_>| {
                 Ok(CrossProjectEdge {
                     from_workspace: row.get(0)?,
@@ -7910,17 +7918,19 @@ impl ReaderPool {
             };
             let mut out = Vec::new();
             if let Some((_ws, proj)) = scope {
-                let sql =
-                    format!("{base} AND (fp.project_id = ?1 OR tp.project_id = ?1) ORDER BY fw.name, fpr.name, fp.path");
+                let sql = format!(
+                    "{} AND (fp.project_id = ?1 OR tp.project_id = ?1) ORDER BY fw.name, fpr.name, fp.path",
+                    base("?2")
+                );
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(params![proj.as_bytes()], map_row)?;
+                let rows = stmt.query_map(params![proj.as_bytes(), now], map_row)?;
                 for r in rows {
                     out.push(r?);
                 }
             } else {
-                let sql = format!("{base} ORDER BY fw.name, fpr.name, fp.path");
+                let sql = format!("{} ORDER BY fw.name, fpr.name, fp.path", base("?1"));
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map([], map_row)?;
+                let rows = stmt.query_map(params![now], map_row)?;
                 for r in rows {
                     out.push(r?);
                 }

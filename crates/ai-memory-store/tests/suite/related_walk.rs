@@ -657,3 +657,84 @@ async fn page_links_hides_expired_neighbours() {
         "expired incoming neighbour is hidden; live backlink stays"
     );
 }
+
+/// The cross-project graph (`/api/v1/graph`, the web graph view) hides an
+/// edge whose either end is expired, like every other retrieval surface:
+/// an edge names both pages' paths. A live edge and one into a page whose
+/// TTL is still in the future stay visible, scoped or not.
+#[tokio::test]
+async fn cross_project_edges_hide_edges_touching_an_expired_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_string(), None)
+        .await
+        .unwrap();
+    let infra = store
+        .writer
+        .get_or_create_project(ws, "infra".to_string(), None)
+        .await
+        .unwrap();
+
+    for page in [
+        page_with_links(ws, infra, "runbooks/live.md", vec![]),
+        with_expiry(
+            page_with_links(ws, infra, "runbooks/expired.md", vec![]),
+            expired_at(),
+        ),
+        with_expiry(
+            page_with_links(ws, infra, "runbooks/future.md", vec![]),
+            future_at(),
+        ),
+        page_with_links(
+            ws,
+            app,
+            "notes/to_all.md",
+            vec![
+                cross_project_link("infra", "runbooks/live.md"),
+                cross_project_link("infra", "runbooks/expired.md"),
+                cross_project_link("infra", "runbooks/future.md"),
+            ],
+        ),
+        with_expiry(
+            page_with_links(
+                ws,
+                app,
+                "notes/expired_from.md",
+                vec![cross_project_link("infra", "runbooks/live.md")],
+            ),
+            expired_at(),
+        ),
+    ] {
+        store.writer.upsert_page(page).await.unwrap();
+    }
+
+    for scope in [None, Some((ws, app))] {
+        let edges = store.reader.cross_project_edges(scope, None).await.unwrap();
+        let mut pairs: Vec<(String, String)> = edges
+            .into_iter()
+            .map(|e| (e.from_path, e.to_path))
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "notes/to_all.md".to_string(),
+                    "runbooks/future.md".to_string()
+                ),
+                (
+                    "notes/to_all.md".to_string(),
+                    "runbooks/live.md".to_string()
+                ),
+            ],
+            "scope {scope:?}: edges touching an expired page must be hidden"
+        );
+    }
+}

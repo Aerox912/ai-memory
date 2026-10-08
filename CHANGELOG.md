@@ -8,11 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Hidden expired pages from `page_links` and `related_walk`, the graph
-  neighbour surfaces used by the web link panel and
-  `memory_read_page include_related`. Search, recent, briefing, and
+- Fixed expired pages still showing in `page_links`, `related_walk` and
+  `cross_project_edges`: the web link panel, `memory_read_page
+  include_related`, and the web / `/api/v1` graph view now hide a page (and
+  any edge touching it) once its TTL has passed. Search, recent, briefing, and
   `graph_neighbors_for_project` already applied the retrieval TTL
-  (`expires_at` is null or still in the future); these two queries only
+  (`expires_at` is null or still in the future); these three queries only
   filtered `is_latest`. An expired neighbour is neither returned nor
   walked through. Exact-path reads of an expired page are unchanged. (#1141)
 - Fixed the scheduled auto-improve tests' intermittent empty log captures
