@@ -338,4 +338,3 @@ left to 2.7.
 Lower priority, considered and not scheduled: a byte ruler with retry instead
 of truncating long statements (truncation only affects the rare entry over 200
 bytes).
-

@@ -508,6 +508,48 @@ async fn an_unchanged_merge_keeps_the_entry_as_written() {
     assert!(!body.contains("yarn"), "{body}");
 }
 
+/// `changed: false` cannot freeze a reversed ruling: when the newest
+/// statement flips the stored one's negation, the latest ruling wins even if
+/// the model calls it unchanged.
+#[tokio::test]
+async fn an_unchanged_merge_cannot_freeze_a_reversal() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(&fx, alpha, "Always use pnpm in every project.", 1).await;
+    let first = FakeProfileLlm {
+        merge_statement: "Always use pnpm in every project.".into(),
+        classify_statement: "Always use pnpm in every project.".into(),
+        ..FakeProfileLlm::default()
+    };
+    pass_with(&fx, &single_user(), Arc::new(first)).await;
+    assert_eq!(
+        profile_pages(&fx, "_global")[0].1,
+        "Always use pnpm in every project."
+    );
+
+    let beta = project(&fx, "beta").await;
+    prompt(&fx, beta, "Never use pnpm in every project.", 2).await;
+    let stale = FakeProfileLlm {
+        merge_statement: "Always use pnpm in every project.".into(),
+        classify_statement: "Never use pnpm in every project.".into(),
+        merge_unchanged: true,
+        ..FakeProfileLlm::default()
+    };
+    pass_with(&fx, &single_user(), Arc::new(stale)).await;
+    let statements: Vec<String> = profile_pages(&fx, "_global")
+        .into_iter()
+        .map(|(_, statement, _)| statement)
+        .collect();
+    assert!(
+        statements.iter().any(|s| s.starts_with("Never use pnpm")),
+        "the reversal must win: {statements:?}"
+    );
+    assert!(
+        !statements.iter().any(|s| s.starts_with("Always use pnpm")),
+        "the old ruling must not stay current: {statements:?}"
+    );
+}
+
 /// A page the user edited by hand is never rewritten by the harvester, even
 /// when new evidence arrives for its topic.
 #[tokio::test]
@@ -792,6 +834,8 @@ async fn a_personal_profile_admits_one_operators_habit() {
 #[derive(Clone, Default)]
 struct FakeProfileLlm {
     merge_statement: String,
+    /// The classifier's normalized statement; a fixed pnpm rule when empty.
+    classify_statement: String,
     /// Report `changed: false` from the merge: the evidence only corroborates.
     merge_unchanged: bool,
     fail: bool,
@@ -835,7 +879,11 @@ impl LlmProvider for FakeProfileLlm {
                         "keep": true,
                         "generality": "general",
                         "category": "tools",
-                        "statement": "Use pnpm for JavaScript dependencies.",
+                        "statement": if self.classify_statement.is_empty() {
+                            "Use pnpm for JavaScript dependencies."
+                        } else {
+                            self.classify_statement.as_str()
+                        },
                         "applies_to": ["javascript"],
                         "confidence": 0.9,
                     })

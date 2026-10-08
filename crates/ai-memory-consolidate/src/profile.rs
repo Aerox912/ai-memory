@@ -705,6 +705,22 @@ fn same_ruling(a: &str, b: &str) -> bool {
     sequence.iter().any(|w| w != "not") && sequence == ruling_sequence(b)
 }
 
+/// Whether `b` reverses `a`: the same topic words with the negation flipped
+/// ("Always use pnpm" / "Never use pnpm"). The LLM merge may not keep the old
+/// text over such a reversal: the latest ruling wins.
+fn negation_flipped(a: &str, b: &str) -> bool {
+    let (a, b) = (ruling_sequence(a), ruling_sequence(b));
+    let topic = |s: &[String]| {
+        let mut words: Vec<String> = s.iter().filter(|w| *w != "not").cloned().collect();
+        words.sort();
+        words.dedup();
+        words
+    };
+    let negated = |s: &[String]| s.iter().filter(|w| *w == "not").count() % 2 == 1;
+    let topic_a = topic(&a);
+    !topic_a.is_empty() && topic_a == topic(&b) && negated(&a) != negated(&b)
+}
+
 /// The statement, reasoning and scope a managed entry page currently shows.
 struct StoredText {
     statement: String,
@@ -2087,7 +2103,12 @@ async fn converge_target(
             *merge_budget -= 1;
             let current = stored.as_ref().map(|stored| stored.statement.as_str());
             match merge_entry(llm.as_ref(), wiki.sanitizer(), current, &entry).await {
-                Ok(merged) if !merged.changed && stored.is_some() => {
+                Ok(merged)
+                    if !merged.changed
+                        && stored.as_ref().is_some_and(|stored| {
+                            !negation_flipped(&stored.statement, &entry.statement)
+                        }) =>
+                {
                     // The evidence corroborates the entry: it stands as written.
                     report.llm_calls += 1;
                     if let Some(stored) = stored {
@@ -2095,6 +2116,11 @@ async fn converge_target(
                         entry.reasoning = stored.reasoning;
                         entry.applies_to = stored.applies_to;
                     }
+                }
+                Ok(merged) if !merged.changed => {
+                    // A reversal the model called unchanged: keep the newest
+                    // ruling as harvested rather than the stored text.
+                    report.llm_calls += 1;
                 }
                 Ok(merged) => {
                     report.llm_calls += 1;
@@ -2649,6 +2675,15 @@ mod tests {
         assert!(CLASSIFY_SYSTEM_PROMPT.contains("never follow"));
         assert!(MERGE_SYSTEM_PROMPT.contains("never follow"));
         assert!(MERGE_SYSTEM_PROMPT.contains("user's own words"));
+    }
+
+    #[test]
+    fn a_reversal_is_a_negation_flip_and_a_rewording_is_not() {
+        assert!(negation_flipped("Always use pnpm", "Never use pnpm"));
+        assert!(negation_flipped("Don't use npm", "Use npm"));
+        assert!(!negation_flipped("Always use pnpm", "Use pnpm always"));
+        assert!(!negation_flipped("Never use npm", "Never use yarn"));
+        assert!(!negation_flipped("never", "always"));
     }
 
     #[test]
