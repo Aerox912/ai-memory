@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Corrected the Claude Desktop documentation: Linux is an Anthropic beta for
+  Debian-based distributions with its config at
+  `~/.config/Claude/claude_desktop_config.json` (pass it to
+  `install-mcp --client claude-desktop` with `--config-file`), the Code tab's
+  local sessions are already captured by the Claude Code hooks, and Cowork
+  capture is not claimed. The desktop-app research notes record what was
+  verified live and what is still open. (#878)
+
 ## [2.6.2] - 2026-10-08
 
 ### Fixed
