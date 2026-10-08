@@ -120,6 +120,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   those events queued like other transient failures, matching the native
   spool (`429` retries for free; `408`/`425` retry under its attempt budget
   since #1092), and a drain pass stops without deleting queued entries. (#1146)
+- Fixed expired pages still showing in `page_links`, `related_walk` and
+  `cross_project_edges`: the web link panel, `memory_read_page
+  include_related`, and the web / `/api/v1` graph view now hide a page (and
+  any edge touching it) once its TTL has passed. Search, recent, briefing, and
+  `graph_neighbors_for_project` already applied the retrieval TTL
+  (`expires_at` is null or still in the future); these three queries only
+  filtered `is_latest`. An expired neighbour is neither returned nor
+  walked through. Exact-path reads of an expired page are unchanged. (#1141)
 
 ## [2.6.0] - 2026-10-07
 
