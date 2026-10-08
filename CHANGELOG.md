@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt the user actually wrote, and falls back to the no-prompt summary
   when every prompt in the session is such a block. Prompts that only
   contain markup later in the text, pastes with attributes such as
-  `<pasted_content id="…">`, and stored observations are unchanged.
+  `<pasted_content id="…">`, and stored observations are unchanged. (#1158)
 
 ## [2.6.1] - 2026-10-08
 
