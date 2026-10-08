@@ -444,6 +444,70 @@ async fn the_latest_ruling_supersedes_and_the_old_version_stays() {
     assert!(versions[1].0 && versions[1].1.contains("bun instead of pnpm"));
 }
 
+/// Evidence that only corroborates an entry updates its evidence and leaves
+/// the statement, and so every project's digest line, exactly as it was.
+#[tokio::test]
+async fn corroborating_evidence_leaves_the_digest_line_alone() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let beta = project(&fx, "beta").await;
+    prompt(&fx, alpha, "Always use pnpm.", 1).await;
+    prompt(&fx, beta, "Always use pnpm.", 2).await;
+    pass(&fx, &single_user()).await;
+    let (path, before, _) = profile_pages(&fx, "_global")[0].clone();
+    assert_eq!(before, "Always use pnpm.");
+
+    let gamma = project(&fx, "gamma").await;
+    prompt(&fx, gamma, "I use pnpm, always.", 9).await;
+    let report = pass(&fx, &single_user()).await;
+    assert_eq!(
+        report.entries_written, 1,
+        "the evidence is recorded: {report:?}"
+    );
+    let (same_path, after, body) = profile_pages(&fx, "_global")[0].clone();
+    assert_eq!(same_path, path);
+    assert_eq!(after, before, "a corroborated statement must not churn");
+    assert!(
+        body.contains("I use pnpm, always."),
+        "evidence kept: {body}"
+    );
+}
+
+/// A merge that reports `changed: false` leaves the entry as written, even
+/// when the model also returned a different restatement.
+#[tokio::test]
+async fn an_unchanged_merge_keeps_the_entry_as_written() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(&fx, alpha, "always pnpm pls, never npm in here", 1).await;
+    let first = FakeProfileLlm {
+        merge_statement: "Use pnpm for every JavaScript project.".into(),
+        ..FakeProfileLlm::default()
+    };
+    pass_with(&fx, &single_user(), Arc::new(first)).await;
+    assert_eq!(
+        profile_pages(&fx, "_global")[0].1,
+        "Use pnpm for every JavaScript project."
+    );
+
+    let beta = project(&fx, "beta").await;
+    prompt(&fx, beta, "pnpm again, as always", 2).await;
+    let corroborating = FakeProfileLlm {
+        merge_statement: "Prefer pnpm, and maybe yarn too.".into(),
+        merge_unchanged: true,
+        ..FakeProfileLlm::default()
+    };
+    let report = pass_with(&fx, &single_user(), Arc::new(corroborating)).await;
+    assert!(report.llm_calls >= 1, "{report:?}");
+    let (_, statement, body) = profile_pages(&fx, "_global")[0].clone();
+    assert_eq!(statement, "Use pnpm for every JavaScript project.");
+    assert!(
+        body.contains("Faster installs and a strict lockfile."),
+        "{body}"
+    );
+    assert!(!body.contains("yarn"), "{body}");
+}
+
 /// A page the user edited by hand is never rewritten by the harvester, even
 /// when new evidence arrives for its topic.
 #[tokio::test]
@@ -728,6 +792,8 @@ async fn a_personal_profile_admits_one_operators_habit() {
 #[derive(Clone, Default)]
 struct FakeProfileLlm {
     merge_statement: String,
+    /// Report `changed: false` from the merge: the evidence only corroborates.
+    merge_unchanged: bool,
     fail: bool,
     seen: Arc<Mutex<Vec<String>>>,
 }
@@ -778,6 +844,7 @@ impl LlmProvider for FakeProfileLlm {
             Ok(serde_json::json!({ "items": items }))
         } else {
             Ok(serde_json::json!({
+                "changed": !self.merge_unchanged,
                 "statement": self.merge_statement,
                 "reasoning": "Faster installs and a strict lockfile.",
                 "applies_to": ["javascript"],

@@ -44,8 +44,10 @@ nothing one operator's agents learn reaches another's.
 
 ## What you see at session start
 
-After the project brief (if the project has one), the session start carries a
-short fenced section:
+The session start opens with a short fenced section, ahead of any handoff,
+project brief or inbox notice. Those change every session; the profile changes
+only when you do, so leading with it keeps it in the part of the harness's
+prompt that can be cached:
 
 ```text
 > 🧭 ai-memory: your usual choices (cross-project profile)
@@ -194,7 +196,11 @@ stack.
 
 **The latest ruling wins.** When you change your mind ("use bun instead of
 pnpm from now on"), the newer statement replaces the entry; the old version
-stays in the page history, never destroyed.
+stays in the page history, never destroyed. Saying the same thing again, in
+any words, only adds evidence: the entry keeps its statement, so the line every
+project sees does not change. Without an LLM, "the same thing" means the same
+topic words in the same order with the same negations (so "use pnpm" and "I
+always use pnpm" match, while "never use pnpm" is a change).
 
 Each learned entry records its evidence (the projects and dates it came from,
 your words, the most recent five), how many projects back it, its confidence,
@@ -209,8 +215,10 @@ two places, both through JSON-schema structured output:
   which decides which are real preferences, whether they are general, their
   category and stack, and restates each as one short line. A looser filter
   feeds it, so it catches phrasing the word lists miss.
-- **Merge.** When an entry gains evidence, the model restates it from your
-  words, newest ruling first, with your reasoning when you gave one.
+- **Merge.** When an entry gains evidence that may change it, the model
+  restates it from your words, newest ruling first, with your reasoning when
+  you gave one. It also says whether anything changed; when the evidence only
+  confirms the entry, the entry stays exactly as written.
 
 Both prompts treat every sentence as data, rank your own words first and are
 told never to follow instructions found in the text. The evidence quote is

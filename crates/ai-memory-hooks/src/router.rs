@@ -1586,9 +1586,9 @@ async fn fetch_and_accept_handoff_at(
     let profile_md =
         render_requested_profile_digest(state, &query, ws, proj, viewer, profile_flags.consume)
             .await;
-    // Handoff first: it is a short curated pointer and must not be buried
-    // under a ledger that can run tens of KB. The existing ledger-then-brief
-    // order is preserved. Claim both single-use inputs only after every
+    // Handoff right after the profile digest: it is a short curated pointer
+    // and must not be buried under a ledger that can run tens of KB. The
+    // existing ledger-then-brief order is preserved. Claim both single-use inputs only after every
     // fallible read and render has succeeded, and in one transaction so a
     // failed or racing managed claim cannot consume the handoff by itself.
     // Same reasoning as the SessionEnd insert: the session-start claim is how
@@ -1729,15 +1729,19 @@ async fn fetch_and_accept_handoff_at(
         // because the count could not be read.
         Err(_) => None,
     };
+    // The profile digest goes first: it changes only when the profile does,
+    // while everything after it changes every session, so leading with it
+    // keeps it in the reusable part of the harness's prompt cache (design:
+    // docs/design-cross-project-profile.md §3).
     Ok(combine_handoff_and_brief(
-        handoff_md,
+        profile_md,
         combine_handoff_and_brief(
-            handoff_notice,
+            handoff_md,
             combine_handoff_and_brief(
-                managed_md,
+                handoff_notice,
                 combine_handoff_and_brief(
-                    brief_md,
-                    combine_handoff_and_brief(profile_md, inbox_notice),
+                    managed_md,
+                    combine_handoff_and_brief(brief_md, inbox_notice),
                 ),
             ),
         ),
@@ -18588,6 +18592,63 @@ mod tests {
             .unwrap();
         assert!(settled.contains("Use pnpm, not npm."), "{settled}");
         assert!(!settled.contains("ai-memory profile apply"), "{settled}");
+    }
+
+    /// The digest leads the session-start payload: the handoff and brief that
+    /// follow change every session, so a digest placed after them could never
+    /// sit in a reusable cached prefix. Two starts with different batons share
+    /// a byte-identical digest prefix.
+    #[tokio::test]
+    async fn the_profile_digest_leads_the_session_start_payload() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_global_profile(&state).await;
+        let cwd = "/home/u/digest-first";
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        let mut prefixes = Vec::new();
+        for marker in ["BATON-ONE", "BATON-TWO"] {
+            state
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id: ws,
+                    project_id: proj,
+                    from_session_id: None,
+                    from_agent: AgentKind::Codex,
+                    to_agent: None,
+                    cwd: None,
+                    summary: marker.to_string(),
+                    open_questions: Vec::new(),
+                    next_steps: Vec::new(),
+                    files_touched: Vec::new(),
+                    owner_user: None,
+                })
+                .await
+                .unwrap();
+            let text = session_start_text(&state, profile_query(cwd, "claude-code"))
+                .await
+                .expect("digest and handoff are delivered");
+            let digest_at = text
+                .find("ai-memory: your usual choices")
+                .expect("the digest is delivered");
+            let baton_at = text.find(marker).expect("the handoff is delivered");
+            assert!(digest_at < baton_at, "the digest must come first: {text}");
+            prefixes.push(text[..baton_at].to_owned());
+        }
+        let digest_one = &prefixes[0][..prefixes[0].rfind("_\n").unwrap()];
+        let digest_two = &prefixes[1][..prefixes[1].rfind("_\n").unwrap()];
+        assert_eq!(
+            digest_one, digest_two,
+            "the digest prefix must be byte-stable"
+        );
     }
 
     /// `[profile] consume = false`, a client that already delivered the digest
