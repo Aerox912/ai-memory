@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the cross-project profile rewriting a settled entry whenever new
+  evidence merely agreed with it: a statement now changes only when the ruling
+  or its scope does (the LLM merge reports `changed`), so the line every project
+  receives stays put. The profile digest also moved to the front of the
+  session-start payload, ahead of the handoff and brief that change every
+  session, so it stays in the harness's cacheable prompt prefix; its footer now
+  asks the agent to open an entry before relying on its one-line summary; and
+  topic grouping no longer compares every candidate with every other, which
+  grew quadratically on long-lived installs. See
+  `docs/design-cross-project-profile.md` §11. (#1000)
 - Fixed the scheduled auto-improve tests' intermittent empty log captures
   (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
   `warn!` callsite's first-in-process execution on a bare thread caches

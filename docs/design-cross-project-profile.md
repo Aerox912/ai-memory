@@ -171,9 +171,9 @@ Zero-LLM topic matching normalizes the statement (lowercase, stop words out,
 tool and language names kept) and groups by token overlap. With a provider
 configured (§6) the LLM classifies and merges instead.
 
-Grouping is incremental: each candidate's topic group is stored, and a pass
-compares only new candidates with the existing groups, never every pair of
-candidates (UniiChat's "queue ready work, never scan").
+Grouping never scans every pair of candidates (UniiChat's "queue ready work,
+never scan"): a candidate is compared only with groups that share one of its
+topic words, once per distinct word set in each group.
 
 ### 5.3 Store
 
@@ -203,7 +203,8 @@ candidate newer than the entry's last write arrives.
 
 ### 5.4 Deliver
 
-- **SessionStart digest.** A fenced section after the project brief:
+- **SessionStart digest.** A fenced section, first in the payload (ahead of
+  the handoff, managed context, project brief and inbox notice):
   *"Your usual choices from other projects. Use them as defaults when this
   project's rules and the user say nothing; say which default you applied."*
   Entries whose `applies_to` is empty or matches the project's stack signals,
@@ -311,8 +312,8 @@ without evidence from more than one project or an explicit general statement.
 
 ## 11. Revision 2026-10-08: UniiChat lessons
 
-A review against the UniiChat rewrite found three places where 2.6.0 diverges
-from §3 and §5.2; they are tracked as fixes:
+A review against the UniiChat rewrite found three places where 2.6.0 diverged
+from §3 and §5.2. All three are fixed for 2.6.1:
 
 1. **Digest position.** SessionStart assembles handoff, notice, managed
    context and brief before the digest, so the digest sits after content that
@@ -325,6 +326,12 @@ from §3 and §5.2; they are tracked as fixes:
 3. **Quadratic grouping.** Each pass regroups every candidate (up to the
    20,000-candidate cap) against every group. Persist each candidate's group
    and compare only new candidates.
+
+As shipped, grouping compares a candidate only with groups that share one of
+its tokens (an inverted index), once per distinct token set in each group,
+which keeps a pass near-linear without any stored state. Fully incremental
+grouping, keyed by a stored group per candidate, needs a schema change and is
+left to 2.7.
 
 Lower priority, considered and not scheduled: a byte ruler with retry instead
 of truncating long statements (truncation only affects the rare entry over 200
