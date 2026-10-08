@@ -128,6 +128,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`expires_at` is null or still in the future); these three queries only
   filtered `is_latest`. An expired neighbour is neither returned nor
   walked through. Exact-path reads of an expired page are unchanged. (#1141)
+- Fixed the session-aware MCP bridge failing on Docker-wrapper installs: the
+  wrapper sent `mcp-bridge` to the helper container, where the registered
+  `127.0.0.1` server URL is unreachable, so every session started without
+  ai-memory's MCP tools. The wrapper now runs `mcp-bridge` through its
+  checksum-verified native host client, which also repairs existing entries.
+  (#1147)
 
 ## [2.6.0] - 2026-10-07
 

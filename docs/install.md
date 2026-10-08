@@ -135,7 +135,9 @@ ai-memory install-mcp --client claude-code --session-aware --apply
 
 It replaces the static HTTP MCP entry with a local ai-memory stdio bridge that
 still connects to the configured remote server and bearer token, while
-forwarding Claude's lifecycle session id. Pair it with
+forwarding Claude's lifecycle session id. On a Docker-wrapper install the
+wrapper runs the bridge through its checksum-verified native host client, so
+the configured loopback server URL resolves on the host. Pair it with
 `[auto_scope] mode = "per_session"` when the same operator runs concurrent
 Claude Code sessions in different projects. The default static HTTP
 registration remains appropriate for one active project at a time.
