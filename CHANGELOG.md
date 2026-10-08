@@ -108,6 +108,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of `unknown`, so their output is no longer dropped by the
   unknown-family body shortcut. Payload shape verified against Hermes
   `agent/shell_hooks.py` on 2026-10-07. (#1123)
+- Fixed the Pi extension sending `notifications/initialized` as a JSON-RPC
+  request with an id: JSON-RPC 2.0 and MCP notifications do not carry an id and
+  expect no response body, which caused the server to emit `-32601`
+  method-not-found warnings on every Pi launch. The generated extension now
+  uses `mcpNotify` to send notifications without an id and accept empty
+  successful HTTP responses without failing JSON parsing. (#1136)
 
 ## [2.6.0] - 2026-10-07
 
