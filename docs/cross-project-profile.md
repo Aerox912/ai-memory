@@ -169,7 +169,11 @@ is new since the last one.
   equivalents (*sempre*, *nunca*, *prefiro*, *em vez de*, *não use*, *a partir
   de agora*, *por padrão*, …). A sentence also has to name an action or be a
   comparison, so "the build always fails" is not a preference; questions and
-  code blocks never are. Your verbatim words are kept as evidence.
+  code blocks never are. A sentence that reads like agent output (markdown
+  bold, or a `file.ext:line` reference) is skipped too: on hosts where agents
+  brief each other through the prompt channel, that text is a lead agent's
+  task brief or a pasted review, not you. Your verbatim words are kept as
+  evidence.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
   `procedures/`.
 - **Stack signals**: the languages the project's activity shows (from file
@@ -187,6 +191,11 @@ becomes an entry when:
   makes a candidate, but it can describe one file, app or task, so it has to
   earn the project threshold below, or
 - the same choice shows up in at least `min_projects` projects (default 2).
+  The same sentence arriving in several projects within an hour counts as one
+  project: that is one message fanned out to several checkouts (a lead agent
+  briefing its workers), not a habit. And one sentence backs at most one
+  entry, so a statement the classifier splits into two topics does not
+  produce duplicate pages.
 
 A habit seen in only one project stays that project's business; `profile
 review` lists such habits and how many more projects each needs. A language

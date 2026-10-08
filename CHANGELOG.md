@@ -167,6 +167,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose undeclared clone created `acme-widget` with `widget` as its legacy key
   can see which project to purge or rename. A restricted project is reported
   as "a restricted project", never by name, matching the project list. (#1144)
+- Fixed the cross-project profile learning from agent-written prompt text
+  and counting one fanned-out brief as several projects: sentences that read
+  like agent output (markdown bold, `file.ext:line` references) are no longer
+  candidates, the same sentence arriving in several projects within an hour
+  counts as one project toward `min_projects`, and one sentence backs at most
+  one entry. (#1148)
 
 ## [2.6.0] - 2026-10-07
 
