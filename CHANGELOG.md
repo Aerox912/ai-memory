@@ -139,6 +139,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-project scope ("in all my projects", "every project", "everywhere",
   and the Portuguese equivalents) now waives the `min_projects` threshold,
   in both the zero-LLM detector and the LLM classifier prompt. (#1148)
+- Fixed explicit in-session "consolidate this session" requests reaching the
+  server's model: the routing instructions and the managed learning and
+  durable-pages skills now send them to the agent route (`memory_read_session_observations`, then
+  `memory_write_page` with `session_id`) and give the agent the server's
+  multi-page layout (session, concept, decision, gotcha and rule pages, at
+  most five). `memory_consolidate` stays for other sessions and headless
+  runs. (#1140)
 
 ## [2.6.0] - 2026-10-07
 
