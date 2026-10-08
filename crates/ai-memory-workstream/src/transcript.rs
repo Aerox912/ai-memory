@@ -280,27 +280,53 @@ pub fn claude_live_background_attach_id(
     })
 }
 
-/// Find the Claude Code background session that `native_session_id` attached
-/// to during this run, if any.
+/// Where a Claude Code launch's conversation went on, when it left the
+/// session the launcher started or resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeContinuation {
+    /// `/resume` attached to a background session the daemon hosts.
+    Background(String),
+    /// `/clear` started a new session in the same process.
+    Cleared(String),
+}
+
+impl ClaudeContinuation {
+    /// The native session the conversation continued in.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Background(id) | Self::Cleared(id) => id,
+        }
+    }
+}
+
+/// Find the session `native_session_id`'s Claude Code process continued in
+/// during this run, if it left it.
 ///
-/// `/resume` on a background session (one hosted by the Claude Code daemon)
-/// does not continue the foreground session: the conversation keeps going in
-/// the background session's own transcript, whose records carry
-/// `"sessionKind": "bg"` and name the attached foreground session in
-/// `session_id`. The daemon's hooks never see this run's id, so without this
-/// the workstream stays on the foreground session and the next launch resumes
-/// a transcript with no conversation in it.
+/// Every record a Claude Code process writes names the session the process
+/// launched with in `session_id`, while `sessionId` names the transcript's own
+/// session. Two moves leave that launch session behind:
 ///
-/// Only transcripts written since `started_at` are read, the newest first,
-/// and a record must also match this checkout. Transcripts without those
-/// fields (older Claude Code builds) never match.
-pub fn claude_attached_background_session(
+/// - `/resume` on a background session (one hosted by the Claude Code daemon)
+///   keeps going in the background session's transcript, whose records carry
+///   `"sessionKind": "bg"`. The daemon's hooks never see this run's id.
+/// - `/clear` starts a new session whose transcript records the `/clear`
+///   command itself.
+///
+/// Without this the workstream stays on the launch session, and the next
+/// launch resumes a transcript that holds none of the later conversation.
+///
+/// Only transcripts written since `started_at` are read, the newest first, so
+/// a chain of `/clear`s ends on the last one. A background record must match
+/// this checkout exactly; a cleared session may have moved into a directory
+/// below it. Transcripts without those fields (older Claude Code builds)
+/// never match.
+pub fn claude_continued_session(
     home: &Path,
     cwd: &Path,
     session_dir: Option<&Path>,
     native_session_id: &str,
     started_at: SystemTime,
-) -> Result<Option<String>> {
+) -> Result<Option<ClaudeContinuation>> {
     if !valid_native_session_id(native_session_id) {
         return Ok(None);
     }
@@ -315,42 +341,63 @@ pub fn claude_attached_background_session(
         if modified(&path).is_some_and(|time| time + Duration::from_secs(2) < started_at) {
             break;
         }
-        if path
-            .file_stem()
-            .is_some_and(|stem| stem == std::ffi::OsStr::new(native_session_id))
-        {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if stem == native_session_id {
             continue;
         }
         let reader = BufReader::new(File::open(&path)?);
+        let mut cleared = false;
+        let mut cleared_in_checkout = false;
         for line in reader.lines() {
             let line = line?;
-            if !line.contains(&attached_marker) {
+            let clear_command = line.contains(CLAUDE_CLEAR_COMMAND);
+            if !clear_command && !line.contains(&attached_marker) {
                 continue;
             }
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            let background = value.get("sessionKind").and_then(Value::as_str) == Some("bg");
-            let attached =
-                value.get("session_id").and_then(Value::as_str) == Some(native_session_id);
-            let in_checkout = value
-                .get("cwd")
-                .and_then(Value::as_str)
-                .is_some_and(|recorded| same_path(Path::new(recorded), cwd));
             let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
                 continue;
             };
-            if background
-                && attached
-                && in_checkout
-                && session != native_session_id
-                && valid_native_session_id(session)
-            {
-                return Ok(Some(session.to_string()));
+            if session == native_session_id || !valid_native_session_id(session) {
+                continue;
             }
+            let recorded_cwd = value.get("cwd").and_then(Value::as_str).map(Path::new);
+            if clear_command && session == stem && is_claude_clear_command(&value) {
+                cleared = true;
+            }
+            if value.get("session_id").and_then(Value::as_str) != Some(native_session_id) {
+                continue;
+            }
+            if value.get("sessionKind").and_then(Value::as_str) == Some("bg") {
+                if recorded_cwd.is_some_and(|recorded| same_path(recorded, cwd)) {
+                    return Ok(Some(ClaudeContinuation::Background(session.to_string())));
+                }
+            } else if session == stem
+                && recorded_cwd.is_some_and(|recorded| path_within(recorded, cwd))
+            {
+                cleared_in_checkout = true;
+            }
+        }
+        if cleared && cleared_in_checkout {
+            return Ok(Some(ClaudeContinuation::Cleared(stem.to_string())));
         }
     }
     Ok(None)
+}
+
+const CLAUDE_CLEAR_COMMAND: &str = "<command-name>/clear</command-name>";
+
+/// The user record Claude Code writes for a `/clear` typed at its prompt.
+fn is_claude_clear_command(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("user")
+        && value
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.trim_start().starts_with(CLAUDE_CLEAR_COMMAND))
 }
 
 /// List newest native sessions whose recorded working directory matches the
@@ -4598,7 +4645,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_attached_background_session_follows_only_this_checkouts_bg_records() {
+    fn claude_continued_session_follows_only_this_checkouts_bg_records() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().join("repo");
         let other = temp.path().join("other");
@@ -4629,7 +4676,9 @@ mod tests {
             value
         };
         let find = |id: &str| {
-            claude_attached_background_session(temp.path(), &cwd, None, id, started_at).unwrap()
+            claude_continued_session(temp.path(), &cwd, None, id, started_at)
+                .unwrap()
+                .map(|continuation| continuation.session_id().to_owned())
         };
 
         // The foreground transcript names itself; it is never the answer.
@@ -4673,6 +4722,126 @@ mod tests {
         );
         assert_eq!(find("fg").as_deref(), Some("bg"));
         assert_eq!(find("unrelated"), None);
+    }
+
+    #[test]
+    fn claude_continued_session_follows_only_this_launchs_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let nested = cwd.join("packages/app");
+        let other = temp.path().join("other");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let write = |name: &str, records: &[Value], age: Duration| {
+            let path = project.join(format!("{name}.jsonl"));
+            let body = records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>();
+            fs::write(&path, body).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - age)
+                .unwrap();
+        };
+        // Claude Code's real shape: the `/clear` record carries no
+        // `session_id`; later records name the launch session there.
+        let clear = |session: &str, cwd: &Path| {
+            json!({
+                "type": "user",
+                "sessionId": session,
+                "cwd": cwd,
+                "message": {"role": "user", "content": format!(
+                    "{CLAUDE_CLEAR_COMMAND}\n            <command-message>clear</command-message>"
+                )},
+            })
+        };
+        let turn = |session: &str, launch: &str, cwd: &Path| json!({"type": "user", "sessionId": session, "session_id": launch, "cwd": cwd});
+        let find =
+            |id: &str| claude_continued_session(temp.path(), &cwd, None, id, started_at).unwrap();
+        let recent = Duration::from_secs(5);
+
+        write("launch", &[turn("launch", "launch", &cwd)], recent);
+        assert_eq!(find("launch"), None);
+
+        // A transcript that names the launch session without having been
+        // cleared is neither a clear nor a background continuation.
+        write("plain", &[turn("plain", "launch", &cwd)], recent);
+        // Text that merely quotes `/clear` is not the command record.
+        write(
+            "quoted",
+            &[
+                json!({"type": "user", "sessionId": "quoted", "cwd": cwd,
+                    "message": {"role": "user", "content": format!("what does {CLAUDE_CLEAR_COMMAND} do?")}}),
+                turn("quoted", "launch", &cwd),
+            ],
+            recent,
+        );
+        // Another checkout's clear, and a concurrent launch's clear here.
+        write(
+            "elsewhere",
+            &[
+                clear("elsewhere", &other),
+                turn("elsewhere", "launch", &other),
+            ],
+            recent,
+        );
+        write(
+            "concurrent",
+            &[
+                clear("concurrent", &cwd),
+                turn("concurrent", "other-launch", &cwd),
+            ],
+            recent,
+        );
+        // A subagent file holds the cleared session's records under its own
+        // stem; it is not a session to resume.
+        write(
+            "agent-1",
+            &[clear("subagent", &cwd), turn("subagent", "launch", &cwd)],
+            recent,
+        );
+        // A clear made before this run started is not read.
+        write(
+            "stale",
+            &[clear("stale", &cwd), turn("stale", "launch", &cwd)],
+            Duration::from_secs(600),
+        );
+        assert_eq!(find("launch"), None);
+        assert_eq!(
+            find("other-launch"),
+            Some(ClaudeContinuation::Cleared("concurrent".into()))
+        );
+
+        // The clear this launch made, even after moving below the checkout.
+        write(
+            "cleared",
+            &[clear("cleared", &cwd), turn("cleared", "launch", &nested)],
+            Duration::from_secs(3),
+        );
+        assert_eq!(
+            find("launch"),
+            Some(ClaudeContinuation::Cleared("cleared".into()))
+        );
+
+        // A second `/clear` in the same process: the newest one wins.
+        write(
+            "cleared-again",
+            &[
+                clear("cleared-again", &cwd),
+                turn("cleared-again", "launch", &cwd),
+            ],
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            find("launch"),
+            Some(ClaudeContinuation::Cleared("cleared-again".into()))
+        );
     }
 
     #[test]
