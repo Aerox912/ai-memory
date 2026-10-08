@@ -77,7 +77,16 @@ mod slow {
         .await;
 
         say(&client, &base, "alpha", 1, "I prefer tabs over spaces.").await;
-        say(&client, &base, "beta", 2, "I prefer tabs over spaces.").await;
+        // Worded differently: the same sentence in two projects at once
+        // reads as one fanned-out brief and counts once (#1148).
+        say(
+            &client,
+            &base,
+            "beta",
+            2,
+            "I really prefer tabs over spaces here too.",
+        )
+        .await;
         let rebuilt = run_cli(
             &["profile", "rebuild"],
             data_dir.path(),

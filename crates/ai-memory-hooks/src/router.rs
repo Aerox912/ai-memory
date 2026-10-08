@@ -18766,7 +18766,15 @@ mod tests {
     async fn a_habit_from_two_projects_reaches_a_new_projects_first_session() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
-        for (index, project) in ["alpha", "beta"].into_iter().enumerate() {
+        // Worded differently per project: the same sentence in two projects
+        // at once reads as one fanned-out brief and counts once (#1148).
+        for (index, (project, habit)) in [
+            ("alpha", "I prefer tabs over spaces."),
+            ("beta", "I really prefer tabs over spaces here too."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let proj = state
                 .writer
                 .get_or_create_project(state.workspace_id, project, None)
@@ -18798,7 +18806,7 @@ mod tests {
                         extension: None,
                         source_event: None,
                         title: "prompt".into(),
-                        body: "I prefer tabs over spaces.".into(),
+                        body: habit.into(),
                         importance: 5,
                     },
                     &ai_memory_core::Sanitizer::builtin(),
