@@ -1,6 +1,8 @@
 //! Wire envelope received on `POST /hook`.
 
-use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, truncate_utf8_bytes};
+use ai_memory_core::{
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, truncate_utf8_bytes,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
@@ -17,7 +19,32 @@ pub const POST_COMPACTION_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
 /// Durable excerpt ceiling for notifications.
 pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
 
-const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
+/// Durable excerpt ceiling for tool I/O summaries and short excerpts
+/// (tool results, extension bodies, Stop assistant excerpts).
+pub const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
+
+/// Durable body ceiling the ingest funnel applies to an event's excerpt
+/// **after** the sanitizer has scrubbed the full text.
+///
+/// The cap used to run inside excerpt extraction, before the sanitizer ever
+/// saw the text, so a secret straddling the cutoff was cut in half and the
+/// surviving prefix too short to match a pattern — stored unredacted (#1114),
+/// the body-side twin of the #980 title-hint leak. Extraction now returns the
+/// uncapped text and the router applies this cap to the scrubbed output,
+/// mirroring `ai_memory_core::sanitize::Sanitized::new`.
+#[must_use]
+pub fn durable_body_cap(event: HookEvent) -> usize {
+    match event {
+        HookEvent::UserPrompt => USER_PROMPT_EXCERPT_MAX_BYTES,
+        HookEvent::PostCompaction => POST_COMPACTION_EXCERPT_MAX_BYTES,
+        HookEvent::Notification
+        | HookEvent::PreToolUse
+        | HookEvent::PostToolUse
+        | HookEvent::Stop
+        | HookEvent::Other => TOOL_EXCERPT_MAX_BYTES,
+        _ => OBSERVATION_BODY_MAX_BYTES,
+    }
+}
 
 /// Query-string parameters on `POST /hook`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -777,7 +804,7 @@ fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value)
         &["tool_response", "tool_output", "output", "result"],
     )
     .or_else(|| extract_content(payload, &["error"]))?;
-    Some(truncate_excerpt(&format!("tool: {tool}\n---\n{result}")))
+    Some(format!("tool: {tool}\n---\n{result}"))
 }
 
 const fn closed_tool_agent(agent: AgentKind) -> bool {
@@ -886,7 +913,7 @@ fn safe_tool_body(
             .unwrap_or_else(|| "(no output captured)".into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
-            Some(truncate_excerpt(&summary))
+            Some(summary)
         }
         _ => None,
     }
@@ -1051,7 +1078,6 @@ fn extension_body_excerpt(raw: &serde_json::Value) -> Option<String> {
             "details",
         ],
     )
-    .map(|s| truncate_excerpt(&s))
 }
 
 /// Extract human-readable text content for an observation body, accepting the
@@ -1106,8 +1132,7 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
 
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"])
-            .map(|body| truncate_utf8_bytes(&body, USER_PROMPT_EXCERPT_MAX_BYTES)),
+        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -1118,12 +1143,10 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
                     .unwrap_or_else(|| "(no output captured)".into());
-            Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
+            Some(format!("tool: {tool}\n---\n{result}"))
         }
-        HookEvent::Notification => extract_content(raw, &["message", "text"])
-            .map(|body| truncate_utf8_bytes(&body, NOTIFICATION_EXCERPT_MAX_BYTES)),
-        HookEvent::PostCompaction => extract_content(raw, &["summary"])
-            .map(|body| truncate_utf8_bytes(&body, POST_COMPACTION_EXCERPT_MAX_BYTES)),
+        HookEvent::Notification => extract_content(raw, &["message", "text"]),
+        HookEvent::PostCompaction => extract_content(raw, &["summary"]),
         _ => None,
     }
 }
@@ -1148,10 +1171,6 @@ fn first_line(s: String) -> Option<String> {
     // does not strip, so the CR was stored in the observation title.
     let line = s.lines().next().unwrap_or("").to_string();
     (!line.is_empty()).then_some(line)
-}
-
-fn truncate_excerpt(s: &str) -> String {
-    truncate_utf8_bytes(s, TOOL_EXCERPT_MAX_BYTES)
 }
 
 /// Cap core lifecycle body fields before the native hook writes its local
@@ -1212,7 +1231,15 @@ fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: us
             continue;
         };
         if text.len() > max_bytes {
-            *field = serde_json::Value::String(truncate_utf8_bytes(&text, max_bytes));
+            // Scrub the full text before capping it. The client cannot see
+            // the server's `[sanitize]` extras, but the built-in patterns
+            // cover the credential classes and the server re-scrubs the
+            // capped field with its configured sanitizer; truncating first
+            // would cut a straddling secret in half and persist an
+            // unmatchable prefix (#1114), the class #980 / #1109 fixed.
+            // Same order as `assistant_capture::transform_for_client`.
+            let scrubbed = Sanitizer::builtin().scrub(&text);
+            *field = serde_json::Value::String(truncate_utf8_bytes(&scrubbed, max_bytes));
             changed = true;
         }
     }
@@ -2054,7 +2081,10 @@ mod tests {
             q,
             serde_json::json!({"payload":{"tool":"bash","output":"é".repeat(2_000)}}),
         );
-        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+        let body = long.body_excerpt.unwrap();
+        assert!(body.len() > 2_000);
+        let capped = truncate_utf8_bytes(&body, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.len() <= 2_000);
     }
 
     /// OpenCode's plugin `event` hook receives bus events shaped like
@@ -2415,11 +2445,19 @@ mod tests {
                 },
                 serde_json::json!({(field): body}),
             );
-            let excerpt = env.body_excerpt.expect("bounded body excerpt");
-            assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
-            assert!(excerpt.ends_with('…'), "{event} omitted truncation marker");
+            // Extraction no longer caps (#1114): the sanitizer at the ingest
+            // funnel must see the full text before any byte limit runs. The
+            // scrub-then-cap order itself is asserted by the router's
+            // `issue_1114_*` tests.
+            let excerpt = env.body_excerpt.expect("body excerpt");
+            assert_eq!(excerpt, body, "{event} excerpt was capped at extraction");
+            let hook_event = HookEvent::parse(event);
+            assert_eq!(durable_body_cap(hook_event), cap);
+            let capped = truncate_utf8_bytes(&excerpt, durable_body_cap(hook_event));
+            assert!(capped.len() <= cap, "{event} exceeded {cap} bytes");
+            assert!(capped.ends_with('…'), "{event} omitted truncation marker");
             assert!(
-                !excerpt.contains("TAIL_SENTINEL"),
+                !capped.contains("TAIL_SENTINEL"),
                 "{event} retained content after the cap"
             );
         }
@@ -2465,6 +2503,35 @@ mod tests {
         ));
     }
 
+    /// Regression for #1114 (client side): an oversized lifecycle body is
+    /// scrubbed with the built-in sanitizer **before** the spool cap runs, so
+    /// a secret straddling the cutoff is redacted whole instead of being cut
+    /// into an unmatchable prefix that the spool — and later the server —
+    /// persists in clear text. Mirrors `transform_for_client` (#196) and the
+    /// #980 / #1109 scrub-before-cap fixes.
+    #[test]
+    fn client_body_cap_scrubs_before_truncating() {
+        // AWS access key id shape: a built-in pattern.
+        let secret = format!("AKIA{}", "A".repeat(16));
+        let mut raw = serde_json::json!({
+            "prompt": format!("{} {secret}", "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES - 14)),
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        let capped = raw["prompt"].as_str().expect("oversized prompt capped");
+        assert!(
+            !capped.contains("AKIA"),
+            "unredacted secret fragment survived the cap: {capped:?}"
+        );
+        assert!(
+            capped.contains("[REDACTED:"),
+            "capped prompt carries no redaction marker: {capped:?}"
+        );
+        assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+    }
+
     /// Kimi Code's content-block `prompt` must flatten into the title
     /// exactly like the body excerpt does.
     #[test]
@@ -2504,8 +2571,9 @@ mod tests {
             }),
         );
         let excerpt = env.body_excerpt.unwrap();
-        assert!(excerpt.ends_with('…'));
         assert!(excerpt.starts_with("tool_family: non-file\noutcome: unknown\n---\n"));
+        let capped = truncate_utf8_bytes(&excerpt, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.ends_with('…'));
     }
 
     /// Regression: the native-binary hook command sends the script stem
@@ -2732,9 +2800,12 @@ mod tests {
             },
             serde_json::json!({"tool_name": "Bash", "tool_use_id": "call-long", "tool_response": {"content": [{"type": "text", "text": "é".repeat(2_000)}]}}),
         );
+        // Extraction no longer caps: the sanitizer must see the full text
+        // before any byte limit runs (#1114). The cap itself is asserted at
+        // the ingest funnel, where it is applied to the scrubbed body.
         let body = env.body_excerpt.unwrap();
         assert!(body.contains('é'));
-        assert!(body.len() <= TOOL_EXCERPT_MAX_BYTES);
+        assert!(body.len() > TOOL_EXCERPT_MAX_BYTES);
     }
 
     #[test]
@@ -2860,7 +2931,10 @@ mod tests {
             },
             serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":"utf8-1","output": "é".repeat(2_000)}),
         );
-        assert!(long.body_excerpt.unwrap().len() <= 2_000);
+        let body = long.body_excerpt.unwrap();
+        assert!(body.len() > 2_000);
+        let capped = truncate_utf8_bytes(&body, durable_body_cap(HookEvent::PostToolUse));
+        assert!(capped.len() <= 2_000);
     }
 
     #[test]
