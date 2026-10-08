@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the session-aware MCP bridge failing on Docker-wrapper installs: the
+  wrapper sent `mcp-bridge` to the helper container, where the registered
+  `127.0.0.1` server URL is unreachable, so every session started without
+  ai-memory's MCP tools. The wrapper now runs `mcp-bridge` through its
+  checksum-verified native host client, which also repairs existing entries.
+  (#1147)
 - Fixed the scheduled auto-improve tests' intermittent empty log captures
   (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
   `warn!` callsite's first-in-process execution on a bare thread caches
