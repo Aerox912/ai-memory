@@ -259,7 +259,21 @@ impl fmt::Display for ScopeResolutionError {
                 write!(
                     f,
                     "project '{project}' not found in workspace '{workspace}'"
-                )
+                )?;
+                // A project name never contains '/', so this is a
+                // `workspace/project` label passed as the project (#1152).
+                if let Some((ws, proj)) = project.split_once('/')
+                    && !ws.is_empty()
+                    && !proj.is_empty()
+                    && !proj.contains('/')
+                {
+                    write!(
+                        f,
+                        "; project names never contain '/': pass workspace \"{ws}\" and \
+                         project \"{proj}\" as separate arguments"
+                    )?;
+                }
+                Ok(())
             }
             ScopeResolutionError::ProjectNameAmbiguous {
                 workspace,
@@ -1244,6 +1258,27 @@ mod tests {
     use ai_memory_core::NewUser;
 
     use crate::{AccessMode, GrantLevel};
+
+    /// A `workspace/project` label passed as the project names the split
+    /// (#1152); an ordinary miss keeps the plain message.
+    #[test]
+    fn a_slashed_project_name_points_at_the_separate_arguments() {
+        let glued = ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: "default".into(),
+            project: "myorg/myproject".into(),
+        }
+        .to_string();
+        assert!(
+            glued.contains("pass workspace \"myorg\" and project \"myproject\""),
+            "{glued}"
+        );
+        let plain = ScopeResolutionError::ProjectNotFoundInWorkspace {
+            workspace: "default".into(),
+            project: "ghost".into(),
+        }
+        .to_string();
+        assert_eq!(plain, "project 'ghost' not found in workspace 'default'");
+    }
 
     async fn user_named(store: &Store, username: &str, byte: u8) -> UserId {
         store
