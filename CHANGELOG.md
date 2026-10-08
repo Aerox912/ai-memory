@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entries 2.6.0 admitted under the looser rules survive the upgrade and a
   rebuild. The doc now gives the upgrade path, `profile review` then
   `profile forget` on each entry to drop. (#1155)
+- Fixed a `workspace/project` label passed as the project failing to resolve
+  (for example `workspace: "default", project: "myorg/myproject"`): when no
+  project has that exact name, the label's own workspace and project are used,
+  under the same access checks as passing them separately. A write never
+  creates a project whose name contains `/` any more; it is refused with the
+  hint instead. (#1152, #1154)
 
 ## [2.6.1] - 2026-10-08
 
