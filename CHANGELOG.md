@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Fixed the macOS menu bar companion's **Settings…** item opening the
+  Settings window behind the frontmost app, so clicking it appeared to do
+  nothing. The item now activates the app before opening the window, as
+  **Show Status…** already did. (#1161)
+
 ## [2.6.2] - 2026-10-08
 
 ### Fixed
