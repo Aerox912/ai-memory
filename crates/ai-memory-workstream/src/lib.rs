@@ -25,10 +25,10 @@ pub use repository::{
     RepositoryFingerprints, RepositoryIdentity, inspect_repository, inspect_repository_fingerprints,
 };
 pub use transcript::{
-    AmbiguousNativeSession, ExportedTranscript, NativeSessionCandidate,
-    claude_attached_background_session, claude_live_background_attach_id,
-    claude_session_ran_in_background, discover_native_session, export_transcript,
-    kiro_harness_from_source_cursor, kiro_v3_resume_uses_default_store, list_native_sessions,
-    native_memory_dir, native_session_exists, native_session_in_checkout, native_store_root,
+    AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, NativeSessionCandidate,
+    claude_continued_session, claude_live_background_attach_id, claude_session_ran_in_background,
+    discover_native_session, export_transcript, kiro_harness_from_source_cursor,
+    kiro_v3_resume_uses_default_store, list_native_sessions, native_memory_dir,
+    native_session_exists, native_session_in_checkout, native_store_root,
     wait_for_transcript_flush,
 };

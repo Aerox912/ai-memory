@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed `ai-memory backfill` failing on every Antigravity CLI session: it and
+  `ai-memory run` now import the session's user prompts from `agy`'s
+  `history.jsonl`, keeping only lines whose conversation and workspace match
+  the checkout. (#1134)
 - Fixed the scheduled auto-improve tests' intermittent empty log captures
   (the same latent flaw #1116 fixed for the hooks checkpoint test): a shared
   `warn!` callsite's first-in-process execution on a bare thread caches
@@ -54,10 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now kept by both, and by the PreCompact and PostCompaction checkpoints,
   which rewrote it the same way. The write no longer stamps
   `observation_generation`. (#1138)
-- Fixed `ai-memory backfill` failing on every Antigravity CLI session: it and
-  `ai-memory run` now import the session's user prompts from `agy`'s
-  `history.jsonl`, keeping only lines whose conversation and workspace match
-  the checkout. (#1134)
+- Fixed `ai-memory run claude` resuming the launch session forever after a
+  `/clear`: Claude Code continues a cleared conversation in a new session,
+  and the workstream now follows it — the newest one after several clears —
+  so the next launch resumes where the work actually went and that
+  transcript, not the abandoned one, is imported. Only a transcript that
+  records the `/clear` command, names this launch's session as its origin,
+  and stays in this checkout (or a directory below it) is followed. (#1135)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no
