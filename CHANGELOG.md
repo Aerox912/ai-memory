@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the #980 / #1109 fixes established — so a straddling secret can no longer
   reach the spool (and through it the server) as an unredacted fragment.
   (#1114)
+- Fixed the managed-workstream ledger capping event content *before* the
+  sanitizer ever saw it: the 64 KiB per-event cap in
+  `hooks::workstream::sanitize_events` truncated first, so a secret
+  straddling the cutoff was cut into a prefix too short to match any
+  pattern and persisted unredacted in the immutable raw segment — the same
+  ordering bug as the #980 title-hint and #1109 feedback-reason leaks. The
+  cap now runs after scrubbing, the server-generated checkpoint and losses
+  boundary events get the same ordering, and the store's `finish_run`
+  scrubs with the caller's sanitizer before its own 16 KiB bound as
+  defense in depth. The stored shapes and byte limits are unchanged.
+  (#1113)
 - Fixed the hook spool charging a spooled event's retry budget while the
   server was unreachable: an endpoint-level delivery failure (connection
   refused, timeout, DNS — the existing `Unreachable` classification) no

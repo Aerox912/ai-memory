@@ -546,6 +546,77 @@ async fn workstream_provenance_retry_with_marker_matching_pattern_is_idempotent(
     );
 }
 
+/// Defense in depth at the store boundary (#1113): even a caller that hands
+/// `finish_workstream_run` an unscrubbed event gets the credential scrubbed
+/// before the 16 KiB content cap, so a secret straddling the cap is never
+/// cut into an unmatchable prefix and persisted verbatim.
+#[tokio::test]
+async fn workstream_content_is_scrubbed_before_the_store_cap() {
+    const CONTENT_CAP: usize = 16 * 1024;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let run = prepare(&store).await;
+    // The key starts 18 bytes before the truncation cut (the cap minus the
+    // ellipsis reserve): capping first would keep `sk-` plus 15 characters,
+    // one short of the 16 the pattern needs, leaking the prefix verbatim.
+    // The space before the tail keeps the greedy key pattern from swallowing
+    // the tail, so the scrubbed text still crosses the cap.
+    let mut hostile = event("straddling", "record-1", json!({}));
+    hostile.content = format!(
+        "{}sk-{} {}",
+        "x".repeat(CONTENT_CAP - 21),
+        "A".repeat(40),
+        "y".repeat(2 * 1024),
+    );
+    let mut control = event("control", "record-2", json!({}));
+    control.content = "plain ledger note".into();
+    assert_eq!(
+        store
+            .writer
+            .finish_workstream_run(
+                local_authority(),
+                finish(run.run_id, vec![hostile, control])
+            )
+            .await
+            .unwrap()
+            .imported_events,
+        2
+    );
+    let conn = Connection::open(store.db_path()).unwrap();
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM workstream_events WHERE event_id = 'straddling'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        content.contains("[REDACTED:api_key]"),
+        "straddling credential must be redacted before the cap: {content:?}"
+    );
+    assert!(
+        !content.contains("sk-"),
+        "cap-straddling credential prefix leaked"
+    );
+    assert!(
+        content.ends_with('…'),
+        "scrubbed content must still cross the cap and be truncated"
+    );
+    assert!(
+        content.len() <= CONTENT_CAP,
+        "stored content exceeds the cap: {} bytes",
+        content.len()
+    );
+    let control: String = conn
+        .query_row(
+            "SELECT content FROM workstream_events WHERE event_id = 'control'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(control, "plain ledger note");
+}
+
 /// A single-user (no database users) caller: the finish gate admits it, so
 /// these provenance tests exercise only the storage boundary.
 fn local_authority() -> ai_memory_store::ManagedRunAuthority {
