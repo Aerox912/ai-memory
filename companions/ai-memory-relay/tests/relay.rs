@@ -1601,9 +1601,11 @@ fn journal_reclassification_busy_preserves_committed_migration_and_retries_same_
     let mut committed = Vec::new();
     let mut busy = 0;
     let start = std::time::Instant::now();
+    // Room for several attempts on every platform: Windows sleeps in ~15 ms
+    // ticks, so a 40 ms budget could end after one slow attempt and one sleep.
     let result = queue_under_test::Queue::open_for_test(
         &dir,
-        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(200),
         &mut |phase| match phase {
             OpenPhase::BeforeJournal => {
                 assert_eq!(
