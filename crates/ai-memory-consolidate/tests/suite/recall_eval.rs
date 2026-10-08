@@ -539,7 +539,9 @@ async fn profile_recall_across_projects() {
         .with_store_reader(store.reader.clone());
     for (project, prompt) in [
         ("alpha", "I prefer tabs over spaces."),
-        ("beta", "I prefer tabs over spaces."),
+        // Reworded: the same text in two projects at the same moment is one
+        // message fanned out, not a habit (#1148).
+        ("beta", "I prefer tabs over spaces here too."),
         (
             "alpha",
             "Use the legacy webpack builder instead of vite in this repo.",

@@ -592,10 +592,36 @@ fn has_phrase(padded: &str, phrase: &str) -> bool {
 }
 
 /// Whether a sentence carries a preference marker at all (the loose gate the
-/// LLM classifier sees).
+/// LLM classifier sees). Sentences that read like agent output never pass.
 fn has_marker(sentence: &str) -> bool {
     let padded = padded_lower(sentence);
-    PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m))
+    PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m)) && !looks_agent_written(sentence)
+}
+
+/// Whether a sentence reads like agent output rather than a person typing a
+/// preference: markdown emphasis or a `file.ext:line` reference. On hosts
+/// where agents brief each other through the prompt channel, the user-prompt
+/// text is often a lead agent's task brief or a pasted review, full of
+/// "always"/"never" that only hold for that task (#1148).
+fn looks_agent_written(sentence: &str) -> bool {
+    if sentence.contains("**") || sentence.contains("__") {
+        return true;
+    }
+    sentence.split_whitespace().any(|word| {
+        let word = word.trim_matches(|c: char| {
+            !(c.is_alphanumeric() || matches!(c, '.' | ':' | '/' | '_' | '-'))
+        });
+        let Some((path, line)) = word.rsplit_once(':') else {
+            return false;
+        };
+        let line = line.split(['-', ':']).next().unwrap_or("");
+        let has_ext = path.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && (1..=6).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+        has_ext && !line.is_empty() && line.chars().all(|c| c.is_ascii_digit())
+    })
 }
 
 /// The preference-shaped sentences of user-written `text`, zero-LLM.
@@ -613,7 +639,10 @@ pub fn detect_preferences(text: &str) -> Vec<DetectedPreference> {
 }
 
 fn classify_sentence(sentence: &str) -> Option<DetectedPreference> {
-    if sentence.contains('?') || sentence.len() > SENTENCE_MAX_BYTES {
+    if sentence.contains('?')
+        || sentence.len() > SENTENCE_MAX_BYTES
+        || looks_agent_written(sentence)
+    {
         return None;
     }
     let padded = padded_lower(sentence);
@@ -1217,8 +1246,13 @@ pub fn converge(
     }
 
     // Statements: group by topic, admit, latest ruling wins.
+    let mut used_quotes: BTreeSet<String> = BTreeSet::new();
     for group in group_by_topic(&statement_rows) {
         let projects: BTreeSet<String> = group.iter().map(|m| project_label(m.row)).collect();
+        // One instruction fanned out to several checkouts at once (a lead
+        // agent's brief to its workers) is one piece of evidence, not one per
+        // project (#1148).
+        let independent = independent_projects(&group);
         let general = group
             .iter()
             .any(|m| m.row.candidate.generality == ProfileGenerality::General);
@@ -1238,7 +1272,7 @@ pub fn converge(
         let projects_short = if general {
             0
         } else {
-            min_projects.saturating_sub(projects.len())
+            min_projects.saturating_sub(independent)
         };
         // Only a team profile counts people; a personal one (or a single-user
         // server, where evidence carries no contributor) needs none.
@@ -1250,10 +1284,19 @@ pub fn converge(
         if projects_short > 0 || contributors_short > 0 {
             plan.waiting.push(WaitingGroup {
                 statement: newest.row.candidate.statement.clone(),
-                projects: projects.len(),
+                projects: independent,
                 needs: projects_short,
                 contributors_needed: contributors_short,
             });
+            continue;
+        }
+        // One quote backs one entry: a group whose every quote already
+        // backs an entry admitted in this pass adds nothing new (#1148).
+        let quotes: BTreeSet<String> = group
+            .iter()
+            .map(|m| normalized_quote(&m.row.candidate.quote))
+            .collect();
+        if quotes.is_subset(&used_quotes) {
             continue;
         }
         // An entry the user removed stays removed until they say it again.
@@ -1317,7 +1360,7 @@ pub fn converge(
                     .unwrap_or(0),
             ),
             last_seen: date_of(newest.row.candidate.observed_at),
-            confidence: confidence_of(projects.len(), general, best_candidate),
+            confidence: confidence_of(independent, general, best_candidate),
             generality: if general {
                 ProfileGenerality::General
             } else {
@@ -1335,8 +1378,47 @@ pub fn converge(
             matched.as_deref(),
         );
         taken.insert(path);
+        used_quotes.extend(quotes);
     }
     plan
+}
+
+/// A quote reduced to its words, so the same brief pasted with different
+/// whitespace or punctuation compares equal.
+fn normalized_quote(quote: &str) -> String {
+    padded_lower(quote).trim().to_owned()
+}
+
+/// How long after one occurrence the same quote in another project still
+/// counts as the same message rather than a second, independent statement.
+/// A lead agent fans one brief out to its workers within minutes; a person
+/// repeating a habit in another project does so on another day.
+const FAN_OUT_WINDOW_US: i64 = 60 * 60 * 1_000_000;
+
+/// How many projects carry independent evidence for a group. The same quote
+/// seen in several projects within [`FAN_OUT_WINDOW_US`] of an occurrence
+/// already counted is one message fanned out, so it counts once.
+fn independent_projects(group: &[Member<'_>]) -> usize {
+    let mut occurrences: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+    for member in group {
+        occurrences
+            .entry(normalized_quote(&member.row.candidate.quote))
+            .or_default()
+            .push((member.row.candidate.observed_at, project_label(member.row)));
+    }
+    let mut projects = BTreeSet::new();
+    for mut seen in occurrences.into_values() {
+        seen.sort();
+        let mut last_counted: Option<i64> = None;
+        for (at, project) in seen {
+            if last_counted.is_some_and(|last| at - last < FAN_OUT_WINDOW_US) {
+                continue;
+            }
+            last_counted = Some(at);
+            projects.insert(project);
+        }
+    }
+    projects.len()
 }
 
 /// Route an admitted entry: skip it when its page is hand-edited, count it
@@ -2394,6 +2476,78 @@ mod tests {
 
     fn day(n: i64) -> i64 {
         1_790_000_000_000_000 + n * 86_400_000_000
+    }
+
+    /// Agent output in the prompt channel (a lead agent's brief, a pasted
+    /// review) is not the user stating a preference (#1148).
+    #[test]
+    fn agent_written_sentences_are_not_candidates() {
+        for text in [
+            "Always check src/router.rs:120 before you touch the gate.",
+            "Never edit crates/store/src/ops.rs:600-640 by hand.",
+            "**Never** run the migration twice.",
+            "Always keep __init__ files empty.",
+        ] {
+            assert!(looks_agent_written(text), "{text}");
+            assert!(detect_preferences(text).is_empty(), "{text}");
+            assert!(!has_marker(text), "{text}");
+        }
+        for text in [
+            "Always use pnpm for installs.",
+            "I prefer a 3:2 split for the sidebar layout.",
+            "Never commit generated files like build.rs output.",
+        ] {
+            assert!(!looks_agent_written(text), "{text}");
+            assert!(!detect_preferences(text).is_empty(), "{text}");
+        }
+    }
+
+    /// The same brief fanned out to two workers' checkouts within minutes is
+    /// one message; the same words typed in two projects days apart is a
+    /// habit (#1148).
+    #[test]
+    fn a_fanned_out_brief_counts_once_and_a_repeated_habit_twice() {
+        let brief = "Always run the full suite before you reply.";
+        let alpha = row("worker-a", brief, day(1), ProfileGenerality::Project);
+        let beta = row(
+            "worker-b",
+            brief,
+            day(1) + 60_000_000,
+            ProfileGenerality::Project,
+        );
+        let plan = converge(&[&alpha, &beta], &[], &[], 2, 1);
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert_eq!(plan.waiting.len(), 1);
+        assert_eq!(plan.waiting[0].needs, 1);
+
+        let later = row("worker-b", brief, day(3), ProfileGenerality::Project);
+        let plan = converge(&[&alpha, &later], &[], &[], 2, 1);
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].projects, 2);
+    }
+
+    /// One quote backs one entry even when it was classified into two
+    /// topics: no `-2`/`-3` duplicates of the same sentence (#1148).
+    #[test]
+    fn one_quote_backs_one_entry() {
+        let quote = "In all my projects, use pnpm and keep commits small.";
+        let mut pnpm = row(
+            "alpha",
+            "Use pnpm for every project.",
+            day(1),
+            ProfileGenerality::General,
+        );
+        pnpm.candidate.quote = quote.to_owned();
+        let mut commits = row(
+            "alpha",
+            "Keep commits small everywhere.",
+            day(1),
+            ProfileGenerality::General,
+        );
+        commits.candidate.quote = quote.to_owned();
+        commits.candidate.source_ref = "session:alpha-other".to_owned();
+        let plan = converge(&[&pnpm, &commits], &[], &[], 2, 1);
+        assert_eq!(plan.writes.len(), 1, "{:?}", plan.writes);
     }
 
     #[test]

@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed the cross-project profile learning from agent-written prompt text
+  and counting one fanned-out brief as several projects: sentences that read
+  like agent output (markdown bold, `file.ext:line` references) are no longer
+  candidates, the same sentence arriving in several projects within an hour
+  counts as one project toward `min_projects`, and one sentence backs at most
+  one entry. (#1148)
 - Fixed the cross-project profile rewriting a settled entry whenever new
   evidence merely agreed with it: a statement now changes only when the ruling
   or its scope does (the LLM merge reports `changed`), so the line every project
