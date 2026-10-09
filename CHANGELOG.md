@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trust each other's baselines. The state directory now ignores itself with
   a `.gitignore` of `*`. A state committed by an earlier export needs one
   `git rm -r --cached <dest>/.ai-memory-wikisync`. (#1162)
+- Fixed the macOS menu bar companion's **Settings…** item opening the
+  Settings window behind the frontmost app, so clicking it appeared to do
+  nothing. The item now activates the app before opening the window, as
+  **Show Status…** already did. (#1161)
 
 ## [2.6.2] - 2026-10-08
 
