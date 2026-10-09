@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the placeholder id `empty-state-draft` and no workspace, and each launch
   appended another observation to that one empty session. The server now
   acknowledges and drops that placeholder.
+- Fixed `install-mcp --client claude-desktop` refusing to run on Linux:
+  Anthropic ships Claude Desktop for Linux as a beta, and the command now
+  writes `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (default
+  `~/.config/Claude/`) instead of requiring `--config-file`.
 - Corrected the Claude Desktop documentation: Linux is an Anthropic beta for
   Debian-based distributions with its config at
   `~/.config/Claude/claude_desktop_config.json` (pass it to
