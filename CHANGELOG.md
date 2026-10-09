@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the budget (`no input sources selected`), and repeated the rules in the
   prompt. Only names the directory lists are read now, and identical text is
   read once. (#1168)
+- Fixed `backfill` and managed runs not finding a Claude Code transcript when
+  the session's directory contains anything but letters, digits and `/`:
+  Claude Code names a project's folder by turning every other character into
+  `-`, but ai-memory replaced only `/`, so every Windows path and any path
+  with `.`, `_` or a space missed it, and the bounded fallback scan could run
+  out on a large store first. The folder name now follows Claude Code's rule,
+  every project folder is probed for the exact transcript before the scan,
+  and a subagent's `subagents/*.jsonl` sidechain, which carries its parent's
+  session id, is never taken for the session's transcript. (#1167)
 - Fixed the macOS menu bar companion's **Settings…** item opening the
   Settings window behind the frontmost app, so clicking it appeared to do
   nothing. The item now activates the app before opening the window, as
