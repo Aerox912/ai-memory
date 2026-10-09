@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Fixed Cursor tool calls being stored with no title or content: Cursor's own
+  hooks, and the Claude Code hooks Cursor also runs, send Claude's
+  `tool_name`/`tool_input` fields, but Cursor was missing from the tool-capture
+  mapping, so every Cursor tool observation reached the store empty. They now
+  get the same tool-family title and output summary as Claude Code's.
 - Corrected the Claude Desktop documentation: Linux is an Anthropic beta for
   Debian-based distributions with its config at
   `~/.config/Claude/claude_desktop_config.json` (pass it to
