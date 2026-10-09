@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool_name`/`tool_input` fields, but Cursor was missing from the tool-capture
   mapping, so every Cursor tool observation reached the store empty. They now
   get the same tool-family title and output summary as Claude Code's.
+- Fixed every Cursor window adding a session to memory before any
+  conversation: Cursor fires `sessionStart` for its empty draft composer with
+  the placeholder id `empty-state-draft` and no workspace, and each launch
+  appended another observation to that one empty session. The server now
+  acknowledges and drops that placeholder.
 - Corrected the Claude Desktop documentation: Linux is an Anthropic beta for
   Debian-based distributions with its config at
   `~/.config/Claude/claude_desktop_config.json` (pass it to
