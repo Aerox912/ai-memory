@@ -664,6 +664,10 @@ async fn handle_hook(
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "capture policy dropped");
     };
+    if is_cursor_draft_placeholder(&env) {
+        HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
+        return (StatusCode::ACCEPTED, "cursor draft placeholder dropped");
+    }
     // Accept-but-drop subagent captures (incl. the unmarked tail of tracked
     // subagent sessions) when the operator opts in. Returning 202 (not an error)
     // means the client treats the event as delivered and never retries/spools
@@ -932,6 +936,15 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         };
+        if is_cursor_draft_placeholder(&env) {
+            HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedInvalid,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
         // as committed so the client clears it from its spool, but do not store
         // it. Keeps the contiguous-prefix ack contract intact.
@@ -1279,6 +1292,15 @@ const fn canonical_tool_name(family: ToolFamily) -> &'static str {
         ToolFamily::NonFile => "non-file",
         ToolFamily::Unknown => "unknown",
     }
+}
+
+/// Cursor fires `sessionStart` for the empty draft composer of every window it
+/// opens, before any conversation exists, always with this placeholder id and
+/// no workspace. Kept, it piles up as one session that never holds work.
+const CURSOR_DRAFT_SESSION_ID: &str = "empty-state-draft";
+
+fn is_cursor_draft_placeholder(env: &HookEnvelope) -> bool {
+    env.agent == AgentKind::Cursor && env.session_id.as_deref() == Some(CURSOR_DRAFT_SESSION_ID)
 }
 
 /// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
@@ -4155,7 +4177,9 @@ fn build_auto_handoff(
         match obs.kind {
             ObservationKind::UserPrompt => {
                 let text = pick_text(obs);
-                if !text.is_empty() {
+                // A harness block delivered as a user turn (`<task-notification>`)
+                // is not a request to continue from.
+                if !text.is_empty() && !ai_memory_core::looks_like_markup_block(text) {
                     prompts.push(text.to_string());
                 }
             }
@@ -4259,7 +4283,11 @@ fn derive_open_questions(
         observations.iter().rev().find(|o| o.kind == kind)
     };
 
-    let last_prompt_obs = last_of_kind(ObservationKind::UserPrompt);
+    // Harness blocks delivered as a user turn are not the user's question.
+    let last_prompt_obs = observations.iter().rev().find(|o| {
+        let text = if o.body.is_empty() { &o.title } else { &o.body };
+        o.kind == ObservationKind::UserPrompt && !ai_memory_core::looks_like_markup_block(text)
+    });
     let last_tool = last_of_kind(ObservationKind::PostToolUse);
     let last_stop = last_of_kind(ObservationKind::Stop);
     let has_session_end = observations
@@ -7963,6 +7991,77 @@ mod tests {
             ingest_rate_key(&with_session, Some("bob")),
             "different actors sharing a session id get separate limiter buckets"
         );
+    }
+
+    #[tokio::test]
+    async fn cursor_draft_placeholder_is_dropped_before_any_capacity_is_spent() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        // One token, no refill: a placeholder that reached the limiter would
+        // leave nothing for the real conversation that follows.
+        state.ingest_rate = Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::new(0.001, 1.0)));
+        let state = Arc::new(state);
+        async fn hit(state: Arc<HookState>, sid: &str) -> (StatusCode, String) {
+            let response = handle_hook(
+                State(state),
+                Query(HookQuery {
+                    event: "session-start".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                Json(serde_json::json!({
+                    "conversation_id": sid, "session_id": sid,
+                    "hook_event_name": "sessionStart", "cursor_version": "3.24.9",
+                    "workspace_roots": [], "transcript_path": null,
+                })),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+
+        for _ in 0..2 {
+            assert_eq!(
+                hit(state.clone(), "empty-state-draft").await,
+                (
+                    StatusCode::ACCEPTED,
+                    "cursor draft placeholder dropped".into()
+                )
+            );
+        }
+        // Control: a real Cursor conversation is queued.
+        assert_eq!(
+            hit(state.clone(), "17689370-2e8e-4dfd-bcd0-7e5bb9cd19ed").await,
+            (StatusCode::ACCEPTED, "queued".into())
+        );
+        // A Claude Code session that happens to use the same id is not Cursor's.
+        let claude = handle_hook(
+            State(state),
+            Query(HookQuery {
+                event: "session-start".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(serde_json::json!({ "session_id": "empty-state-draft" })),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(claude.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"queued");
     }
 
     #[tokio::test]
@@ -18176,6 +18275,177 @@ mod tests {
             handoff.next_steps.iter().any(|s| s == "Tools used: Edit"),
             "a real tool name must still be listed; got: {:?}",
             handoff.next_steps
+        );
+    }
+
+    const TASK_NOTIFICATION: &str = "<task-notification>\n<task-id>abc</task-id>\n\
+        <status>completed</status>\n<summary>Agent \"review\" completed</summary>\n\
+        </task-notification>";
+
+    fn handoff_from(
+        observations: &[ai_memory_core::Observation],
+        turn_checkpoint: bool,
+    ) -> NewHandoff {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            observations,
+            None,
+            turn_checkpoint,
+        )
+    }
+
+    #[test]
+    fn auto_handoff_skips_a_trailing_task_notification_prompt() {
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "start", "map the sweep code"),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "later",
+                "fix the pinned-page sweep",
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(
+            handoff.summary,
+            "Started: map the sweep code\n\nLast: fix the pinned-page sweep"
+        );
+        assert_eq!(
+            handoff.open_questions,
+            vec!["Continue from: fix the pinned-page sweep".to_string()]
+        );
+        assert!(!handoff.summary.contains("task-notification"));
+        assert!(
+            handoff
+                .open_questions
+                .iter()
+                .all(|q| !q.contains("task-notification"))
+        );
+    }
+
+    #[test]
+    fn auto_handoff_with_only_task_notification_prompts_uses_the_no_prompt_fallback() {
+        let observations = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(handoff.summary, "Session ended; 2 observations recorded.");
+        assert!(
+            handoff.open_questions.is_empty(),
+            "got: {:?}",
+            handoff.open_questions
+        );
+    }
+
+    #[test]
+    fn auto_handoff_does_not_treat_a_task_notification_question_as_unresolved() {
+        let notification = "<task-notification>\n<task-id>abc</task-id>\n\
+            <status>completed</status>\n<summary>Should the docs change too?";
+        let observations = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "fix",
+                "fix the pinned-page sweep",
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                notification,
+            ),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert!(
+            handoff
+                .open_questions
+                .iter()
+                .all(|q| !q.starts_with("Unresolved question:")),
+            "got: {:?}",
+            handoff.open_questions
+        );
+    }
+
+    #[test]
+    fn turn_checkpoint_continues_from_the_real_prompt_before_a_task_notification() {
+        let observations = vec![
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "fix",
+                "fix the pinned-page sweep",
+            ),
+            mk_obs(
+                ObservationKind::UserPrompt,
+                "<task-notification>",
+                TASK_NOTIFICATION,
+            ),
+        ];
+        let handoff = handoff_from(&observations, true);
+        assert_eq!(
+            handoff.open_questions,
+            vec!["Continue from last request: fix the pinned-page sweep".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_a_prompt_with_markup_after_its_first_word() {
+        let observations = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "fix",
+            "fix <div> alignment",
+        )];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(handoff.summary, "Session focused on: fix <div> alignment");
+        assert_eq!(
+            handoff.open_questions,
+            vec!["Continue from: fix <div> alignment".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_a_pasted_content_prompt() {
+        let pasted = "<pasted_content id=\"5b6f\">\nEu quero inicializar um harness";
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "start", "map the sweep code"),
+            mk_obs(ObservationKind::UserPrompt, "paste", pasted),
+        ];
+        let handoff = handoff_from(&observations, false);
+        assert!(
+            handoff.summary.ends_with(&format!("Last: {pasted}")),
+            "got: {}",
+            handoff.summary
+        );
+        assert_eq!(
+            handoff.open_questions,
+            vec![format!("Continue from: {pasted}")]
+        );
+    }
+
+    #[test]
+    fn auto_handoff_keeps_a_prompt_decorated_prompt() {
+        let prompt = "\u{276f} rode o workflow de arquitetura";
+        let observations = vec![mk_obs(ObservationKind::UserPrompt, "run", prompt)];
+        let handoff = handoff_from(&observations, false);
+        assert_eq!(handoff.summary, format!("Session focused on: {prompt}"));
+        assert_eq!(
+            handoff.open_questions,
+            vec![format!("Continue from: {prompt}")]
         );
     }
 

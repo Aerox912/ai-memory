@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.2-aerox.1] - 2026-10-09
+
+### Changed
+- Integrated canonical AI Memory through `c97766d5`, including v2.6.2 and the subsequent scope, transcript, bootstrap, and desktop-hook fixes. Preserved the maintained fork's file-backed authentication, runtime-only hook credentials, trusted pool routing, and native Windows/WSL packaging.
+
+### Fixed
+- Fixed Cursor tool calls being stored with no title or content: Cursor's own
+  hooks, and the Claude Code hooks Cursor also runs, send Claude's
+  `tool_name`/`tool_input` fields, but Cursor was missing from the tool-capture
+  mapping, so every Cursor tool observation reached the store empty. They now
+  get the same tool-family title and output summary as Claude Code's.
+- Fixed every Cursor window adding a session to memory before any
+  conversation: Cursor fires `sessionStart` for its empty draft composer with
+  the placeholder id `empty-state-draft` and no workspace, and each launch
+  appended another observation to that one empty session. The server now
+  acknowledges and drops that placeholder.
+- Fixed `install-mcp --client claude-desktop` refusing to run on Linux:
+  Anthropic ships Claude Desktop for Linux as a beta, and the command now
+  writes `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (default
+  `~/.config/Claude/`) instead of requiring `--config-file`.
+- Corrected the Claude Desktop documentation: Linux is an Anthropic beta for
+  Debian-based distributions with its config at
+  `~/.config/Claude/claude_desktop_config.json` (pass it to
+  `install-mcp --client claude-desktop` with `--config-file`), the Code tab's
+  local sessions are already captured by the Claude Code hooks, and Cowork
+  capture is not claimed. The desktop-app research notes record what was
+  verified live and what is still open. (#878)
+- Fixed `ai-memory-wikisync` committing its per-clone export state: the
+  `git add` of the destination that `export --apply` prints also staged
+  `.ai-memory-wikisync/state.json`, so two clones would conflict on it and
+  trust each other's baselines. The state directory now ignores itself with
+  a `.gitignore` of `*`. A state committed by an earlier export needs one
+  `git rm -r --cached <dest>/.ai-memory-wikisync`. (#1162)
+- Fixed `bootstrap` reading a rules file twice when it is reachable under two
+  names: on a case-insensitive filesystem `claude.md` opened `CLAUDE.md`
+  again, and on any system a `CLAUDE.md` linked to `AGENTS.md` did the same.
+  The doubled text inflated the token estimate, could push every source over
+  the budget (`no input sources selected`), and repeated the rules in the
+  prompt. Only names the directory lists are read now, and identical text is
+  read once. (#1168)
+- Fixed `backfill` and managed runs not finding a Claude Code transcript when
+  the session's directory contains anything but letters, digits and `/`:
+  Claude Code names a project's folder by turning every other character into
+  `-`, but ai-memory replaced only `/`, so every Windows path and any path
+  with `.`, `_` or a space missed it, and the bounded fallback scan could run
+  out on a large store first. The folder name now follows Claude Code's rule,
+  every project folder is probed for the exact transcript before the scan,
+  and a subagent's `subagents/*.jsonl` sidechain, which carries its parent's
+  session id, is never taken for the session's transcript. (#1167)
+- Fixed the macOS menu bar companion's **Settings…** item opening the
+  Settings window behind the frontmost app, so clicking it appeared to do
+  nothing. The item now activates the app before opening the window, as
+  **Show Status…** already did. (#1161)
+
+## [2.6.2] - 2026-10-08
+
+### Fixed
+- Fixed automatic handoffs carrying harness scaffolding as the user's
+  request: a user turn that opens with a markup block whose opening tag has
+  no attributes (for example the `<task-notification>` block Claude Code
+  delivers when a background task, agent or workflow completes) no longer
+  becomes the handoff's `Started:` / `Last:` summary, its `Continue from:`
+  line, or its `Unresolved question:` line. The handoff now uses the last
+  prompt the user actually wrote, and falls back to the no-prompt summary
+  when every prompt in the session is such a block. Prompts that only
+  contain markup later in the text, pastes with attributes such as
+  `<pasted_content id="…">`, and stored observations are unchanged. (#1158)
+- Corrected the `profile rebuild` guidance in `docs/cross-project-profile.md`
+  and the command's help: it never removes an entry, and a candidate recorded
+  by an earlier version keeps the classification it was recorded with, so
+  entries 2.6.0 admitted under the looser rules survive the upgrade and a
+  rebuild. The doc now gives the upgrade path, `profile review` then
+  `profile forget` on each entry to drop. (#1155)
+- Fixed a `workspace/project` label passed as the project failing to resolve
+  (for example `workspace: "default", project: "myorg/myproject"`): when no
+  project has that exact name, the label's own workspace and project are used,
+  under the same access checks as passing them separately. A write never
+  creates a project whose name contains `/` any more; it is refused with the
+  hint instead. (#1152, #1154)
+- Fixed every Pi turn failing with a 400 on Moonshot/Kimi models: the
+  generated Pi extension registered the MCP tools with schemas containing
+  `$ref`, which Moonshot rejects. Its bridge now requests the `?flavor=moonshot`
+  schemas, with every reference inlined, which any provider accepts. Re-run
+  `ai-memory install-hooks --agent pi --apply` to regenerate the extension.
+  (#1157)
+
 ## [2.6.1-aerox.1] - 2026-10-08
 
 ### Changed
@@ -8897,8 +8983,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v2.6.1-aerox.1...HEAD
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v2.6.2-aerox.1...HEAD
+[2.6.2-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v2.6.2-aerox.1
 [2.6.1-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v2.6.1-aerox.1
+[2.6.2]: https://github.com/akitaonrails/ai-memory/compare/v2.6.1...v2.6.2
 [2.6.1]: https://github.com/akitaonrails/ai-memory/compare/v2.6.0...v2.6.1
 [2.6.0-aerox.1]: https://github.com/Aerox912/ai-memory/releases/tag/v2.6.0-aerox.1
 [2.6.0]: https://github.com/akitaonrails/ai-memory/compare/v2.5.2...v2.6.0
