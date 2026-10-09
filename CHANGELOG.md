@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local sessions are already captured by the Claude Code hooks, and Cowork
   capture is not claimed. The desktop-app research notes record what was
   verified live and what is still open. (#878)
+- Fixed `ai-memory-wikisync` committing its per-clone export state: the
+  `git add` of the destination that `export --apply` prints also staged
+  `.ai-memory-wikisync/state.json`, so two clones would conflict on it and
+  trust each other's baselines. The state directory now ignores itself with
+  a `.gitignore` of `*`. A state committed by an earlier export needs one
+  `git rm -r --cached <dest>/.ai-memory-wikisync`. (#1162)
 
 ## [2.6.2] - 2026-10-08
 
