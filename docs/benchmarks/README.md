@@ -13,11 +13,15 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
-| **2026-09-21** | LongMemEval-S (v1) | **local embeddings (2.4 RC, current)** | **0.815** | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
+| **2026-10-13** | LongMemEval-S (v1) | **local embeddings (2.6.6-aerox.1, current)** | **0.821** | [longmemeval-s-2026-10-13-aerox-2.6.6.md](longmemeval-s-2026-10-13-aerox-2.6.6.md) |
+| 2026-10-13 | LongMemEval-S (v1) | zero-LLM FTS (2.6.6-aerox.1) | 0.666 | [longmemeval-s-2026-10-13-aerox-2.6.6.md](longmemeval-s-2026-10-13-aerox-2.6.6.md) |
+| **2026-09-21** | LongMemEval-S (v1) | **local embeddings (2.4 RC, prior)** | **0.815** | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-21 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (2.4 RC) | 0.666 | [retrieval-ab-r2.md](retrieval-ab-r2.md) |
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 2026-10-13 workstation-fork run reproduces FTS hit@5 0.666 and local hit@5 0.821. The [release review](longmemeval-s-2026-10-13-aerox-2.6.6.md) includes all slices, the historical comparisons and the hardware/measurement limits.
 
 The 2026-09-21 (2.4 RC) re-run shows no default-ranking regression: local
 `hit@5` 0.823 → 0.815 and FTS `hit@5` 0.668 → 0.666 are identical within

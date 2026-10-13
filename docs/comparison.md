@@ -1,5 +1,7 @@
 # How ai-memory compares
 
+Latest workstation-fork measurement: [2.6.6-aerox.1 retrieval review](benchmarks/longmemeval-s-2026-10-13-aerox-2.6.6.md), 470 scored questions per mode. The historical run and hardware limits are stated there.
+
 This page is for anyone evaluating ai-memory against another agent-memory tool,
 or migrating from one. It aims to be **fair and specific**: what each
 approach does well, where ai-memory differs, where others are ahead, and where
@@ -37,8 +39,8 @@ What sets it apart:
 - **One self-contained binary.** Bundled SQLite, vendored libgit2; no external
   services to stand up. It runs on a laptop, a homelab box, or a LAN server.
 
-It also publishes numbers: **LongMemEval-S hit@5 0.823** (local-embeddings
-default; 0.668 zero-LLM), produced by the in-repo harness with full provenance.
+It also publishes numbers: **LongMemEval-S hit@5 0.821** (local-embeddings
+default; 0.666 zero-LLM), produced by the in-repo harness with full provenance.
 For context on the same dataset, mcp-memory-service
 reports 0.804 R@5 and agentmemory 0.967 R@5 (hybrid + reranking). ai-memory is
 comparable to the former and below the latter, and it documents *why*
@@ -254,7 +256,7 @@ operator turns it on.
 
 ## Where we're behind, or different by choice
 
-- **Raw retrieval score, and no local reranker.** 0.823 hit@5 on LongMemEval-S
+- **Raw retrieval score, and no local reranker.** 0.821 hit@5 on LongMemEval-S
   is comparable to mcp-memory-service and below agentmemory's 0.967 (hybrid +
   reranking). Part of the gap is deliberate: a 2 KB privacy cap on captured excerpts puts
   evidence deep inside one long turn out of the index's reach, and the benchmark

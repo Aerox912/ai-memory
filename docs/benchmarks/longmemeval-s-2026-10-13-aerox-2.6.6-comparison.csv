@@ -1,0 +1,131 @@
+mode,slice,metric,published,candidate,delta,published_source
+baseline,overall,hit@1,0.532,0.5319148936170213,-8.510638297876127e-05,2.4 RC
+baseline,overall,hit@3,0.645,0.6446808510638298,-0.00031914893617024376,2.4 RC
+baseline,overall,hit@5,0.666,0.6659574468085107,-4.255319148938064e-05,2.4 RC
+baseline,overall,hit@10,0.694,0.6936170212765957,-0.0003829787234042037,2.4 RC
+baseline,overall,recall@5,0.536,0.5356382978723404,-0.0003617021276596244,2.4 RC
+baseline,overall,recall@10,0.564,0.5636170212765957,-0.0003829787234042037,2.4 RC
+candidate,overall,hit@1,0.536,0.5361702127659574,0.00017021276595741153,2.4 RC
+candidate,overall,hit@3,0.73,0.723404255319149,-0.006595744680851001,2.4 RC
+candidate,overall,hit@5,0.815,0.8212765957446808,0.0062765957446808684,2.4 RC
+candidate,overall,hit@10,0.891,0.8893617021276595,-0.0016382978723404884,2.4 RC
+candidate,overall,recall@5,0.677,0.6800000000000003,0.0030000000000002247,2.4 RC
+candidate,overall,recall@10,0.817,0.8180141843971634,0.0010141843971634978,2.4 RC
+candidate,knowledge-update,hit@5,0.875,0.9027777777777778,0.02777777777777779,2.4 RC
+candidate,multi-session,hit@5,0.868,0.8760330578512396,0.008033057851239644,2.4 RC
+candidate,temporal-reasoning,hit@5,0.78,0.7795275590551181,-0.00047244094488196886,2.4 RC
+candidate,single-session-assistant,hit@5,0.821,0.8035714285714286,-0.01742857142857135,2.4 RC
+candidate,single-session-preference,hit@5,0.767,0.7666666666666667,-0.0003333333333332966,2.4 RC
+candidate,single-session-user,hit@5,0.734,0.75,0.016000000000000014,2.4 RC
+baseline,knowledge-update,hit@1,0.583,0.5833333333333334,0.00033333333333340764,2.0 historical full-slice report
+baseline,knowledge-update,hit@3,0.75,0.75,0.0,2.0 historical full-slice report
+baseline,knowledge-update,hit@5,0.764,0.7638888888888888,-0.00011111111111117289,2.0 historical full-slice report
+baseline,knowledge-update,hit@10,0.778,0.7777777777777778,-0.00022222222222223476,2.0 historical full-slice report
+baseline,knowledge-update,recall@1,0.292,0.2916666666666667,-0.0003333333333332966,2.0 historical full-slice report
+baseline,knowledge-update,recall@3,0.549,0.5486111111111112,-0.00038888888888888307,2.0 historical full-slice report
+baseline,knowledge-update,recall@5,0.562,0.5625,0.0004999999999999449,2.0 historical full-slice report
+baseline,knowledge-update,recall@10,0.59,0.5902777777777778,0.0002777777777778212,2.0 historical full-slice report
+baseline,multi-session,hit@1,0.446,0.4462809917355372,0.0002809917355371949,2.0 historical full-slice report
+baseline,multi-session,hit@3,0.554,0.5537190082644629,-0.0002809917355371949,2.0 historical full-slice report
+baseline,multi-session,hit@5,0.579,0.5785123966942148,-0.00048760330578512256,2.0 historical full-slice report
+baseline,multi-session,hit@10,0.603,0.6033057851239669,0.0003057851239669507,2.0 historical full-slice report
+baseline,multi-session,recall@1,0.193,0.1929752066115702,-2.479338842981127e-05,2.0 historical full-slice report
+baseline,multi-session,recall@3,0.35,0.3501377410468319,0.00013774104683189625,2.0 historical full-slice report
+baseline,multi-session,recall@5,0.385,0.3847107438016529,-0.000289256198347132,2.0 historical full-slice report
+baseline,multi-session,recall@10,0.403,0.403305785123967,0.0003057851239669507,2.0 historical full-slice report
+baseline,overall,hit@1,0.534,0.5319148936170213,-0.002085106382978763,2.0 historical full-slice report
+baseline,overall,hit@3,0.647,0.6446808510638298,-0.0023191489361702455,2.0 historical full-slice report
+baseline,overall,hit@5,0.668,0.6659574468085107,-0.0020425531914893824,2.0 historical full-slice report
+baseline,overall,hit@10,0.696,0.6936170212765957,-0.0023829787234042055,2.0 historical full-slice report
+baseline,overall,recall@1,0.351,0.34861702127659566,-0.0023829787234043165,2.0 historical full-slice report
+baseline,overall,recall@3,0.51,0.5079787234042552,-0.002021276595744803,2.0 historical full-slice report
+baseline,overall,recall@5,0.538,0.5356382978723404,-0.002361702127659626,2.0 historical full-slice report
+baseline,overall,recall@10,0.566,0.5636170212765957,-0.0023829787234042055,2.0 historical full-slice report
+baseline,single-session-assistant,hit@1,0.679,0.6785714285714286,-0.0004285714285714448,2.0 historical full-slice report
+baseline,single-session-assistant,hit@3,0.786,0.7857142857142857,-0.00028571428571433355,2.0 historical full-slice report
+baseline,single-session-assistant,hit@5,0.804,0.8035714285714286,-0.0004285714285714448,2.0 historical full-slice report
+baseline,single-session-assistant,hit@10,0.839,0.8392857142857143,0.00028571428571433355,2.0 historical full-slice report
+baseline,single-session-assistant,recall@1,0.679,0.6785714285714286,-0.0004285714285714448,2.0 historical full-slice report
+baseline,single-session-assistant,recall@3,0.786,0.7857142857142857,-0.00028571428571433355,2.0 historical full-slice report
+baseline,single-session-assistant,recall@5,0.804,0.8035714285714286,-0.0004285714285714448,2.0 historical full-slice report
+baseline,single-session-assistant,recall@10,0.839,0.8392857142857143,0.00028571428571433355,2.0 historical full-slice report
+baseline,single-session-preference,hit@1,0.3,0.3,0.0,2.0 historical full-slice report
+baseline,single-session-preference,hit@3,0.467,0.4666666666666667,-0.00033333333333335213,2.0 historical full-slice report
+baseline,single-session-preference,hit@5,0.533,0.5333333333333333,0.0003333333333332966,2.0 historical full-slice report
+baseline,single-session-preference,hit@10,0.667,0.6666666666666666,-0.00033333333333340764,2.0 historical full-slice report
+baseline,single-session-preference,recall@1,0.3,0.3,0.0,2.0 historical full-slice report
+baseline,single-session-preference,recall@3,0.467,0.4666666666666667,-0.00033333333333335213,2.0 historical full-slice report
+baseline,single-session-preference,recall@5,0.533,0.5333333333333333,0.0003333333333332966,2.0 historical full-slice report
+baseline,single-session-preference,recall@10,0.667,0.6666666666666666,-0.00033333333333340764,2.0 historical full-slice report
+baseline,single-session-user,hit@1,0.625,0.625,0.0,2.0 historical full-slice report
+baseline,single-session-user,hit@3,0.656,0.65625,0.00024999999999997247,2.0 historical full-slice report
+baseline,single-session-user,hit@5,0.688,0.6875,-0.0004999999999999449,2.0 historical full-slice report
+baseline,single-session-user,hit@10,0.703,0.703125,0.00012500000000004174,2.0 historical full-slice report
+baseline,single-session-user,recall@1,0.625,0.625,0.0,2.0 historical full-slice report
+baseline,single-session-user,recall@3,0.656,0.65625,0.00024999999999997247,2.0 historical full-slice report
+baseline,single-session-user,recall@5,0.688,0.6875,-0.0004999999999999449,2.0 historical full-slice report
+baseline,single-session-user,recall@10,0.703,0.703125,0.00012500000000004174,2.0 historical full-slice report
+baseline,temporal-reasoning,hit@1,0.535,0.5275590551181102,-0.007440944881889844,2.0 historical full-slice report
+baseline,temporal-reasoning,hit@3,0.654,0.6456692913385826,-0.008330708661417385,2.0 historical full-slice report
+baseline,temporal-reasoning,hit@5,0.661,0.6535433070866141,-0.0074566929133859094,2.0 historical full-slice report
+baseline,temporal-reasoning,hit@10,0.677,0.6692913385826772,-0.0077086614173228485,2.0 historical full-slice report
+baseline,temporal-reasoning,recall@1,0.264,0.2559055118110236,-0.008094488188976401,2.0 historical full-slice report
+baseline,temporal-reasoning,recall@3,0.456,0.4479002624671916,-0.008099737532808404,2.0 historical full-slice report
+baseline,temporal-reasoning,recall@5,0.478,0.4700787401574803,-0.007921259842519679,2.0 historical full-slice report
+baseline,temporal-reasoning,recall@10,0.493,0.4850393700787401,-0.007960629921259899,2.0 historical full-slice report
+candidate,knowledge-update,hit@1,0.625,0.6111111111111112,-0.01388888888888884,2.0 historical full-slice report
+candidate,knowledge-update,hit@3,0.806,0.8055555555555556,-0.0004444444444444695,2.0 historical full-slice report
+candidate,knowledge-update,hit@5,0.903,0.9027777777777778,-0.00022222222222223476,2.0 historical full-slice report
+candidate,knowledge-update,hit@10,0.944,0.9583333333333334,0.01433333333333342,2.0 historical full-slice report
+candidate,knowledge-update,recall@1,0.312,0.3055555555555556,-0.006444444444444419,2.0 historical full-slice report
+candidate,knowledge-update,recall@3,0.59,0.5833333333333334,-0.006666666666666599,2.0 historical full-slice report
+candidate,knowledge-update,recall@5,0.736,0.7430555555555556,0.007055555555555593,2.0 historical full-slice report
+candidate,knowledge-update,recall@10,0.875,0.8888888888888888,0.01388888888888884,2.0 historical full-slice report
+candidate,multi-session,hit@1,0.471,0.4628099173553719,-0.00819008264462806,2.0 historical full-slice report
+candidate,multi-session,hit@3,0.76,0.743801652892562,-0.01619834710743806,2.0 historical full-slice report
+candidate,multi-session,hit@5,0.876,0.8760330578512396,3.305785123963734e-05,2.0 historical full-slice report
+candidate,multi-session,hit@10,0.95,0.9504132231404959,0.0004132231404959663,2.0 historical full-slice report
+candidate,multi-session,recall@1,0.203,0.20096418732782367,-0.0020358126721763403,2.0 historical full-slice report
+candidate,multi-session,recall@3,0.462,0.45082644628099167,-0.011173553719008356,2.0 historical full-slice report
+candidate,multi-session,recall@5,0.624,0.6304407713498624,0.006440771349862429,2.0 historical full-slice report
+candidate,multi-session,recall@10,0.801,0.8137741046831954,0.012774104683195397,2.0 historical full-slice report
+candidate,overall,hit@1,0.536,0.5361702127659574,0.00017021276595741153,2.0 historical full-slice report
+candidate,overall,hit@3,0.726,0.723404255319149,-0.0025957446808509976,2.0 historical full-slice report
+candidate,overall,hit@5,0.823,0.8212765957446808,-0.0017234042553191387,2.0 historical full-slice report
+candidate,overall,hit@10,0.889,0.8893617021276595,0.00036170212765951337,2.0 historical full-slice report
+candidate,overall,recall@1,0.343,0.34517730496453897,0.0021773049645389397,2.0 historical full-slice report
+candidate,overall,recall@3,0.566,0.5642198581560285,-0.0017801418439714611,2.0 historical full-slice report
+candidate,overall,recall@5,0.68,0.6800000000000003,2.220446049250313e-16,2.0 historical full-slice report
+candidate,overall,recall@10,0.812,0.8180141843971634,0.006014184397163391,2.0 historical full-slice report
+candidate,single-session-assistant,hit@1,0.714,0.7321428571428571,0.018142857142857127,2.0 historical full-slice report
+candidate,single-session-assistant,hit@3,0.804,0.8035714285714286,-0.0004285714285714448,2.0 historical full-slice report
+candidate,single-session-assistant,hit@5,0.821,0.8035714285714286,-0.01742857142857135,2.0 historical full-slice report
+candidate,single-session-assistant,hit@10,0.839,0.8214285714285714,-0.01757142857142857,2.0 historical full-slice report
+candidate,single-session-assistant,recall@1,0.714,0.7321428571428571,0.018142857142857127,2.0 historical full-slice report
+candidate,single-session-assistant,recall@3,0.804,0.8035714285714286,-0.0004285714285714448,2.0 historical full-slice report
+candidate,single-session-assistant,recall@5,0.821,0.8035714285714286,-0.01742857142857135,2.0 historical full-slice report
+candidate,single-session-assistant,recall@10,0.839,0.8214285714285714,-0.01757142857142857,2.0 historical full-slice report
+candidate,single-session-preference,hit@1,0.433,0.43333333333333335,0.00033333333333335213,2.0 historical full-slice report
+candidate,single-session-preference,hit@3,0.633,0.6666666666666666,0.03366666666666662,2.0 historical full-slice report
+candidate,single-session-preference,hit@5,0.767,0.7666666666666667,-0.0003333333333332966,2.0 historical full-slice report
+candidate,single-session-preference,hit@10,0.867,0.9,0.03300000000000003,2.0 historical full-slice report
+candidate,single-session-preference,recall@1,0.433,0.43333333333333335,0.00033333333333335213,2.0 historical full-slice report
+candidate,single-session-preference,recall@3,0.633,0.6666666666666666,0.03366666666666662,2.0 historical full-slice report
+candidate,single-session-preference,recall@5,0.767,0.7666666666666667,-0.0003333333333332966,2.0 historical full-slice report
+candidate,single-session-preference,recall@10,0.867,0.9,0.03300000000000003,2.0 historical full-slice report
+candidate,single-session-user,hit@1,0.453,0.453125,0.00012499999999998623,2.0 historical full-slice report
+candidate,single-session-user,hit@3,0.656,0.65625,0.00024999999999997247,2.0 historical full-slice report
+candidate,single-session-user,hit@5,0.75,0.75,0.0,2.0 historical full-slice report
+candidate,single-session-user,hit@10,0.812,0.8125,0.0004999999999999449,2.0 historical full-slice report
+candidate,single-session-user,recall@1,0.453,0.453125,0.00012499999999998623,2.0 historical full-slice report
+candidate,single-session-user,recall@3,0.656,0.65625,0.00024999999999997247,2.0 historical full-slice report
+candidate,single-session-user,recall@5,0.75,0.75,0.0,2.0 historical full-slice report
+candidate,single-session-user,recall@10,0.812,0.8125,0.0004999999999999449,2.0 historical full-slice report
+candidate,temporal-reasoning,hit@1,0.535,0.5433070866141733,0.008307086614173231,2.0 historical full-slice report
+candidate,temporal-reasoning,hit@3,0.669,0.6692913385826772,0.0002913385826771586,2.0 historical full-slice report
+candidate,temporal-reasoning,hit@5,0.78,0.7795275590551181,-0.00047244094488196886,2.0 historical full-slice report
+candidate,temporal-reasoning,hit@10,0.866,0.8582677165354331,-0.007732283464566891,2.0 historical full-slice report
+candidate,temporal-reasoning,recall@1,0.255,0.2591863517060367,0.004186351706036706,2.0 historical full-slice report
+candidate,temporal-reasoning,recall@3,0.485,0.48530183727034115,0.00030183727034116536,2.0 historical full-slice report
+candidate,temporal-reasoning,recall@5,0.584,0.5812335958005248,-0.0027664041994751587,2.0 historical full-slice report
+candidate,temporal-reasoning,recall@10,0.763,0.7637795275590551,0.0007795275590550821,2.0 historical full-slice report

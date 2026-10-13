@@ -1,5 +1,7 @@
 # Competitive parity & migration-worthiness
 
+Latest workstation-fork measurement: [2.6.6-aerox.1 retrieval review](benchmarks/longmemeval-s-2026-10-13-aerox-2.6.6.md), 470 scored questions per mode. The historical run and hardware limits are stated there.
+
 A self-critical internal audit, September 2026. Sibling to the public
 [`comparison.md`](comparison.md) (the fair pitch) and
 [`research-2026-landscape.md`](research-2026-landscape.md) (what each competitor
@@ -42,7 +44,7 @@ None of the competitors below has more than one or two of these; none has all.
   "both agents read the same files."
 - **Multi-user shared-within-project** ("pages shared, batons owned", invariant
   #16), self-hosted, with no paid tier.
-- **A single honest, reproducible benchmark** (0.823 hit@5 local; 0.668 zero-LLM).
+- **A single honest, reproducible benchmark** (0.821 hit@5 local; 0.666 zero-LLM).
 
 ## Migration verdicts, by competitor
 
@@ -116,7 +118,7 @@ implemented without a separate decision.** Ordered by leverage.
 2. **A zero-LLM / local reranker (candle cross-encoder).** The most-cited
    weakness: our only reranker is LLM-as-judge, so the zero-LLM default path,
    which is our headline, has *no* reranking, while basic-memory ships a local one and
-   agentmemory/Hindsight's score lead is largely reranking (0.823 vs 0.952 same
+   agentmemory/Hindsight's score lead is largely reranking (0.821 vs 0.952 same
    dataset). This would close a gap on our own keyless turf. Gate on R2.
 3. **Activate the dormant substrate: belief-strength now wired, off by
    default (2.4, #815).** `page_evidence` confidence is now computed at read
@@ -181,7 +183,7 @@ implemented without a separate decision.** Ordered by leverage.
    reranking + Teams tier; `research-agentmemory.md` says 53 tools / 124 endpoints
    (now 54 / 130); `comparison.md` attributes agentmemory's `0.967` to
    LongMemEval-S when it's their in-house `coding-agent-life-v1` (the like-for-like
-   LongMemEval-S is 0.952 vs our 0.823).
+   LongMemEval-S is 0.952 vs our 0.821).
 8. **Fleet-scale trust governance: a real gap vs Caura (issue #810).** Our
    multi-user story is per-project (`pages shared, batons owned`, invariant #16)
    with a root→DB-user→OIDC auth ladder and an audit log, and it is deliberately
