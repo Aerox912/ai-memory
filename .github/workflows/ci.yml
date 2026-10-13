@@ -404,3 +404,27 @@ jobs:
           # repo root so the same rules apply locally if you also
           # install gitleaks.
           GITLEAKS_CONFIG: .gitleaks.toml
+
+  retrieval-benchmark:
+    if: github.event_name == 'workflow_dispatch'
+    name: full LongMemEval-S FTS and local embeddings
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Build the candidate and evaluation harness
+        run: cargo build --locked --release -p ai-memory-cli -p ai-memory-eval
+      - name: Run all 470 scored questions in both configurations
+        run: >-
+          target/release/ai-memory-eval retrieval --fetch
+          --candidate-embeddings local
+          --out benchmark-results
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: retrieval-release-evidence
+          path: benchmark-results/
+          if-no-files-found: error
