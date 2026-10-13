@@ -11,10 +11,10 @@ use ai_memory_consolidate::{
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
     run_lint,
 };
-use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
+use ai_memory_core::{ActiveProject, IdentityKey, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, WorkstreamState, hook_router,
-    workstream_router,
+    CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
+    WorkstreamState, hook_router, workstream_router,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
@@ -862,8 +862,35 @@ async fn run_profile_worker(
     }
 }
 
+async fn session_consolidation_actor(
+    reader: &ReaderPool,
+    session_id: ai_memory_core::SessionId,
+) -> ai_memory_core::ActorContext {
+    match reader.session_actor_user(session_id).await {
+        Ok(Some(owner)) => IdentityKey::from_storage_key(&owner)
+            .map(|key| key.to_actor_context())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    session = %session_id,
+                    "session owner is not a valid identity key; consolidating as anonymous"
+                );
+                ai_memory_core::ActorContext::anonymous()
+            }),
+        Ok(None) => ai_memory_core::ActorContext::anonymous(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                session = %session_id,
+                "could not read session owner; consolidating as anonymous"
+            );
+            ai_memory_core::ActorContext::anonymous()
+        }
+    }
+}
+
 async fn run_session_consolidation_worker(
     writer: WriterHandle,
+    reader: ReaderPool,
     consolidator: Arc<Consolidator>,
     notify: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -879,7 +906,7 @@ async fn run_session_consolidation_worker(
         {
             Ok(job) => job,
             Err(error) => {
-                tracing::warn!(%error, "SessionEnd consolidation queue claim failed");
+                tracing::warn!(%error, "session consolidation queue claim failed");
                 tokio::select! {
                     () = cancel.cancelled() => return,
                     () = notify.notified() => {},
@@ -912,13 +939,13 @@ async fn run_session_consolidation_worker(
                     Ok(()) => info!(
                         session = %session_id,
                         generation,
-                        "SessionEnd: session page was written by the agent; consolidation skipped",
+                        "session page was written by the agent; queued consolidation skipped",
                     ),
                     Err(error) => tracing::warn!(
                         %error,
                         session = %session_id,
                         generation,
-                        "SessionEnd consolidation skip could not complete the queue job",
+                        "session consolidation skip could not complete the queue job",
                     ),
                 }
                 #[cfg(test)]
@@ -930,21 +957,16 @@ async fn run_session_consolidation_worker(
                 %error,
                 session = %session_id,
                 generation,
-                "could not read the session page before SessionEnd consolidation; consolidating",
+                "could not read the session page before queued consolidation; consolidating",
             ),
         }
-        let consolidation = consolidator.consolidate_session(
-            session_id,
-            false,
-            ai_memory_core::ActorContext::anonymous(),
-            None,
-            None,
-        );
+        let actor = session_consolidation_actor(&reader, session_id).await;
+        let consolidation = consolidator.consolidate_session(session_id, false, actor, None, None);
         tokio::pin!(consolidation);
         let result = tokio::select! {
             () = cancel.cancelled() => {
                 if let Err(error) = writer.release_session_consolidation(job).await {
-                    tracing::warn!(%error, %session_id, generation, "failed to release SessionEnd consolidation during shutdown");
+                    tracing::warn!(%error, %session_id, generation, "failed to release session consolidation during shutdown");
                 }
                 return;
             }
@@ -959,7 +981,7 @@ async fn run_session_consolidation_worker(
                         generation,
                         attempts,
                         path = %outcome.path,
-                        "SessionEnd: queued LLM consolidation written (opt-in)",
+                        "queued LLM consolidation written",
                     );
                     #[cfg(test)]
                     completed.notify_one();
@@ -968,7 +990,7 @@ async fn run_session_consolidation_worker(
                     %error,
                     session = %session_id,
                     generation,
-                    "SessionEnd consolidation succeeded but queue completion failed",
+                    "session consolidation succeeded but queue completion failed",
                 ),
             },
             Err(error) => {
@@ -996,7 +1018,7 @@ async fn run_session_consolidation_worker(
                         error = %store_error,
                         session = %session_id,
                         generation,
-                        "failed to persist SessionEnd consolidation failure",
+                        "failed to persist session consolidation failure",
                     );
                 } else if terminal {
                     tracing::error!(
@@ -1004,7 +1026,7 @@ async fn run_session_consolidation_worker(
                         session = %session_id,
                         generation,
                         attempts,
-                        "SessionEnd LLM consolidation exhausted retries; heuristic page remains",
+                        "queued LLM consolidation exhausted retries; heuristic page remains",
                     );
                 } else {
                     tracing::warn!(
@@ -1012,7 +1034,7 @@ async fn run_session_consolidation_worker(
                         session = %session_id,
                         generation,
                         attempts,
-                        "SessionEnd LLM consolidation failed; queued for retry",
+                        "queued LLM consolidation failed; queued for retry",
                     );
                 }
             }
@@ -1406,25 +1428,22 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 cancel.child_token(),
             ));
             let (session_consolidation_notify, session_consolidation_task) =
-                if config.consolidate_on_session_end {
-                    if let Some(consolidator) = consolidator.clone() {
-                        let notify = Arc::new(tokio::sync::Notify::new());
-                        let task = tokio::spawn(run_session_consolidation_worker(
-                            store.writer.clone(),
-                            consolidator,
-                            notify.clone(),
-                            cancel.child_token(),
-                            #[cfg(test)]
-                            Arc::new(tokio::sync::Notify::new()),
-                        ));
-                        info!(
-                            max_attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
-                            "durable SessionEnd consolidation worker started"
-                        );
-                        (Some(notify), Some(task))
-                    } else {
-                        (None, None)
-                    }
+                if let Some(consolidator) = consolidator.clone() {
+                    let notify = Arc::new(tokio::sync::Notify::new());
+                    let task = tokio::spawn(run_session_consolidation_worker(
+                        store.writer.clone(),
+                        store.reader.clone(),
+                        consolidator,
+                        notify.clone(),
+                        cancel.child_token(),
+                        #[cfg(test)]
+                        Arc::new(tokio::sync::Notify::new()),
+                    ));
+                    info!(
+                        max_attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+                        "durable session consolidation worker started"
+                    );
+                    (Some(notify), Some(task))
                 } else {
                     (None, None)
                 };
@@ -1532,6 +1551,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 sanitizer: sanitizer.clone(),
                 wiki: wiki.clone(),
                 data_dir: config.data_dir.clone(),
+                home_dir: config.home_dir.clone(),
                 trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
             let admin = admin_router_with_sweep_tuning(
@@ -1731,9 +1751,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     &args.web_slug,
                 ))
             });
-            let router = machine
+            let router = refuse_cross_origin_browser_requests(machine.merge(admin), auth_enabled)
                 .merge(healthz_router())
-                .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
@@ -1884,11 +1903,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+                        tracing::warn!(%error, "session consolidation worker join failed");
                     }
                     Err(_) => tracing::warn!(
                         grace_secs = SHUTDOWN_GRACE.as_secs(),
-                        "SessionEnd consolidation worker did not stop within the shutdown \
+                        "session consolidation worker did not stop within the shutdown \
                          grace period; exiting anyway"
                     ),
                 }
@@ -2928,6 +2947,177 @@ async fn require_allowed_host(
     }
     tracing::warn!(host, allowed = ?allowed_hosts, "rejected request with disallowed Host header");
     (StatusCode::FORBIDDEN, "forbidden host\n").into_response()
+}
+
+/// Refuse browser requests from a foreign page on a server with no credential
+/// gate.
+///
+/// With auth off, the machine and admin routes trust whoever can reach the
+/// port, and a page in the operator's browser can reach `127.0.0.1`. Browsers
+/// send `GET` and body-less `POST` cross-origin without a preflight, and the
+/// JSON extractors cannot refuse a request that has no body: `GET /handoff`
+/// claims the single-use baton, `POST /admin/profile/rebuild` runs a profile
+/// pass. Hooks, the CLI and MCP clients never send `Origin` or
+/// `Sec-Fetch-Site`; the built-in web UI's same-origin calls into `/admin`
+/// pass. With auth on, the bearer token (which a foreign page cannot attach)
+/// and the session CSRF token are the gate instead.
+///
+/// The same layer also refuses any browser request whose `Sec-Fetch-Dest` is
+/// not `empty`. Script `fetch()`/XHR, which is how the web UI calls `/admin`,
+/// sends `empty`; images, navigations, link clicks, iframes and form posts
+/// send another destination. That keeps a link or image stored in a page, or
+/// a link opened from another application, off these routes even when the
+/// browser labels it `same-origin` or `none`. Non-browser clients send no
+/// fetch metadata and are unaffected.
+///
+/// Both checks rely on fetch metadata, which browsers send only to
+/// potentially trustworthy origins: loopback names and addresses, and HTTPS.
+/// A server reached over plain HTTP through a LAN address or another allowed
+/// host name gets an `<img>` request with neither fetch metadata nor `Origin`.
+/// For that case the session-start handoff fetch, the one state-changing `GET`
+/// on these routes, must also carry [`CLIENT_MARKER_HEADER`], which a page
+/// cannot add without a preflight these routes never answer. A request that
+/// carries a proxy's forwarding header counts as non-loopback even when the
+/// proxy rewrote `Host` to a loopback address. Loopback hosts
+/// keep working without it, so hook scripts staged before the header existed
+/// still deliver handoffs on a default install. `POST`s need no marker: a
+/// browser sends `Origin` on every cross-origin `POST`, metadata or not.
+fn refuse_cross_origin_browser_requests(router: axum::Router, auth_enabled: bool) -> axum::Router {
+    if auth_enabled {
+        return router;
+    }
+    router.layer(axum::middleware::from_fn(require_same_origin_browser))
+}
+
+/// Body of the 403 a handoff fetch without [`CLIENT_MARKER_HEADER`] gets. It
+/// reaches an operator through a hook staged before the header existed, so it
+/// names both ways out.
+const CLIENT_MARKER_REFUSAL: &str = "handoff fetch refused: this server has no bearer token and \
+     was reached through a non-loopback host name or a proxy, so it accepts the handoff fetch only from \
+     current ai-memory hooks; re-stage them with `ai-memory install-hooks` (or `ai-memory \
+     upgrade`), or configure AI_MEMORY_AUTH_TOKEN\n";
+
+async fn require_same_origin_browser(req: Request<Body>, next: Next) -> Response {
+    let headers = req.headers();
+    if is_cross_origin_browser_request(headers) || is_non_script_browser_request(headers) {
+        // Any page the operator opens can trigger this at will, so it stays
+        // out of the default log level.
+        tracing::debug!(
+            path = req.uri().path(),
+            origin = ?headers.get(header::ORIGIN),
+            dest = ?headers.get("sec-fetch-dest"),
+            "rejected browser request to an unauthenticated server"
+        );
+        return (StatusCode::FORBIDDEN, "browser request refused\n").into_response();
+    }
+    if handoff_fetch_lacks_client_marker(req.method(), req.uri().path(), headers) {
+        tracing::debug!(
+            host = ?headers.get(header::HOST),
+            "rejected handoff fetch without the client marker on a non-loopback host"
+        );
+        return (StatusCode::FORBIDDEN, CLIENT_MARKER_REFUSAL).into_response();
+    }
+    next.run(req).await
+}
+
+/// Whether this is a handoff fetch (`GET`, or `HEAD`, which axum routes to the
+/// same handler) without [`CLIENT_MARKER_HEADER`] on a host where a browser
+/// sends no fetch metadata, or through a forwarding proxy. The path is the one inside any `--base-path`
+/// mount, which strips its prefix before this layer runs.
+fn handoff_fetch_lacks_client_marker(
+    method: &axum::http::Method,
+    path: &str,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    if path != "/handoff" || !matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+    {
+        return false;
+    }
+    if headers
+        .get(CLIENT_MARKER_HEADER)
+        .is_some_and(|value| !value.as_bytes().is_empty())
+    {
+        return false;
+    }
+    // A plain-HTTP reverse proxy can rewrite `Host` to the loopback address
+    // it forwards to, while the browser behind it saw a non-loopback origin
+    // and so sent no fetch metadata. Such a request is not a loopback one.
+    // First-party clients talk to the server directly and send none of these.
+    let proxied = PROXY_HEADERS.iter().any(|name| headers.contains_key(*name));
+    proxied
+        || !headers
+            .get(header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .is_some_and(is_loopback_host)
+}
+
+/// Headers a forwarding proxy adds; any of them means the `Host` a request
+/// carries may not be the one the browser addressed.
+/// CDNs and load balancers name the client in their own headers
+/// (`CF-Connecting-IP`, `True-Client-IP`, `X-Client-IP`), and some add only
+/// the scheme, server or port they forwarded (`X-Forwarded-Proto`, …).
+const PROXY_HEADERS: [&str; 12] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-server",
+    "x-forwarded-port",
+    "x-original-forwarded-for",
+    "x-real-ip",
+    "x-client-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "via",
+];
+
+/// Whether a browser treats this `Host` as a potentially trustworthy origin
+/// and so sends fetch metadata to it over plain HTTP: `localhost`, a
+/// `*.localhost` name, `127.0.0.0/8` or `[::1]`. Anything else, including a
+/// LAN address, `0.0.0.0` or `host.docker.internal`, is not.
+fn is_loopback_host(host: &str) -> bool {
+    let name = host_without_port(host).to_ascii_lowercase();
+    name == "localhost"
+        || name
+            .strip_suffix(".localhost")
+            .is_some_and(|label| !label.is_empty())
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether a browser marks this request as issued by a page of another origin.
+///
+/// `Sec-Fetch-Site` is computed by the browser and decides when present. A
+/// browser too old to send it still sends `Origin` on every cross-origin
+/// `POST`, so that falls back to comparing `Origin` with `Host`; `Origin: null`
+/// (sandboxed frames, some redirects) never matches.
+fn is_cross_origin_browser_request(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return !matches!(site.to_str(), Ok("same-origin" | "none"));
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return false;
+    };
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    let authority = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| origin.split_once("://"))
+        .map(|(_, authority)| authority);
+    match (authority, host) {
+        (Some(authority), Some(host)) => !authority.eq_ignore_ascii_case(host),
+        _ => true,
+    }
+}
+
+/// Whether a browser says this request was not issued by script `fetch()` or
+/// XHR (`Sec-Fetch-Dest` other than `empty`). A value that is not valid UTF-8
+/// is refused; an absent header leaves the decision to the origin check.
+fn is_non_script_browser_request(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-dest")
+        .is_some_and(|dest| !dest.to_str().is_ok_and(|d| d.eq_ignore_ascii_case("empty")))
 }
 
 fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
@@ -4255,6 +4445,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
+            store.reader.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),
@@ -4288,6 +4479,209 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "completed work must not be claimed again"
+        );
+    }
+
+    /// A PreCompact checkpoint job is an open session. The same worker must
+    /// consume it without `end_session` and without the SessionEnd opt-in.
+    #[tokio::test]
+    async fn session_consolidation_worker_consumes_an_open_session_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "checkpoint".into(),
+                    body: "open session still running".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should complete the open-session checkpoint");
+
+        let path = format!("sessions/{session_id}.md");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(workspace_id, project_id, &path)
+                .await
+                .unwrap()
+                .is_some_and(|page| page.body.contains("Durable worker completed")),
+            "checkpoint completion must follow the durable wiki write"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "completed checkpoint must not be claimed again"
+        );
+    }
+
+    /// The worker attributes the rewrite to the session owner, not anonymous.
+    #[tokio::test]
+    async fn session_consolidation_worker_attributes_checkpoint_to_session_owner() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: Some("user:alice".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "checkpoint".into(),
+                    body: "owned session still running".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .enqueue_session_checkpoint(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should complete the owned checkpoint");
+        cancel.cancel();
+        task.await.unwrap();
+
+        let path = format!("sessions/{session_id}.md");
+        let page = store
+            .reader
+            .page_body_by_ids(workspace_id, project_id, &path)
+            .await
+            .unwrap()
+            .expect("checkpoint page must exist");
+        let frontmatter: serde_json::Value = serde_json::from_str(&page.frontmatter_json).unwrap();
+        assert_eq!(
+            frontmatter["last_modified_by"]["username"].as_str(),
+            Some("alice"),
+            "checkpoint rewrite must be attributed to the session owner: {frontmatter}"
         );
     }
 
@@ -4362,6 +4756,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
+            store.reader.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),
@@ -4524,6 +4919,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_session_consolidation_worker(
             store.writer.clone(),
+            store.reader.clone(),
             consolidator,
             notify.clone(),
             cancel.child_token(),
@@ -4869,6 +5265,384 @@ mod tests {
     #[test]
     fn host_without_port_handles_ipv6_loopback() {
         assert_eq!(host_without_port("[::1]:49374"), "::1");
+    }
+
+    fn browser_headers(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:49374".parse().unwrap());
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn cross_origin_browser_request_detection() {
+        for (pairs, cross) in [
+            // Hooks, the CLI and MCP clients send neither header.
+            (&[][..], false),
+            (&[("sec-fetch-mode", "cors")][..], false),
+            (&[("sec-fetch-site", "same-origin")][..], false),
+            (&[("sec-fetch-site", "none")][..], false),
+            (&[("origin", "http://127.0.0.1:49374")][..], false),
+            (
+                &[
+                    ("origin", "http://127.0.0.1:49374"),
+                    ("sec-fetch-site", "same-origin"),
+                ][..],
+                false,
+            ),
+            (&[("sec-fetch-site", "cross-site")][..], true),
+            (&[("sec-fetch-site", "same-site")][..], true),
+            (&[("origin", "https://evil.example")][..], true),
+            (&[("origin", "http://localhost:49374")][..], true),
+            (&[("origin", "null")][..], true),
+            // Fetch metadata decides over a forged-looking Origin and vice versa.
+            (
+                &[
+                    ("origin", "http://127.0.0.1:49374"),
+                    ("sec-fetch-site", "cross-site"),
+                ][..],
+                true,
+            ),
+        ] {
+            assert_eq!(
+                is_cross_origin_browser_request(&browser_headers(pairs)),
+                cross,
+                "{pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_script_browser_request_detection() {
+        for (pairs, refused) in [
+            // No fetch metadata (hooks, CLI, MCP clients): the origin check decides.
+            (&[][..], false),
+            (&[("sec-fetch-site", "same-origin")][..], false),
+            // Script fetch()/XHR, as the web UI sends.
+            (&[("sec-fetch-dest", "empty")][..], false),
+            (&[("sec-fetch-dest", "EMPTY")][..], false),
+            (
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "empty"),
+                ][..],
+                false,
+            ),
+            // Images, navigations, frames: refused even same-origin or `none`.
+            (&[("sec-fetch-dest", "image")][..], true),
+            (&[("sec-fetch-dest", "document")][..], true),
+            (&[("sec-fetch-dest", "iframe")][..], true),
+            (
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "image"),
+                ][..],
+                true,
+            ),
+            (
+                &[("sec-fetch-site", "none"), ("sec-fetch-dest", "document")][..],
+                true,
+            ),
+            (&[("sec-fetch-dest", "")][..], true),
+        ] {
+            assert_eq!(
+                is_non_script_browser_request(&browser_headers(pairs)),
+                refused,
+                "{pairs:?}"
+            );
+        }
+        let mut headers = browser_headers(&[]);
+        headers.insert(
+            "sec-fetch-dest",
+            axum::http::HeaderValue::from_bytes(b"emp\xffty").unwrap(),
+        );
+        assert!(is_non_script_browser_request(&headers), "non-UTF-8 dest");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_browser_guard_applies_only_without_auth() {
+        use tower::ServiceExt as _;
+
+        let send = |auth_enabled: bool, pairs: &'static [(&'static str, &'static str)]| async move {
+            let app = refuse_cross_origin_browser_requests(
+                axum::Router::new().route("/handoff", axum::routing::get(|| async { "claimed" })),
+                auth_enabled,
+            );
+            let mut request = Request::builder()
+                .uri("/handoff")
+                .header(header::HOST, "127.0.0.1:49374");
+            for (name, value) in pairs {
+                request = request.header(*name, *value);
+            }
+            app.oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+        // Attack: an `<img src>` from a foreign page, auth off.
+        assert_eq!(
+            send(false, &[("sec-fetch-site", "cross-site")]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(false, &[("origin", "https://evil.example")]).await,
+            StatusCode::FORBIDDEN
+        );
+        // Attack: a same-origin image or a navigation from outside the browser.
+        assert_eq!(
+            send(
+                false,
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "image")
+                ]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                false,
+                &[("sec-fetch-site", "none"), ("sec-fetch-dest", "document")]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        // Controls: a hook-style request, and the web UI's same-origin call.
+        assert_eq!(send(false, &[]).await, StatusCode::OK);
+        assert_eq!(
+            send(false, &[("sec-fetch-site", "same-origin")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                false,
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "empty")
+                ]
+            )
+            .await,
+            StatusCode::OK
+        );
+        // With auth on, the bearer gate decides; this layer stays out of it.
+        assert_eq!(
+            send(true, &[("sec-fetch-site", "cross-site")]).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                true,
+                &[
+                    ("sec-fetch-site", "same-origin"),
+                    ("sec-fetch-dest", "document")
+                ]
+            )
+            .await,
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn loopback_host_detection() {
+        for (host, loopback) in [
+            ("127.0.0.1:49374", true),
+            ("127.0.0.1", true),
+            ("127.8.9.10:49374", true),
+            ("[::1]:49374", true),
+            ("localhost:49374", true),
+            ("LOCALHOST", true),
+            ("ai-memory.localhost:49374", true),
+            ("a.b.LocalHost", true),
+            // Not potentially trustworthy to a browser: no fetch metadata.
+            ("192.168.1.20:49374", false),
+            ("10.0.0.5", false),
+            ("0.0.0.0:49374", false),
+            ("host.docker.internal:49374", false),
+            ("memory.lan:49374", false),
+            ("[::ffff:127.0.0.1]:49374", false),
+            ("notlocalhost:49374", false),
+            ("localhost.evil.example", false),
+            (".localhost", false),
+            ("", false),
+        ] {
+            assert_eq!(is_loopback_host(host), loopback, "{host:?}");
+        }
+    }
+
+    #[test]
+    fn handoff_fetch_client_marker_decision() {
+        use axum::http::Method;
+
+        let headers = |host: &'static str, marker: Option<&'static str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::HOST, host.parse().unwrap());
+            if let Some(marker) = marker {
+                headers.insert(CLIENT_MARKER_HEADER, marker.parse().unwrap());
+            }
+            headers
+        };
+        for (method, path, host, marker, refused) in [
+            // Attack: an `<img>` to a LAN host carries no fetch metadata.
+            (Method::GET, "/handoff", "192.168.1.20:49374", None, true),
+            (Method::HEAD, "/handoff", "192.168.1.20:49374", None, true),
+            (
+                Method::GET,
+                "/handoff",
+                "host.docker.internal:49374",
+                None,
+                true,
+            ),
+            (Method::GET, "/handoff", "memory.lan", Some(""), true),
+            // Controls: a current hook names itself on any host.
+            (
+                Method::GET,
+                "/handoff",
+                "192.168.1.20:49374",
+                Some("hook"),
+                false,
+            ),
+            (
+                Method::GET,
+                "/handoff",
+                "memory.lan",
+                Some("hook-sh"),
+                false,
+            ),
+            // Loopback: browsers send fetch metadata there, and hooks staged
+            // before the marker existed must keep working.
+            (Method::GET, "/handoff", "127.0.0.1:49374", None, false),
+            (Method::GET, "/handoff", "localhost:49374", None, false),
+            (Method::GET, "/handoff", "[::1]:49374", None, false),
+            // Other routes and methods are not the state-changing GET.
+            (Method::POST, "/hook", "192.168.1.20:49374", None, false),
+            (
+                Method::GET,
+                "/admin/handoffs",
+                "192.168.1.20:49374",
+                None,
+                false,
+            ),
+            (Method::GET, "/handoff/x", "192.168.1.20:49374", None, false),
+            (Method::POST, "/handoff", "192.168.1.20:49374", None, false),
+        ] {
+            assert_eq!(
+                handoff_fetch_lacks_client_marker(&method, path, &headers(host, marker)),
+                refused,
+                "{method} {path} host={host} marker={marker:?}"
+            );
+        }
+        // A plain-HTTP proxy that rewrites `Host` to loopback: the browser
+        // behind it addressed a non-loopback origin and sent no metadata.
+        // Each of these alone marks a request as proxied.
+        for name in [
+            "Forwarded",
+            "X-Forwarded-For",
+            "X-Forwarded-Host",
+            "X-Forwarded-Proto",
+            "X-Forwarded-Server",
+            "X-Forwarded-Port",
+            "X-Original-Forwarded-For",
+            "X-Real-IP",
+            "X-Client-IP",
+            "CF-Connecting-IP",
+            "True-Client-IP",
+            "Via",
+        ] {
+            assert!(
+                PROXY_HEADERS.contains(&name.to_ascii_lowercase().as_str()),
+                "{name}"
+            );
+        }
+        for proxy_header in PROXY_HEADERS {
+            let mut proxied = headers("127.0.0.1:49374", None);
+            proxied.insert(proxy_header, "203.0.113.7".parse().unwrap());
+            assert!(
+                handoff_fetch_lacks_client_marker(&Method::GET, "/handoff", &proxied),
+                "{proxy_header} without the marker"
+            );
+            proxied.insert(CLIENT_MARKER_HEADER, "hook".parse().unwrap());
+            assert!(
+                !handoff_fetch_lacks_client_marker(&Method::GET, "/handoff", &proxied),
+                "{proxy_header} with the marker"
+            );
+        }
+        let mut no_host = axum::http::HeaderMap::new();
+        assert!(handoff_fetch_lacks_client_marker(
+            &Method::GET,
+            "/handoff",
+            &no_host
+        ));
+        no_host.insert(CLIENT_MARKER_HEADER, "hook".parse().unwrap());
+        assert!(!handoff_fetch_lacks_client_marker(
+            &Method::GET,
+            "/handoff",
+            &no_host
+        ));
+    }
+
+    #[tokio::test]
+    async fn handoff_client_marker_guard_on_lan_hosts_and_under_a_base_path() {
+        use tower::ServiceExt as _;
+
+        let send = |auth_enabled: bool,
+                    base: &'static str,
+                    host: &'static str,
+                    marker: Option<&'static str>| async move {
+            let guarded = refuse_cross_origin_browser_requests(
+                axum::Router::new().route("/handoff", axum::routing::get(|| async { "claimed" })),
+                auth_enabled,
+            );
+            let app = if base.is_empty() {
+                guarded
+            } else {
+                axum::Router::new().nest(base, guarded)
+            };
+            let mut request = Request::builder()
+                .uri(format!("{base}/handoff?workspace=w&project=p"))
+                .header(header::HOST, host);
+            if let Some(marker) = marker {
+                request = request.header(CLIENT_MARKER_HEADER, marker);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        };
+        for base in ["", "/memory"] {
+            // Attack: no metadata, no Origin, no marker, LAN host.
+            let (status, body) = send(false, base, "192.168.1.20:49374", None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "base={base:?}");
+            assert!(
+                body.contains("install-hooks") && body.contains("AI_MEMORY_AUTH_TOKEN"),
+                "the refusal must name both remedies: {body}"
+            );
+            // Control: the same request from a current hook.
+            assert_eq!(
+                send(false, base, "192.168.1.20:49374", Some("hook")).await,
+                (StatusCode::OK, "claimed".to_string()),
+                "base={base:?}"
+            );
+            // Legacy hook on a loopback install.
+            assert_eq!(
+                send(false, base, "127.0.0.1:49374", None).await.0,
+                StatusCode::OK,
+                "base={base:?}"
+            );
+            // Auth on: the bearer gate decides.
+            assert_eq!(
+                send(true, base, "192.168.1.20:49374", None).await.0,
+                StatusCode::OK,
+                "base={base:?}"
+            );
+        }
     }
 
     #[test]

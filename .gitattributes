@@ -3,3 +3,4 @@
 crates/ai-memory-core/src/routing_skills/*/SKILL.md text eol=lf
 *.sh text eol=lf
 bin/ai-memory text eol=lf
+crates/ai-memory-consolidate/prompts/*.md text eol=lf

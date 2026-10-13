@@ -33,7 +33,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{RunArgs, RunHarnessChoice};
-use crate::commands::{path_util, resolve_scope};
+use crate::commands::transcript_capture::TranscriptCapture;
+use crate::commands::{path_util, resolve_scope_noting_marker_project};
 use crate::config::Config;
 use crate::http_client::{
     ServerEndpoint, ServerProbe, ServerResponseError, augment_connect_error, get_json, post_empty,
@@ -562,8 +563,11 @@ async fn run_once_with_wiring(
     // `default`, so a checkout whose marker declared another workspace put its
     // managed workstream in one scope while its hook-captured sessions went to
     // another — the same repository split in two.
-    let (workspace, project) =
-        resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    let (workspace, project, marker_project) = resolve_scope_noting_marker_project(
+        config,
+        args.workspace.as_deref(),
+        args.project.as_deref(),
+    )?;
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     // Inside ai-jail every jail flag is moot (no nesting), so neither the
     // binary lookup nor its errors apply there.
@@ -656,6 +660,7 @@ async fn run_once_with_wiring(
         new_workstream: args.new_workstream,
         force_unlock,
         lease_owner: lease_owner(),
+        repository_identity: remote_identity_naming(&repository.cwd, &project, marker_project),
     };
     let interrupted_before_spawn = CancellationToken::new();
     let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
@@ -1246,6 +1251,7 @@ async fn run_once_with_wiring(
         checkpoint,
         Some(exit_code),
         &privacy,
+        &TranscriptCapture::for_checkout(&config.data_dir, &repository.cwd),
     )
     .await
     {
@@ -2376,6 +2382,22 @@ fn auto_session_dir(
     .session_dir)
 }
 
+/// The checkout's git-remote identity when `project` is the name it derives,
+/// so the server can route the run by identity the way hook capture does. A
+/// name from `--project` that differs from it routes by name, and so does any
+/// name a marker's `project` key pinned: capture never reads the remote then.
+fn remote_identity_naming(cwd: &Path, project: &str, marker_project: bool) -> Option<String> {
+    if marker_project {
+        return None;
+    }
+    crate::marker::discover_remote_identity(&cwd.to_string_lossy())
+        .filter(|identity| {
+            ai_memory_core::repository_identity::path_style_name(identity).as_deref()
+                == Some(project)
+        })
+        .map(|identity| identity.identity)
+}
+
 fn unique_auto_agents(candidates: &[AutoSessionCandidate]) -> Vec<AgentKind> {
     let mut agents = Vec::new();
     for candidate in candidates {
@@ -3317,6 +3339,10 @@ async fn export_after_flush(
     }
 }
 
+/// Upload the exported transcript as the run's ledger segments. `capture`
+/// applies the checkout's `[capture] ignore_paths` first, so an excluded tool
+/// call and its output never reach a segment; a result whose call was imported
+/// by an earlier run has no call here and is dropped under a policy.
 async fn import_batches(
     endpoint: &ServerEndpoint,
     run_path: &str,
@@ -3324,6 +3350,7 @@ async fn import_batches(
     checkpoint: ai_memory_core::WorkstreamCheckpoint,
     exit_code: Option<i32>,
     sanitizer: &Sanitizer,
+    capture: &TranscriptCapture,
 ) -> Result<usize> {
     let native_identity = nonempty_session(&transcript.native_session_id)
         .map(|id| NativeSessionIdentity::parse(&id, sanitizer))
@@ -3331,8 +3358,9 @@ async fn import_batches(
     for event in &transcript.events {
         NativeSessionIdentity::parse(&event.native_session_id, sanitizer)?;
     }
+    let events = capture.filter_ledger_events(transcript.events);
     let mut imported = 0;
-    let mut batches = event_batches(transcript.events).into_iter().peekable();
+    let mut batches = event_batches(events).into_iter().peekable();
     while let Some(batch) = batches.next() {
         let complete = batches.peek().is_none();
         let request = FinishManagedRunRequest {
@@ -3749,6 +3777,90 @@ mod tests {
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
         JailPlan { warn, mode }
+    }
+
+    #[test]
+    fn run_sends_the_remote_identity_only_for_the_name_it_derives() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("new-space-game");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:victorcesc/unknown-system.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert_eq!(
+            remote_identity_naming(&repo, "victorcesc-unknown-system", false).as_deref(),
+            Some("github.com/victorcesc/unknown-system")
+        );
+        // A folder-name, `--project`, or marker name routes by name alone.
+        assert_eq!(remote_identity_naming(&repo, "new-space-game", false), None);
+        assert_eq!(
+            remote_identity_naming(tmp.path(), "victorcesc-unknown-system", false),
+            None
+        );
+    }
+
+    /// Hook capture reads no remote once a marker's `project` key names the
+    /// project, so the run must not send one either, even when the pinned
+    /// name happens to equal the remote-derived one.
+    #[test]
+    fn run_sends_no_remote_identity_for_a_marker_pinned_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("new-space-game");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:victorcesc/unknown-system.git",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let config = Config {
+            runtime_env: crate::config::RuntimeEnv::with_host_cwd_for_tests(repo.to_str().unwrap()),
+            ..Config::default()
+        };
+        let identity_for = |marker: &str| {
+            std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+            let (_, project, marker_project) =
+                resolve_scope_noting_marker_project(&config, None, None).unwrap();
+            assert_eq!(project, "victorcesc-unknown-system");
+            remote_identity_naming(&repo, &project, marker_project)
+        };
+
+        assert_eq!(
+            identity_for("workspace = \"acme\"\nproject = \"victorcesc-unknown-system\"\n"),
+            None
+        );
+        // A marker that pins only the workspace leaves the name to the remote.
+        assert_eq!(
+            identity_for("workspace = \"acme\"\n").as_deref(),
+            Some("github.com/victorcesc/unknown-system")
+        );
     }
 
     /// The full decision table: request × jailed × yolo × interactive ×
@@ -4743,6 +4855,7 @@ mod tests {
             new_workstream: None,
             force_unlock: false,
             lease_owner: "workstation:43".into(),
+            repository_identity: None,
         };
 
         let prepared = prepare_managed_run_with_retry(
@@ -5014,6 +5127,7 @@ mod tests {
             new_workstream: None,
             force_unlock: false,
             lease_owner: "workstation:43".into(),
+            repository_identity: None,
         }
     }
 
@@ -8661,6 +8775,7 @@ mod tests {
                     Default::default(),
                     Some(0),
                     &sanitizer,
+                    &TranscriptCapture::for_checkout(home.path(), home.path()),
                 )
                 .await
                 .is_err(),
@@ -8687,6 +8802,7 @@ mod tests {
                     Default::default(),
                     Some(0),
                     &sanitizer,
+                    &TranscriptCapture::for_checkout(home.path(), home.path()),
                 )
                 .await
                 .is_err(),
@@ -8702,6 +8818,7 @@ mod tests {
                 Default::default(),
                 Some(0),
                 &sanitizer,
+                &TranscriptCapture::for_checkout(home.path(), home.path()),
             )
             .await
             .unwrap(),
@@ -8715,6 +8832,313 @@ mod tests {
             requests.lock().unwrap()[0].source_cursor.as_deref(),
             Some("cursor")
         );
+        server.abort();
+    }
+
+    /// GHSA-gcpc-88hm-3xqr: the ledger upload applies the checkout's
+    /// `[capture] ignore_paths`. An excluded read's call and output never reach
+    /// the finish request (and so never a raw segment); a public read in the
+    /// same transcript still does.
+    #[tokio::test]
+    async fn ledger_upload_drops_tool_content_the_capture_policy_excludes() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let event = |kind, content: String, metadata: serde_json::Value| {
+            ai_memory_core::NewWorkstreamEvent {
+                event_id: format!("e-{}", content.len()),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "sid-1".into(),
+                source_record_id: None,
+                kind,
+                role: None,
+                content,
+                occurred_at: None,
+                metadata,
+            }
+        };
+        let read = |path: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolCall,
+                format!(
+                    "Read: {}",
+                    serde_json::json!({"file_path": repo.path().join(path)})
+                ),
+                serde_json::json!({"tool": "Read", "tool_use_id": id}),
+            )
+        };
+        let output = |text: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolResult,
+                text.into(),
+                serde_json::json!({"tool_use_id": id}),
+            )
+        };
+        let transcript = ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                read("docs/adr/1.md", "adr"),
+                read("src/lib.rs", "pub"),
+                output("ADRSENTINEL private decision", "adr"),
+                output("PUBLICCONTROL code", "pub"),
+            ],
+            losses: Vec::new(),
+        };
+        let imported = import_batches(
+            &endpoint,
+            "/workstream/runs/test",
+            transcript,
+            Default::default(),
+            Some(0),
+            &Sanitizer::builtin(),
+            &TranscriptCapture::for_checkout(home.path(), repo.path()),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let posted = serde_json::to_string(&*requests.lock().unwrap()).unwrap();
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(!posted.contains("docs/adr"), "excluded call: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "public control: {posted}");
+        assert!(posted.contains("src/lib.rs"), "public call: {posted}");
+        assert_eq!(imported, 2);
+        assert_eq!(
+            requests.lock().unwrap()[0].source_cursor.as_deref(),
+            Some("cursor"),
+            "the cursor still advances past the excluded events"
+        );
+    }
+
+    /// Codex records its shell tool as `exec_command` with `{cmd, workdir}`,
+    /// which hooks receive as `Bash`. The ledger upload inspects it as that
+    /// shell call: a command whose `workdir`-relative argument names an ignored
+    /// path never reaches the finish request, while the same command run from
+    /// a public directory does.
+    #[tokio::test]
+    async fn ledger_upload_inspects_codex_exec_command_as_the_hook_shell_call() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let event = |kind, content: String, id: &str| ai_memory_core::NewWorkstreamEvent {
+            event_id: format!("e-{id}-{}", content.len()),
+            agent: AgentKind::Codex,
+            native_session_id: "sid-1".into(),
+            source_record_id: None,
+            kind,
+            role: None,
+            content,
+            occurred_at: None,
+            metadata: serde_json::json!({"tool": "exec_command", "tool_use_id": id}),
+        };
+        let exec = |workdir: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolCall,
+                format!(
+                    "exec_command: {}",
+                    serde_json::json!({"cmd": "cat adr/x.md", "workdir": repo.path().join(workdir)})
+                ),
+                id,
+            )
+        };
+        let output = |text: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolResult,
+                text.into(),
+                id,
+            )
+        };
+        let transcript = ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                exec("docs", "adr"),
+                output("ADRSENTINEL private decision", "adr"),
+                exec("src", "pub"),
+                output("PUBLICCONTROL public note", "pub"),
+            ],
+            losses: Vec::new(),
+        };
+        let imported = import_batches(
+            &endpoint,
+            "/workstream/runs/test",
+            transcript,
+            Default::default(),
+            Some(0),
+            &Sanitizer::builtin(),
+            &TranscriptCapture::for_checkout(home.path(), repo.path()),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let posted = serde_json::to_string(&*requests.lock().unwrap()).unwrap();
+        assert!(!posted.contains("ADRSENTINEL"), "excluded output: {posted}");
+        assert!(posted.contains("PUBLICCONTROL"), "public output: {posted}");
+        assert_eq!(imported, 2, "only the public call and its output: {posted}");
+    }
+
+    /// Allowlist capture mode (#446): the live hook emits nothing from an
+    /// unmarked checkout, so its run ledger upload carries no events — no
+    /// prompt, no tool content — while still finishing the run. A marked
+    /// checkout under allowlist and an unmarked one under the default denylist
+    /// upload the transcript as before.
+    #[tokio::test]
+    async fn ledger_upload_under_allowlist_mode_carries_nothing_from_an_unmarked_checkout() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<FinishManagedRunRequest>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/workstream/runs/{id}/finish",
+            post(
+                move |axum::Json(request): axum::Json<FinishManagedRunRequest>| {
+                    let captured = captured.clone();
+                    async move {
+                        let imported_events = request.events.len();
+                        captured.lock().unwrap().push(request);
+                        axum::Json(FinishManagedRunResponse {
+                            imported_events,
+                            latest_sequence: 1,
+                        })
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let config = launch_config(home.path(), home.path(), address);
+        let endpoint = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let allowlist = tempfile::tempdir().unwrap();
+        std::fs::write(
+            allowlist.path().join(super::super::hook::CAPTURE_MODE_FILE),
+            "allowlist\n",
+        )
+        .unwrap();
+        let denylist = tempfile::tempdir().unwrap();
+        let unmarked = tempfile::tempdir().unwrap();
+        let marked = tempfile::tempdir().unwrap();
+        std::fs::write(marked.path().join(".ai-memory.toml"), "[capture]\n").unwrap();
+        let transcript = || ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                ai_memory_core::NewWorkstreamEvent {
+                    event_id: "prompt".into(),
+                    agent: AgentKind::ClaudeCode,
+                    native_session_id: "sid-1".into(),
+                    source_record_id: None,
+                    kind: ai_memory_core::WorkstreamEventKind::Message,
+                    role: Some("user".into()),
+                    content: "PROMPTSENTINEL".into(),
+                    occurred_at: None,
+                    metadata: serde_json::json!({}),
+                },
+                ai_memory_core::NewWorkstreamEvent {
+                    event_id: "tool".into(),
+                    agent: AgentKind::ClaudeCode,
+                    native_session_id: "sid-1".into(),
+                    source_record_id: None,
+                    kind: ai_memory_core::WorkstreamEventKind::ToolCall,
+                    role: Some("assistant".into()),
+                    content: "Bash: {\"command\":\"echo TOOLSENTINEL\"}".into(),
+                    occurred_at: None,
+                    metadata: serde_json::json!({"tool": "Bash"}),
+                },
+            ],
+            losses: Vec::new(),
+        };
+        let upload = |data_dir: &Path, repo: &Path| {
+            let capture = TranscriptCapture::for_checkout(data_dir, repo);
+            let endpoint = &endpoint;
+            let requests = requests.clone();
+            async move {
+                requests.lock().unwrap().clear();
+                import_batches(
+                    endpoint,
+                    "/workstream/runs/test",
+                    transcript(),
+                    Default::default(),
+                    Some(0),
+                    &Sanitizer::builtin(),
+                    &capture,
+                )
+                .await
+                .unwrap();
+                serde_json::to_string(&*requests.lock().unwrap()).unwrap()
+            }
+        };
+
+        let refused = upload(allowlist.path(), unmarked.path()).await;
+        assert!(!refused.contains("SENTINEL"), "{refused}");
+        assert!(
+            requests.lock().unwrap()[0].complete,
+            "the run still finishes, with no events"
+        );
+        assert!(requests.lock().unwrap()[0].events.is_empty());
+        for (data_dir, repo, label) in [
+            (allowlist.path(), marked.path(), "marked under allowlist"),
+            (denylist.path(), unmarked.path(), "unmarked under denylist"),
+        ] {
+            let kept = upload(data_dir, repo).await;
+            assert!(
+                kept.contains("PROMPTSENTINEL") && kept.contains("TOOLSENTINEL"),
+                "control {label}: {kept}"
+            );
+        }
         server.abort();
     }
 

@@ -363,6 +363,96 @@ async fn web_page_view_renders_author_chip_for_attributed_pages() {
 }
 
 #[tokio::test]
+async fn web_page_view_created_is_the_first_versions_date() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for body in ["first", "second", "third"] {
+        wiki.write_page(wiki_req(ws, proj, "notes/versions.md", body))
+            .await
+            .unwrap();
+    }
+    wiki.write_page(wiki_req(ws, proj, "notes/single.md", "only"))
+        .await
+        .unwrap();
+
+    // Age the superseded versions; the latest keeps its fresh timestamp.
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+    let aged = jiff::Timestamp::now().as_microsecond() - 40 * 86_400_000_000;
+    let n = conn
+        .execute(
+            "UPDATE pages SET created_at = ?1 \
+             WHERE project_id = ?2 AND path = 'notes/versions.md' AND is_latest = 0",
+            rusqlite::params![aged, proj.as_bytes()],
+        )
+        .unwrap();
+    assert_eq!(n, 2, "two superseded versions");
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+    };
+
+    let text = get("/w/default/scratch/p/notes/versions.md").await;
+    assert!(
+        text.contains("Created 1 month ago"),
+        "Created should be the oldest version's date: {text}"
+    );
+    assert!(
+        text.contains("Updated just now"),
+        "Updated stays the latest version's date: {text}"
+    );
+    let text = get("/w/default/scratch/p/notes/single.md").await;
+    assert!(
+        text.contains("Created just now"),
+        "a single-version page keeps its own date: {text}"
+    );
+
+    // The JSON API reads the same page-level date, so SPA clients agree.
+    let api = api_router(store.reader.clone(), wiki.clone());
+    let resp = api
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/pages/notes/versions.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let created = json["created_at"].as_str().unwrap();
+    let updated = json["updated_at"].as_str().unwrap();
+    assert_ne!(
+        created, updated,
+        "API created_at is the first version's: {json}"
+    );
+    let created_us = created.parse::<jiff::Timestamp>().unwrap().as_microsecond();
+    assert_eq!(created_us, aged, "{json}");
+}
+
+#[tokio::test]
 async fn smoke_search_returns_200() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -403,6 +493,70 @@ async fn smoke_search_returns_200() {
         text.contains("unique_term_xyz_abc"),
         "expected search term in results"
     );
+}
+
+/// Seeds `n` pages matching one term and returns the `/search` body for it.
+async fn search_body_with_pages(n: usize) -> String {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for i in 0..n {
+        store
+            .writer
+            .upsert_page(new_page(
+                ws,
+                proj,
+                &format!("p{i}.md"),
+                &format!("Cap Page {i}"),
+                "capnoticeterm",
+            ))
+            .await
+            .unwrap();
+    }
+    let app = router(store.reader.clone(), wiki.clone());
+    let req = Request::builder()
+        .uri("/search?q=capnoticeterm")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+const CUT_NOTICE: &str = "Showing the first 50 results. Refine your search to narrow them.";
+
+#[tokio::test]
+async fn search_over_the_cap_shows_truncation_notice() {
+    let text = search_body_with_pages(51).await;
+    assert!(text.contains(CUT_NOTICE), "missing notice");
+    assert!(!text.contains("51 results") && !text.contains(">50 results<"));
+    assert_eq!(text.matches("Cap Page ").count(), 50, "rows rendered");
+}
+
+#[tokio::test]
+async fn search_at_the_cap_shows_plain_count() {
+    let text = search_body_with_pages(50).await;
+    assert!(!text.contains(CUT_NOTICE), "unexpected notice");
+    assert!(text.contains("50 results"));
+    assert_eq!(text.matches("Cap Page ").count(), 50, "rows rendered");
+}
+
+#[tokio::test]
+async fn search_under_the_cap_shows_plain_count() {
+    let text = search_body_with_pages(3).await;
+    assert!(!text.contains(CUT_NOTICE), "unexpected notice");
+    assert!(text.contains("3 results"));
 }
 
 #[tokio::test]
@@ -3463,6 +3617,94 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
     }
 }
 
+/// A project name that two projects answer to is the caller's ambiguity, not
+/// a server fault: a viewer opening it gets a 400 naming the clash, where the
+/// refusal mapping used to fall through to a bare 500.
+#[tokio::test]
+async fn web_read_of_an_ambiguous_project_name_is_a_400() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+    use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let declared = store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    let (clone, _) = store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/widget".to_owned(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "acme-widget",
+            Some("/work/widget".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(declared, clone);
+    let viewer = store
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "carol".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let web = router(store.reader.clone(), wiki.clone());
+
+    for uri in ["/w/default/widget", "/w/default/widget/p/notes.md"] {
+        let resp = web
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .extension(AuthorizedViewer(viewer))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("is ambiguous in workspace 'default'"),
+            "{uri}: {body:?}"
+        );
+    }
+
+    // The unambiguous name still opens.
+    let ok = web
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/acme-widget")
+                .extension(AuthorizedViewer(viewer))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
 /// Pins a documented, by-design boundary (see `docs/users.md`): under a
 /// trusted-proxy deployment, a proxied non-root end-user is authenticated as
 /// [`ai_memory_core::AuthLevel::User`] with an [`ai_memory_core::ActorContext`]
@@ -4056,4 +4298,67 @@ async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
         StatusCode::FORBIDDEN,
         "a cursor cannot retain access after its user's grant is revoked"
     );
+}
+
+// ── Accessibility basics: skip link, labelled search inputs, breadcrumb semantics ──
+
+#[tokio::test]
+async fn pages_expose_skip_link_search_labels_and_current_breadcrumb() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/bar.md", "# Bar\n\nbody"))
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+
+    // (uri, search input id, whether the page has a breadcrumb)
+    let cases = [
+        ("/", "header-search", false),
+        ("/w/default/scratch", "header-search", true),
+        ("/w/default/scratch/p/notes/bar.md", "header-search", true),
+        ("/w/default/scratch/p/notes/", "header-search", true),
+        ("/search?q=bar", "search-q", false),
+    ];
+    for (uri, input_id, breadcrumb) in cases {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+
+        assert!(
+            text.contains(r##"href="#main-content""##),
+            "{uri}: skip link"
+        );
+        assert!(
+            text.contains(r#"<main id="main-content""#),
+            "{uri}: skip target"
+        );
+        assert!(
+            text.contains(&format!(r#"<label for="{input_id}""#)),
+            "{uri}: label for {input_id}"
+        );
+        assert!(
+            text.contains(&format!(r#"id="{input_id}""#)),
+            "{uri}: input id {input_id}"
+        );
+        if breadcrumb {
+            assert!(text.contains(r#"aria-label="Breadcrumb""#), "{uri}");
+            assert!(text.contains(r#"aria-current="page""#), "{uri}");
+        }
+    }
 }

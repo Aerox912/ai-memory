@@ -10,11 +10,11 @@ It shows direct MCP writes, queries and handoffs without a native hook adapter.
 
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
-> required), so any client that points a remote URL at `/mcp` — including
-> OpenCode `type: "remote"` and plain `curl` — works without an
+> required), so any client that points a remote URL at `/mcp`, including
+> OpenCode `type: "remote"` and plain `curl`, works without an
 > `mcp-remote` stdio shim (issue #3). The `mcp-remote` bridge is still
 > needed for **Claude Desktop** specifically, because its config only
-> supports stdio servers — not because of session state. If you run a
+> supports stdio servers; session state has nothing to do with it. If you run a
 > client that *requires* MCP session continuity or server-initiated SSE
 > streams, start the server with `ai-memory serve --transport http
 > --http-stateful` to restore rmcp's session mode.
@@ -304,7 +304,7 @@ nothing is pending.
 **Status:** ✅ MCP supported (workspace-default). ❌ No lifecycle hooks
 (Copilot's agent mode does not expose `PreToolUse` / `PostToolUse` /
 `SessionStart` yet, so ai-memory's automatic capture is not active in
-VS Code — call `memory_query`, `memory_write_page`, etc. from chat).
+VS Code; call `memory_query`, `memory_write_page`, etc. from chat).
 
 **Config file:**
 - Workspace (recommended): `.vscode/mcp.json` in the repo root. Matches
@@ -369,13 +369,13 @@ Aliases: `copilot`, `github-copilot`.
   auto-reload `.vscode/mcp.json` while the window is focused on another
   tab.
 - Copilot Enterprise behaves the same as Copilot Individual/Business
-  for MCP — your org may restrict which MCP servers Copilot is allowed
+  for MCP. Your org may restrict which MCP servers Copilot is allowed
   to call; check **Settings → Copilot → MCP servers** if the server
   shows as blocked.
 - Lifecycle hooks aren't possible until VS Code Copilot adds an agent
   hook surface. Until then, the auto-handoff flow that other agents
   enjoy (SessionStart auto-fetches a "where you left off" block) does
-  not run here — ask the agent to call `memory_handoff_accept`
+  not run here. Ask the agent to call `memory_handoff_accept`
   manually if you want it.
 - Sources:
   <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>,
@@ -785,13 +785,37 @@ which merges:
 
 Lifecycle capture is separate and script-free: `ai-memory install-hooks
 --agent zero --apply` merges exec-form entries (the native `ai-memory hook`
-command + args, JSON payload on stdin — no shell) into
+command + args, JSON payload on stdin, no shell) into
 `~/.config/zero/hooks.json`, covering `sessionStart`/`sessionEnd`/
 `beforeTool`/`afterTool` plus `specialistStart`/`specialistStop` (mapped to
 ai-memory's subagent events). Zero discards `sessionStart` hook stdout, so
 capture and session-end handoff *creation* work, but handoff *injection*
-does not — ask Zero to call `memory_handoff_accept` at the start of a
+does not. Ask Zero to call `memory_handoff_accept` at the start of a
 resumed session.
+
+Zero runs hook commands inside its execution sandbox. The default policy
+denies all network, loopback included (a separate network namespace on
+Linux, `(deny network*)` on macOS), mounts `/` read-only with writes limited
+to the workspace and temp, and kills a hook's detached children when the
+hook exits. Hooks therefore cannot reach `server_url`: events land in
+`<data_dir>/hook-spool/` and stay there. Zero only lets the user's global
+`~/.config/zero/config.json` relax this (a project config can only tighten
+it), and ai-memory does not edit that file. Either add
+
+```json
+"sandbox": {
+  "network": "allow",
+  "additionalWriteRoots": ["<ai-memory data dir>"]
+}
+```
+
+(network access is all-or-nothing and applies to every shell command Zero
+runs, not only hooks), or set `"sandbox": {"enabled": false}`. With network
+allowed, `sessionEnd` delivers the spool from the hook process itself within a
+fixed 10-second budget, because the sandbox would kill the detached drainer
+other agents use; whatever does not make it stays spooled. Without either, run `ai-memory hook-drain` from a normal shell to deliver the
+spooled events. A leftover empty `hook-spool/.drain.lock` does not block
+that drain: the lock is an OS file lock released when its holder exits.
 
 ## ZCode (z.ai)
 
@@ -972,16 +996,16 @@ available.
 Real Devin hook payloads may omit `session_id` and `cwd`; the installed hooks
 fill both in:
 
-- **cwd** — the payload's `cwd` wins when present, then the
+- **cwd**: the payload's `cwd` wins when present, then the
   `DEVIN_PROJECT_DIR` environment variable (when Devin's launcher provides
   it), then the hook process working directory.
-- **session id** — when the payload has none, the hook mints one at
+- **session id**: when the payload has none, the hook mints one at
   `SessionStart`, stores it in a single per-host slot
   (`<data-dir>/hook-state/devin-session-id`), reuses it for every later
   event, and clears it at `SessionEnd`. Set `AI_MEMORY_SESSION_ID` in the
   hook environment to pin an externally managed run id instead. Because the
   slot is per host+agent, two Devin sessions running *concurrently* on the
-  same machine share it — the newest `SessionStart` wins and earlier
+  same machine share it: the newest `SessionStart` wins and earlier
   sessions' remaining events are attributed to it (same graceful-degradation
   stance as the single-slot `/handoff` fallback). A payload that does carry
   its own `session_id` always wins over both.
@@ -1019,14 +1043,14 @@ which merges:
 `install-mcp` appends the `?flavor=moonshot` query itself (idempotently, so
 re-runs don't duplicate it). The Moonshot API validates tool parameter
 schemas against a restricted dialect ("moonshot flavored json schema") that
-rejects root-level `anyOf`/`oneOf`/`allOf` combinators — including the
-`anyOf` on `memory_read_page` — and fails the whole session with a 400 at
+rejects root-level `anyOf`/`oneOf`/`allOf` combinators (including the
+`anyOf` on `memory_read_page`) and fails the whole session with a 400 at
 `tools/list`. The ai-memory server answers requests carrying this flavor
 with flat schemas; every other client keeps receiving the upstream schemas
 unchanged.
 
 > **Do not register ai-memory with Kimi's own `mcp add`.** Kimi Code's
-> documented command —
+> documented command,
 >
 > ```bash
 > kimi mcp add --transport http ai-memory http://127.0.0.1:49374/mcp
@@ -1034,7 +1058,7 @@ unchanged.
 >
 > writes the plain URL, with no `?flavor=moonshot`. The server then serves
 > the upstream schemas, Moonshot rejects `memory_read_page`'s root-level
-> `anyOf`, and **every model turn fails with a 400** — including turns that
+> `anyOf`, and **every model turn fails with a 400**, including turns that
 > use no tools at all, because tool schemas ship with each request. Use
 > `ai-memory install-mcp --client kimi-code --apply` instead, which writes
 > the flavored URL for you.
@@ -1051,7 +1075,7 @@ unchanged.
 > ```
 >
 > That serves the restricted dialect on every `tools/list` regardless of the
-> `?flavor=` marker, so any strict client that skips the marker is covered —
+> `?flavor=` marker, so it covers any strict client that skips the marker,
 > not just Kimi. A request's marker can only raise the dialect further, never
 > lower it. Reported in #474.
 
@@ -1065,10 +1089,10 @@ ai-memory install-hooks --agent kimi-code --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-The installed entries cover 10 events — `SessionStart`, `SessionEnd`,
+The installed entries cover 10 events (`SessionStart`, `SessionEnd`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`
 (Kimi Code fires `PostToolUse` on successful calls only), `Stop`,
-`SubagentStart`, `SubagentStop`, and `PreCompact` — with a Kimi Code-specific
+`SubagentStart`, `SubagentStop`, and `PreCompact`) with a Kimi Code-specific
 script bundle /
 native `ai-memory hook --event … --agent kimi-code` commands (native is the
 default for local installs; the staged scripts under
@@ -1360,7 +1384,7 @@ Some model APIs validate MCP tool parameter schemas against a narrower dialect
 than JSON Schema and reject the whole `tools/list` with a 400. ai-memory can
 serve a relaxed dialect per request, via a `?flavor=` query on the MCP URL, or
 server-wide via config for clients that cannot carry one. Runtime argument
-validation is identical in every dialect — only the advertised schema changes.
+validation is identical in every dialect; only the advertised schema changes.
 
 | Marker | Config key | What it changes | Who needs it |
 | --- | --- | --- | --- |
@@ -1368,10 +1392,10 @@ validation is identical in every dialect — only the advertised schema changes.
 | `?flavor=bedrock` | `strip_root_combinators` | Drops root-level `anyOf`/`oneOf`/`allOf` | Kiro CLI (Bedrock); appended by `install-mcp` |
 | `?flavor=gemini` (alias `vertex`) | `gemini_safe_schemas` | Drops root-level `anyOf`/`oneOf`/`allOf`, plus nullable unions collapsed to a single `type` + `nullable: true` | Clients that forward schemas verbatim to Gemini/Vertex, e.g. OpenCode on a Vertex model |
 
-Moonshot's validator never resolves `$ref` — any reference, at the root or
+Moonshot's validator never resolves `$ref`: any reference, at the root or
 nested, fails the request with "detected infinite recursion without termination
-condition" — while inline combinators such as the nullable union on
-`Option<T>` arguments pass. Codex forwards MCP input schemas into Responses
+condition". Inline combinators such as the nullable union on
+`Option<T>` arguments do pass. Codex forwards MCP input schemas into Responses
 `tools.function.parameters` verbatim, so it needs the Moonshot marker even
 though it is not Kimi Code. `?flavor=bedrock` and `?flavor=gemini` keep
 `$defs`/`$ref` pairs, which their upstreams resolve.
@@ -1412,7 +1436,7 @@ Unable to submit request because `ai-memory_memory_auto_improve` functionDeclara
 When using any_of, it must be the only field set.
 ```
 
-The dialect collapses it to `"type": "integer"` plus `nullable: true` — the same
+The dialect collapses it to `"type": "integer"` plus `nullable: true`, the same
 normalization Gemini CLI performs client-side, which is why Gemini CLI and
 Antigravity CLI work on Vertex without any marker and do not need this. Reach
 for it when a pass-through client fails at `tools/list` with that error.
