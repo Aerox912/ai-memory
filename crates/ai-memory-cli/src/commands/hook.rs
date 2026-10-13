@@ -171,15 +171,40 @@ fn session_end_drains_in_process(agent: AgentKind, event: &str) -> bool {
 async fn drain_session_end_in_process(
     spool: &Path,
     data_dir: &Path,
+    server_url: &str,
+    static_bearer: Option<&str>,
+    pool_id: Option<&str>,
     max_attempts: hook_spool::MaxAttempts,
 ) {
-    let drain = hook_spool::drain_exclusive_within_budget(
-        spool,
-        data_dir,
-        IN_PROCESS_SESSION_END_DRAIN_BUDGET,
-        drain_event_timeout().min(IN_PROCESS_SESSION_END_DRAIN_BUDGET),
-        max_attempts,
-    );
+    let drain = async {
+        let per_event_timeout = drain_event_timeout().min(IN_PROCESS_SESSION_END_DRAIN_BUDGET);
+        if let Some(pool_id) = pool_id {
+            hook_spool::drain_exclusive_within_budget_trusted_pool(
+                spool,
+                data_dir,
+                IN_PROCESS_SESSION_END_DRAIN_BUDGET,
+                per_event_timeout,
+                hook_spool::TrustedPool {
+                    server_url,
+                    static_bearer,
+                    pool_id,
+                },
+                max_attempts,
+            )
+            .await
+        } else {
+            hook_spool::drain_exclusive_within_budget_trusted(
+                spool,
+                data_dir,
+                IN_PROCESS_SESSION_END_DRAIN_BUDGET,
+                per_event_timeout,
+                server_url,
+                static_bearer,
+                max_attempts,
+            )
+            .await
+        }
+    };
     // The budget stops new requests; this also stops one already in flight
     // (an old server's per-event fallback, a token refresh). Cancelling only
     // at an await point leaves every spool file whole: at worst an accepted
@@ -1319,7 +1344,15 @@ where
     // but `stop` and `pre-compact` also trigger the helper so delivery does not
     // rely on the single hook most likely to be cancelled during agent shutdown.
     if !external_capture && session_end_drains_in_process(agent_kind, &args.event) {
-        drain_session_end_in_process(&spool, &dd, max_attempts).await;
+        drain_session_end_in_process(
+            &spool,
+            &dd,
+            &args.server_url,
+            install_token,
+            pool_id.as_deref(),
+            max_attempts,
+        )
+        .await;
     } else if !external_capture
         && should_spawn_background_drainer(&args.event)
         && let Err(err) = after_background_drain_event_enqueue(
@@ -3023,6 +3056,8 @@ mod tests {
             agent: "zero".into(),
             server_url: server_url.into(),
             auth_token: None,
+            auth_token_file: None,
+            pool_id: None,
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
@@ -3092,6 +3127,34 @@ mod tests {
             entries[0].attempts, 0,
             "an unreachable server costs no retry"
         );
+    }
+
+    #[tokio::test]
+    async fn zero_session_end_uses_the_trusted_pool_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = hook_spool::spool_dir(tmp.path());
+        let (base, mut requests) = serve_requests("200 OK", r#"{"accepted":1}"#).await;
+        let mut args = zero_hook_args("session-end", &base);
+        args.auth_token = Some("zero-static-test-token".into());
+        args.pool_id = Some("personal".into());
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().to_path_buf()),
+            args,
+            r#"{"sessionId":"trusted-zero","cwd":"/tmp"}"#.into(),
+            &mut stdout,
+            |_, _| panic!("zero's session-end must drain in-process"),
+        )
+        .await
+        .unwrap();
+        let request = first_request(&mut requests).await.expect("trusted drain");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer zero-static-test-token")
+        );
+        assert_eq!(hook_spool::spool_len(&spool), 0);
+        assert_eq!(stdout, b"{}\n");
     }
 
     #[tokio::test]
