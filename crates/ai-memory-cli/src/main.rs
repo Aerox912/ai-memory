@@ -16,7 +16,9 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(ai_memory_cli::run());
+    // The dispatcher includes every command's future. Keep it on the heap so
+    // Tokio's block_on frames do not copy it onto Windows' small main stack.
+    let result = runtime.block_on(Box::pin(ai_memory_cli::run()));
     // `run` has returned and dropped the handles it owned, but the store
     // writer's `Shutdown`-and-join does NOT run here: the maintenance
     // scheduler's detached tasks (and, once a client has connected, the

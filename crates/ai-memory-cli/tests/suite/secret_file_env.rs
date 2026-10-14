@@ -180,5 +180,9 @@ fn hook_shortcut_rejects_missing_secret_file_before_capture_check() {
         );
     let output = run_with_stdin(&mut command, r#"{"prompt":"test"}"#);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("hook bearer token"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("hook bearer token"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

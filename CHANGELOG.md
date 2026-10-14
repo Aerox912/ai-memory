@@ -26,6 +26,8 @@ version in [`docs/changelog/`](docs/changelog/):
   for their authorized drainers.
 
 ### Fixed
+- Kept the CLI dispatcher future on the heap to prevent Windows debug/test
+  builds from overflowing the main-thread stack during command startup.
 - Fixed Windows capture dropping the body of file and shell tool events
   the client had kept. With `[capture] ignore_paths` active, server
   re-inspection compiled a POSIX never-match sentinel and treated the
