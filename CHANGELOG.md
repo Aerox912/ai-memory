@@ -11,11 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-## [3.0.0-aerox.1] - 2026-10-14
-
 ### Security
 - Updated Rustls to 0.23.46 in the workspace and companion lockfiles for
   RUSTSEC-2026-0346, RUSTSEC-2026-0347, RUSTSEC-2026-0348 and RUSTSEC-2026-0349.
+
+### Changed
+- Allowed manual platform CI to omit its hosted retrieval benchmark when the
+  full benchmark runs separately on the same frozen candidate. The hosted
+  benchmark remains enabled by default.
+
+## [3.0.0-aerox.1] - 2026-10-14
 
 ### Changed
 - Integrated canonical upstream through `705aba70bc1a3ce6349194135206fb622ca55749`,
@@ -28,9 +33,6 @@ version in [`docs/changelog/`](docs/changelog/):
 - Published fork plugin metadata and a checksummed installer. Embedded systemd
   units use LF on Windows checkouts. Recovery leaves pool and profile entries
   for their authorized drainers.
-- Allowed manual platform CI to omit its hosted retrieval benchmark when the
-  full benchmark runs separately on the same frozen candidate. The hosted
-  benchmark remains enabled by default.
 
 ### Fixed
 - Kept the CLI dispatcher future on the heap to prevent Windows debug/test
