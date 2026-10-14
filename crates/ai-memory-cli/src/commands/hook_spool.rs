@@ -5792,9 +5792,14 @@ mod tests {
             entry.profile = profile.map(str::to_owned);
             std::fs::write(dir.join(name), serde_json::to_vec(&entry).unwrap()).unwrap();
         }
-        let mut config = crate::config::Config::default();
-        config.server_url = format!("http://{addr}");
-        config.auth.bearer_token = Some("standalone-secret".into());
+        let config = crate::config::Config {
+            server_url: format!("http://{addr}"),
+            auth: crate::config::AuthSettings {
+                bearer_token: Some("standalone-secret".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let quarantine = QuarantinedSpool {
             dir: dir.clone(),
             spool: spool_dir(tmp.path()),

@@ -13,6 +13,10 @@ class FrozenChangelogTests(unittest.TestCase):
             root = pathlib.Path(directory)
             (root / "scripts").mkdir()
             shutil.copyfile(script, root / "scripts" / script.name)
+            shutil.copyfile(
+                script.with_name("changelog_sections.py"),
+                root / "scripts" / "changelog_sections.py",
+            )
 
             def git(*args):
                 return subprocess.check_output(
