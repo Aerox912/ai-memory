@@ -8,6 +8,11 @@ on:
   # Manual full run (macOS legs included) — dispatch on the
   # release-candidate SHA right before a release.
   workflow_dispatch:
+    inputs:
+      run_retrieval_benchmark:
+        description: Run the full retrieval benchmark (disable only when run separately on this candidate)
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -481,7 +486,7 @@ jobs:
           GITLEAKS_CONFIG: .gitleaks.toml
 
   retrieval-benchmark:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.run_retrieval_benchmark
     name: full LongMemEval-S FTS and local embeddings
     runs-on: ubuntu-latest
     timeout-minutes: 180

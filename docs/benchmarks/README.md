@@ -9,6 +9,12 @@ cargo build --release -p ai-memory-cli
 cargo run --release -p ai-memory-eval -- retrieval --fetch
 ```
 
+For fork releases, a manual `ci` dispatch runs the hosted full benchmark by
+default. Set `run_retrieval_benchmark=false` only when the full FTS/local run is
+performed separately on the same frozen candidate. Preserve its report and
+compare every slice with the previous release before tagging; this option does
+not remove the release benchmark requirement.
+
 ## Baselines
 
 | date | dataset | mode | overall hit@5 | file |
