@@ -588,6 +588,12 @@ impl QuarantinedSpool {
                 ..CorrelatedDrainResult::default()
             };
         };
+        let Some(trusted_hook_url) = configured_hook_url(&self.config.server_url) else {
+            return CorrelatedDrainResult {
+                remaining: files.len() + unreadable,
+                ..CorrelatedDrainResult::default()
+            };
+        };
         files.sort();
         let client = build_client();
         let started = Instant::now();
@@ -601,11 +607,7 @@ impl QuarantinedSpool {
                 result.remaining += 1;
                 continue;
             }
-            let Some(entry) = load_live_entry(
-                &path,
-                &mut result,
-                configured_hook_url(&self.config.server_url).as_ref(),
-            ) else {
+            let Some(entry) = load_live_entry(&path, &mut result, Some(&trusted_hook_url)) else {
                 continue;
             };
             // Recovery has only this standalone config's authority. Pool and
@@ -627,6 +629,10 @@ impl QuarantinedSpool {
                 &mut ProfileTokens::new(data_dir),
             )
             .await;
+            if bearer.is_none() && entry.auth_mode == AuthMode::Static {
+                result.remaining += 1;
+                continue;
+            }
             let Some(payload) = batch_payload(&[(path.clone(), entry.clone())]) else {
                 bump_or_drop(&path, &entry, max_attempts.0, &mut result);
                 continue;
@@ -5818,6 +5824,48 @@ mod tests {
         assert_eq!(result.dropped, 0);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(sorted_attempts(&dir), vec![0, 0]);
+    }
+
+    #[tokio::test]
+    async fn recovery_requires_a_valid_trusted_destination_and_static_credential() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let addr = serve_counting_hook(count.clone(), "200 OK").await;
+        for (server_url, bearer) in [
+            (
+                "invalid-url".to_owned(),
+                Some("standalone-secret".to_owned()),
+            ),
+            (format!("http://{addr}"), None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("quarantine");
+            write_static_spool_entry(&dir, "evt-0.json", format!("http://{addr}/hook?event=e0"));
+            let quarantine = QuarantinedSpool {
+                dir: dir.clone(),
+                spool: spool_dir(tmp.path()),
+                config: crate::config::Config {
+                    server_url,
+                    auth: crate::config::AuthSettings {
+                        bearer_token: bearer,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            };
+            let result = quarantine
+                .drain_strict(
+                    tmp.path(),
+                    Duration::from_secs(2),
+                    Duration::from_secs(1),
+                    MaxAttempts::default(),
+                )
+                .await;
+            assert_eq!(result.remaining, 1);
+            assert_eq!(result.durable, 0);
+            assert_eq!(result.dropped, 0);
+            assert_eq!(sorted_attempts(&dir), vec![0]);
+        }
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
