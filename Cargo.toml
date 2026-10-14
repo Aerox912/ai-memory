@@ -13,7 +13,7 @@ members = [
     "crates/ai-memory-workstream",
     # Test-only helpers shared across crates (dev-dependency, never shipped).
     "crates/ai-memory-test-support",
-    # Live A/B harness â€” not part of the shipped binary, but in
+    # Live A/B harness — not part of the shipped binary, but in
     # the workspace so it shares deps + builds with the rest.
     "evals",
 ]
@@ -35,25 +35,26 @@ default-members = [
 ]
 
 [workspace.package]
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
+homepage = "https://aimemory.sh"
 repository = "https://github.com/akitaonrails/ai-memory"
 authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "2.6.6-aerox.1" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "2.6.6-aerox.1" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "2.6.6-aerox.1" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "2.6.6-aerox.1" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "2.6.6-aerox.1" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "2.6.6-aerox.1" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "2.6.6-aerox.1" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "2.6.6-aerox.1" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "2.6.6-aerox.1" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "2.6.6-aerox.1" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "3.0.0-aerox.1" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "3.0.0-aerox.1" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.0.0-aerox.1" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.0.0-aerox.1" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.0.0-aerox.1" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.0.0-aerox.1" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.0.0-aerox.1" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "3.0.0-aerox.1" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.0.0-aerox.1" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.0.0-aerox.1" }
 
 # (Workspace shared deps follow below)
 
@@ -66,7 +67,7 @@ serde = { version = "1", features = ["derive"] }
 # `preserve_order` keeps existing JSON key order intact when we
 # round-trip user config files via `install-mcp --apply`. Without it,
 # `~/.claude.json` (which has dozens of CC-managed keys) would be
-# alphabetised on every write â€” semantically equivalent but a giant
+# alphabetised on every write — semantically equivalent but a giant
 # cosmetic diff the user didn't ask for.
 serde_json = { version = "1", features = ["preserve_order"] }
 # Wiki frontmatter YAML. Each crate opts into the half it uses.
@@ -127,6 +128,7 @@ notify = "8"
 notify-debouncer-full = "0.6"
 sysinfo = "0.32"
 fs2 = "0.4"
+libc = "0.2"
 
 # Windows NTFS file-index (inode equivalent) for own-write detection.
 winapi-util = "0.1"
@@ -167,15 +169,15 @@ git2 = { version = "0.21", default-features = false, features = ["vendored-libgi
 
 # LLM provider HTTP.
 # `rustls-tls` bundles the Mozilla webpki root store and ignores the OS trust
-# store, so a CA an operator installed locally â€” Caddy's `tls internal`, a
-# corporate MITM appliance, any private PKI â€” is invisible to this client even
+# store, so a CA an operator installed locally — Caddy's `tls internal`, a
+# corporate MITM appliance, any private PKI — is invisible to this client even
 # though `curl` and the agent CLIs trust it. That made lifecycle capture fail
 # with `UnknownIssuer` on every install following the project's own
 # HTTPS-via-proxy Path 2 (#492). `rustls-tls-native-roots` reads the platform
 # store instead; the runtime image installs `ca-certificates`, so the server
 # path keeps a populated store.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
-# Local (in-process, pure-Rust) embeddings â€” 2.0 item 5.
+# Local (in-process, pure-Rust) embeddings — 2.0 item 5.
 candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"

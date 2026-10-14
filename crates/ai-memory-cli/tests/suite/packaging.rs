@@ -526,6 +526,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
         posix.contains("CLAUDE_CODE_SESSION_ID"),
         "POSIX wrapper must forward Claude's session id into the bridge container"
     );
+    assert!(
+        posix.contains("  MUSE_SESSION_ID \\"),
+        "POSIX wrapper must forward Muse's session id into the bridge container"
+    );
     assert!(posix.contains("git -C \"${PWD}\" rev-parse --show-toplevel"));
     assert!(posix.contains("AI_MEMORY_SCOPE_CWD=/scope${SCOPE_REL}"));
     assert!(posix.contains("${SCOPE_ROOT}:/scope:ro"));
@@ -546,6 +550,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
     assert!(
         powershell.contains("\"CLAUDE_CODE_SESSION_ID\""),
         "PowerShell wrapper must forward Claude's session id into the bridge container"
+    );
+    assert!(
+        powershell.contains("\"MUSE_SESSION_ID\""),
+        "PowerShell wrapper must forward Muse's session id into the bridge container"
     );
     assert!(powershell.contains("AI_MEMORY_SCOPE_CWD=$ScopeCwd"));
     assert!(powershell.contains("${ScopeRoot}:/scope:ro"));
@@ -710,6 +718,7 @@ fn wrapper_updates_and_install_docs_use_verified_release_assets() {
         "ai-memory-wrapper.cmd",
         "ai-memory-install-hooks",
         "ai-memory-hooks.tar.gz",
+        "install.sh",
     ] {
         assert!(release.contains(asset), "release must publish {asset}");
         assert!(

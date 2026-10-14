@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -57,6 +57,7 @@ dependencies = [
  "fs2",
  "jiff",
  "jsonc-parser",
+ "libc",
  "reqwest 0.12.28",
  "rmcp",
  "rstest",
@@ -84,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -111,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "icu_normalizer",
  "jiff",
@@ -127,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -142,6 +143,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokenizers",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -150,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -177,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -206,13 +208,14 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
  "ai-memory-hooks",
  "ai-memory-llm",
  "ai-memory-store",
+ "ai-memory-web",
  "ai-memory-wiki",
  "anyhow",
  "async-trait",
@@ -241,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -267,17 +270,19 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 
 [[package]]
 name = "ai-memory-web"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-core",
+ "ai-memory-llm",
  "ai-memory-store",
  "ai-memory-wiki",
  "anyhow",
  "askama",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "jiff",
@@ -296,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -328,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "2.6.6-aerox.1"
+version = "3.0.0-aerox.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
