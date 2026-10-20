@@ -273,11 +273,13 @@ jobs:
         run: |
           set -euo pipefail
           install -m 0755 install.sh artifacts/install.sh
+          install -m 0644 install.ps1 artifacts/install.ps1
           install -m 0755 scripts/install-hooks.sh artifacts/ai-memory-install-hooks
           tar -czf artifacts/ai-memory-hooks.tar.gz hooks
           (
             cd artifacts
             sha256sum install.sh > install.sh.sha256
+            sha256sum install.ps1 > install.ps1.sha256
             sha256sum ai-memory-install-hooks > ai-memory-install-hooks.sha256
             sha256sum ai-memory-hooks.tar.gz > ai-memory-hooks.tar.gz.sha256
           )
