@@ -162,6 +162,62 @@ After upgrading the wrapper/image, rerun `install-hooks --agent <agent> --apply`
 for each native Windows agent so existing hook entries receive the current
 command form.
 
+### Managed launches (`run`, `continue`, `show`, …) use the native client
+
+`ai-memory run <harness>`, `continue`, `resume`, `show`, `workstreams` and
+`rename-workstream` execute on the host: the helper container cannot see your
+checkouts, your `claude` or `codex` CLIs, or their native session stores. The
+wrapper intercepts those subcommands and runs the native Windows client
+instead of the container (the same interception the Linux/macOS wrapper
+performs), so managed launches work while the server stays in Docker.
+
+The Docker image and the wrapper do not install that client. Install it once
+from the release zip
+([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)):
+
+```powershell
+irm https://github.com/akitaonrails/ai-memory/releases/latest/download/install.ps1 | iex
+```
+
+`install.ps1` unpacks `ai-memory.exe` to `%LOCALAPPDATA%\Programs\ai-memory`
+and puts that directory on your `PATH`; the wrapper finds it there, or
+wherever `AI_MEMORY_NATIVE_BIN` points. Without it the intercepted commands
+stop with a message naming that installer. They never fall back into the
+container, which has no host CLIs.
+
+- The native client inherits `AI_MEMORY_SERVER_URL`. Leave it unset and it
+  talks to `http://127.0.0.1:49374`, the port the container publishes on the
+  host; a remote-server URL wins, as with every other wrapper command.
+- When the container server has auth enabled (a fresh install mints a root
+  bearer into the volume), the native client needs that token or the server
+  rejects these commands with `401`. The Linux/macOS wrapper copies the
+  token out of the named volume for its native host commands; the
+  PowerShell wrapper does not do that yet
+  ([#1603](https://github.com/akitaonrails/ai-memory/issues/1603)). Until it
+  does, copy the token out once yourself and point the client at the file:
+
+  ```powershell
+  New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\ai-memory" | Out-Null
+  $token = docker run --rm -v ai-memory-data:/data:ro --entrypoint /bin/sh akitaonrails/ai-memory:latest -c "cat /data/auth-tokens/default"
+  Set-Content -NoNewline "$env:LOCALAPPDATA\ai-memory\server-token" $token.Trim()
+  $env:AI_MEMORY_AUTH__BEARER_TOKEN_FILE = "$env:LOCALAPPDATA\ai-memory\server-token"
+  ```
+
+  Setting `AI_MEMORY_AUTH__BEARER_TOKEN_FILE` in your user environment covers
+  every terminal. A plain `$env:AI_MEMORY_AUTH_TOKEN = "<token>"` also works
+  for a single session. Refresh the copy whenever the volume's token rotates.
+- A managed launch does not rewire hooks or MCP: what `install-hooks` and
+  `install-mcp` rendered through the container stays in place (the wrapper
+  sets `AI_MEMORY_RUN_AUTOWIRE=false` for the intercepted commands unless you
+  set the variable yourself). Export `AI_MEMORY_RUN_AUTOWIRE=true` to let
+  `run` rewire a harness around the native client instead.
+- Upgrading in this scenario: `ai-memory upgrade` pulls the image only. It
+  does not refresh the wrapper or install a native client. Refresh the
+  wrapper scripts by re-running the install block at the top of this
+  scenario, and the native client with its own `ai-memory.exe upgrade`
+  ([Scenario C](#scenario-c-prebuilt-release-binary-no-toolchain)). Then
+  rerun `install-hooks --agent <agent> --apply` as noted above.
+
 Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `command-code`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
 

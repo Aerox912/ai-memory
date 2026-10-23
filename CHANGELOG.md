@@ -11,13 +11,74 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-## [3.2.0-aerox.1] - 2026-10-22
+## [3.2.1-aerox.1] - 2026-10-23
 
 ### Aerox fork integration
 
-- Integrated canonical AI Memory v3.2.0 while retaining the managed pool and
-  runtime-only credential patches. Built locally for the managed Windows and
-  WSL installs.
+- Integrated canonical AI Memory v3.2.1 while retaining the managed pool and
+  runtime-only credential routing used by agent-system's isolated WSL installs.
+
+## [3.2.1] - 2026-10-22
+
+### Fixed
+
+- Fixed a 3.2.0 regression that serialized local document embedding and
+  dropped the vector stream from queries that raced a document embed: the
+  local embedder's capacity was hardcoded to two slots (one document, one
+  query), and a query finding both busy degraded instantly to lexical
+  search. The scheduler is now sized from the CPU (half the available
+  parallelism, clamped to between 2 and 6 slots, documents capped at
+  capacity minus one so a slot stays query-reserved), and a query waits up
+  to 250 ms for a slot before degrading. On the affected LongMemEval-S
+  question set this restores query latency (p50/p95 66/87 ms vs 3.2.0's
+  118/295) and ingest throughput; the reported hit@5 delta (0.947 → 0.938)
+  traces to rank-boundary questions that flip between identical runs, not
+  a deterministic ranking change (#1580).
+
+- Fixed `ai-memory run` (and `show`, `continue`, `resume`, `workstreams`,
+  `rename-workstream`) failing on Windows Docker installs with "managed
+  claude executable `claude` was not found in the host PATH": the PowerShell
+  wrapper sent every subcommand into the Linux helper container, which has no
+  host CLIs. It now intercepts the same six commands `bin/ai-memory` does and
+  runs them through the native Windows client, resolved from
+  `AI_MEMORY_NATIVE_BIN` or the documented
+  `%LOCALAPPDATA%\Programs\ai-memory` install location, inheriting
+  `AI_MEMORY_SERVER_URL` (an explicit value wins) and exiting with the
+  child's code. A missing client fails with the documented installer command
+  instead of entering the container; the POSIX wrapper's Git Bash refusal
+  points at the same installer; and the missing-harness error's Docker
+  advice is now OS-aware: on Windows it names the native-client installer
+  rather than `ai-memory upgrade`, which in the `.ps1` wrapper only pulls
+  the image. Managed launches keep the hook/MCP wiring rendered through the
+  container (the wrapper sets `AI_MEMORY_RUN_AUTOWIRE=false` for the
+  intercepted commands unless the operator set it). (#1545)
+
+- Corrected four statements in `SECURITY.md` that no longer matched the
+  code, plus two clarifications in the same sections (#1561). The
+  `AI_MEMORY_ALLOWED_HOSTS` default is `localhost`, `127.0.0.1`, and `::1`;
+  request bodies are capped at 10 MB on `/mcp`, `/hook` and `/workstream/*`,
+  32 MB on `/admin/*`, and 2 MB elsewhere; the auth ladder is anonymous,
+  root bearer, proxy-asserted user, and `aim_` database-user tokens (the
+  server itself never validates OIDC tokens, and the doc no longer says it
+  does); and the "no per-user or per-project ACLs" claim became the current
+  truth about per-project access modes and grants, including that
+  proxy-asserted identities are not subject to them. The bearer-check note
+  now lists the routes that are public by design (`/healthz`, `/auth/login`,
+  `/auth/recovery`, `/favicon.ico`, custom `/web` static assets).
+- Completed the egress inventory in `DATA_HANDLING.md` and documented the
+  default first-start behavior it omitted (#1560). A default install now
+  says plainly that the local embedder downloads its three model files
+  (~87 MB, sha256-pinned) from `huggingface.co` in the background on first
+  start, that nothing stored is sent, and how to avoid it
+  (`embedding_provider = "none"` or offline pre-seeding). The export table
+  gained the rows it was missing: the `llm_provider` pipeline (including
+  the `codex`, `copilot` and `cursor` CLI-backed providers), the `copilot`
+  embedding provider, and `[[admission_webhooks]]`, plus notes on
+  `ai-memory upgrade`'s GitHub release query, the OAuth/OIDC login flows,
+  and remote `server_url` topologies. `docs/airgapped-install.md`'s
+  runtime summary was corrected to match.
+
+## [3.2.0] - 2026-10-21
 
 ### Added
 
@@ -1970,8 +2031,10 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v3.2.0-aerox.1...codex/upstream-20260907
-[3.2.0-aerox.1]: https://github.com/Aerox912/ai-memory/compare/v3.2.0...codex/upstream-20260907
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v3.2.1-aerox.1...codex/upstream-20260907
+[3.2.1-aerox.1]: https://github.com/Aerox912/ai-memory/compare/v3.2.1...codex/upstream-20260907
+[3.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.1
+[3.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.0
 [3.1.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.2
 [3.1.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.1
 [3.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.1.0

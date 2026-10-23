@@ -16,7 +16,9 @@ use ai_memory_hooks::{
     CLIENT_MARKER_HEADER, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore,
     WorkstreamState, hook_router, workstream_router,
 };
-use ai_memory_llm::{Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder};
+use ai_memory_llm::{
+    Embedder, EmbeddingCapacity, LlmProvider, ProviderHealth, build_embedder, local_capacity,
+};
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
     AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
@@ -1679,6 +1681,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 mid_session_routing: config.routing.mid_session,
                 profile: config.profile.clone(),
                 ingest_drop_list: (*config.ingest.drop_list).clone(),
+                // Benchmark-only escape (docs/benchmarks/README.md), read once
+                // here so the hooks crate keeps making no environment reads.
+                skip_wiki_checkpoints: benchmark_skip_wiki_checkpoints(),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -2955,6 +2960,20 @@ fn auto_improve_review_config_from_settings(
     }
 }
 
+/// The retrieval-benchmark escape hatch (docs/benchmarks/README.md): the
+/// LongMemEval harness replays ~24k session ends through one server, and
+/// each SessionEnd auto-commit walks a wiki tree and object database that
+/// keep growing, which dominates ingest wall clock. `retrieval` never
+/// reads git history, so the harness runs its servers with this variable
+/// set and the commits skipped. Read once at startup; nothing else may
+/// read it, and no product path sets it.
+fn benchmark_skip_wiki_checkpoints() -> bool {
+    matches!(
+        std::env::var("AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 async fn configure_embedder(
     config: &Config,
     store: &Store,
@@ -3063,10 +3082,15 @@ async fn configure_embedder(
     );
     let embedder = provider_health.wrap_embedder(embedder, provider_name, model, dim);
     let embedder: Arc<dyn Embedder> = if is_local {
-        // all-MiniLM inference parallelizes internally. A single background
-        // document slot plus one reserved query slot avoids CPU oversubscription
-        // while keeping interactive vector retrieval available during writes.
-        Arc::new(EmbeddingCapacity::new(embedder, 2)?)
+        // all-MiniLM inference parallelizes internally, so capacity bounds
+        // concurrent calls rather than threads. Sizing from the CPU count
+        // recovers the ingest throughput a single background document slot
+        // lost (#1580) while keeping one slot query-reserved; see
+        // `local_capacity` for the halve-and-clamp rationale.
+        let cores = std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(4);
+        Arc::new(EmbeddingCapacity::new(embedder, local_capacity(cores))?)
     } else {
         embedder
     };
