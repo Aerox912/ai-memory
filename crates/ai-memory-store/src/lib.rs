@@ -12,7 +12,7 @@
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 mod api_credentials;
 mod auto_improve;
@@ -63,13 +63,14 @@ pub use maintenance::MaintenanceJob;
 pub use ops::{
     AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalUpsert,
     DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite, EntityBackfillSummary,
-    HookSessionAdmission, IdentityResolution, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MAX_PENDING_INBOX_MESSAGES, MoveSessionSummary, MoveSummary, ObservationPruneOutcome,
-    OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary,
-    PagesMode, ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary,
-    ReorgSummary, RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate,
-    SessionTimesSkipReason, SkippedSessionTimes, StaleAfterRepair, backfill_entity_index,
-    backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
+    HookSessionAdmission, IdentityResolution, IdleEndAction, IdleEndCandidate, IdleEndResult,
+    IngestObservationOutcome, LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
+    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
+    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_ENTRIES_LIMIT, PROFILE_HARVEST_BATCH,
@@ -85,20 +86,21 @@ pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
     AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
-    DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
-    GraphVia, HealthDetail, HealthPage, HybridSearch, InboxCount, InboxEntry, ObservationHit,
-    ObservationOrder, ObservationPage, ObservationPageResult, ObservationProjectionTotals,
-    ObservationRecord, OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PageAuthor, PageFilter,
-    PageHit, PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
-    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
-    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
-    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
-    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
-    SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionPromptTitles, SessionSummary, SessionToolTitles, SettledPage, StatusCounts,
-    StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes,
+    CrossProjectEdge, DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount,
+    FeedbackFinding, GraphVia, HealthDetail, HealthPage, HybridSearch, IdleOpenSession, InboxCount,
+    InboxEntry, LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder,
+    ObservationPage, ObservationPageResult, ObservationProjectionTotals, ObservationRecord,
+    OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor,
+    PageFilter, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary,
+    PageVersion, PageVersionBody, PageVersions, ProjectCoordinateCollisionReason,
+    ProjectCoordinateDiagnostic, ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH,
+    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
+    RrfContributions, SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow,
+    SearchExplain, SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary,
+    SessionDependentRows, SessionEndDisposition, SessionKindSummary, SessionLine,
+    SessionObservationSnapshot, SessionPromptTitles, SessionSummary, SessionToolTitles,
+    SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings,
+    VectorQuery, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -109,14 +111,17 @@ pub use scope::{
     lookup_existing_workspace, lookup_global_scope, lookup_profile_scope,
     resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
-pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
+pub use session_consolidation::{
+    SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, enqueue_in_tx,
+};
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
     LinkOrAdoptManagedRunSession, ManagedRunAuthority, ManagedRunContext, ManagedRunSessionLink,
-    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
-    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamSelection, WorkstreamSelector,
+    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -170,6 +175,14 @@ impl Store {
         conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+        // Writer transactions start IMMEDIATE: a deferred transaction that
+        // has already read cannot wait through the busy handler when it
+        // upgrades to write, so another process holding the write lock (an
+        // external `wal_checkpoint(TRUNCATE)`, a sqlite3 shell) failed hook
+        // admission at once with "database is locked". IMMEDIATE takes the
+        // lock at BEGIN, where `busy_timeout` applies. Refinery's
+        // per-migration transactions below inherit it unchanged otherwise.
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
 
         // SQLite cannot disable FK enforcement inside refinery's per-migration
         // transaction. Keep it off while migrations rebuild tables, then enable
@@ -209,6 +222,14 @@ impl Store {
             tracing::info!(
                 projects = coordinate_keys,
                 "project coordinate keys backfilled"
+            );
+        }
+        let cjk_backfill = ops::backfill_cjk_indexes(&mut conn)?;
+        if cjk_backfill.pages > 0 || cjk_backfill.observations > 0 {
+            tracing::info!(
+                pages = cjk_backfill.pages,
+                observations = cjk_backfill.observations,
+                "CJK search indexes backfilled"
             );
         }
 
@@ -275,9 +296,9 @@ mod tests {
     use ai_memory_core::{
         ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
         ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
-        ObservationId, ObservationKind, PageEvidence, PageEvidenceKind, PageId, PagePath,
-        ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
-        WorkstreamId,
+        ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageEvidenceKind, PageId,
+        PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId,
+        WorkstreamEventKind, WorkstreamId,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -3210,6 +3231,146 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn structured_filters_hold_in_vector_and_both_graph_directions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "filters", None)
+            .await
+            .unwrap();
+
+        for path in ["kept/vector.md", "other/vector.md"] {
+            let id = store
+                .writer
+                .upsert_page(sample_page(ws, proj, path, "vector-only content"))
+                .await
+                .unwrap();
+            store
+                .writer
+                .store_embedding(
+                    id,
+                    f32_vec_to_bytes(&[1.0, 0.0]),
+                    "test".into(),
+                    "two-dim".into(),
+                    2,
+                )
+                .await
+                .unwrap();
+        }
+        let query_vector = [1.0, 0.0];
+        let (vector_hits, _) = store
+            .reader
+            .hybrid_search_scopes(
+                &[(ws, proj)],
+                HybridSearch {
+                    query: "no-lexical-match",
+                    vector: Some(VectorQuery {
+                        vector: &query_vector,
+                        provider: "test",
+                        model: "two-dim",
+                        dim: 2,
+                    }),
+                    limit: 10,
+                    expiry_cutoff_us: None,
+                    include_superseded: false,
+                    explain: true,
+                    owner: &OwnerFilter::Any,
+                    filter: PageFilter {
+                        path_prefix: Some("kept/"),
+                        ..PageFilter::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(vector_hits.len(), 1, "{vector_hits:?}");
+        assert_eq!(vector_hits[0].0.path.as_str(), "kept/vector.md");
+        assert_eq!(
+            vector_hits[0]
+                .1
+                .as_ref()
+                .and_then(|details| details.vector_rank),
+            Some(1)
+        );
+
+        let tagged = |path: &str, body: &str, tag: &str| {
+            let mut page = sample_page(ws, proj, path, body);
+            page.frontmatter_json = serde_json::json!({"tags": [tag]});
+            page
+        };
+        let mut seed = tagged("graph/seed.md", "graphneedle source", "route");
+        seed.links = vec![
+            PagePath::new("graph/out.md").unwrap().into(),
+            PagePath::new("graph/out-denied.md").unwrap().into(),
+        ];
+        store.writer.upsert_page(seed).await.unwrap();
+        store
+            .writer
+            .upsert_page(tagged("graph/out.md", "outgoing target", "route"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(tagged(
+                "graph/out-denied.md",
+                "excluded outgoing target",
+                "other",
+            ))
+            .await
+            .unwrap();
+        for (path, tag) in [("graph/in.md", "route"), ("graph/in-denied.md", "other")] {
+            let mut incoming = tagged(path, "incoming pointer", tag);
+            incoming.links = vec![PagePath::new("graph/seed.md").unwrap().into()];
+            store.writer.upsert_page(incoming).await.unwrap();
+        }
+
+        let (graph_hits, _) = store
+            .reader
+            .hybrid_search_scopes(
+                &[(ws, proj)],
+                HybridSearch {
+                    query: "graphneedle",
+                    vector: None,
+                    limit: 10,
+                    expiry_cutoff_us: None,
+                    include_superseded: false,
+                    explain: true,
+                    owner: &OwnerFilter::Any,
+                    filter: PageFilter {
+                        tag: Some("route"),
+                        ..PageFilter::default()
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let graph_paths: std::collections::HashSet<_> = graph_hits
+            .iter()
+            .map(|(hit, _)| hit.path.as_str())
+            .collect();
+        assert_eq!(
+            graph_paths,
+            ["graph/seed.md", "graph/out.md", "graph/in.md"]
+                .into_iter()
+                .collect()
+        );
+        for path in ["graph/out.md", "graph/in.md"] {
+            let details = graph_hits
+                .iter()
+                .find(|(hit, _)| hit.path.as_str() == path)
+                .and_then(|(_, details)| details.as_ref())
+                .unwrap();
+            assert!(details.graph_rank.is_some(), "{path}: {details:?}");
+        }
+    }
+
     /// P3 (docs/design-hindsight-borrowings.md): a typed edge (`fixes`) is
     /// surfaced as the graph_via `edge` kind in explain. Ranking is untouched;
     /// only the explanation names why the neighbour was reached.
@@ -4793,6 +4954,78 @@ mod tests {
         assert_eq!(s.project_name, "my-project");
         assert_eq!(s.page_count, 2);
         assert!(s.last_updated.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_projects_and_workspaces_with_stats_hide_expired_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let mixed = store
+            .writer
+            .get_or_create_project(ws, "mixed", None)
+            .await
+            .unwrap();
+        let expired_only = store
+            .writer
+            .get_or_create_project(ws, "expired-only", None)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_second();
+        let at = |seconds: i64| Some(jiff::Timestamp::from_second(seconds).unwrap());
+
+        for (path, expires_at) in [
+            ("expired.md", at(now - 60)),
+            ("future.md", at(now + 3_600)),
+            ("live.md", None),
+        ] {
+            let mut page = sample_page(ws, mixed, path, "body");
+            page.expires_at = expires_at;
+            store.writer.upsert_page(page).await.unwrap();
+        }
+
+        let mut only = sample_page(ws, expired_only, "stale.md", "stale body");
+        only.expires_at = at(now - 120);
+        store.writer.upsert_page(only).await.unwrap();
+
+        // Project summaries omit the expired pages from page_count and last_updated.
+        let summaries = store.reader.list_projects_with_stats(None).await.unwrap();
+        assert_eq!(summaries.len(), 2);
+
+        let mixed_summary = summaries
+            .iter()
+            .find(|s| s.project_name == "mixed")
+            .expect("mixed project summary");
+        assert_eq!(mixed_summary.page_count, 2);
+        assert!(mixed_summary.last_updated.is_some());
+
+        let expired_summary = summaries
+            .iter()
+            .find(|s| s.project_name == "expired-only")
+            .expect("expired-only project summary");
+        assert_eq!(expired_summary.page_count, 0);
+        assert_eq!(expired_summary.last_updated, None);
+
+        // Filtered by workspace matches.
+        let ws_projects = store
+            .reader
+            .list_projects_with_stats_for_workspace("default".to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(ws_projects.len(), 2);
+
+        // Workspace aggregates count only unexpired pages across projects.
+        let ws_summaries = store.reader.list_workspaces_with_stats(None).await.unwrap();
+        assert_eq!(ws_summaries.len(), 1);
+        assert_eq!(ws_summaries[0].workspace_name, "default");
+        assert_eq!(ws_summaries[0].project_count, 2);
+        assert_eq!(ws_summaries[0].page_count, 2);
+        assert!(ws_summaries[0].last_updated.is_some());
     }
 
     /// #1208: a project id is an address, so it must be exposed exactly where
@@ -7152,6 +7385,72 @@ mod tests {
         }
     }
 
+    /// The column prefixes the event search strips are filters only at the
+    /// start of a word. `subtitle:rendering` used to lose its `title:` and
+    /// search for `subrendering`, and `somebody: help` lost the word
+    /// `somebody`.
+    #[tokio::test]
+    async fn search_events_keeps_words_that_end_in_a_column_name() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-search-words").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .finish_workstream_run(
+                ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                complete_finish(
+                    run.run_id,
+                    vec![
+                        managed_event(
+                            "ev-1",
+                            AgentKind::Codex,
+                            "native-x",
+                            "subtitle rendering broke",
+                        ),
+                        managed_event("ev-2", AgentKind::Codex, "native-x", "somebody asked"),
+                        managed_event("ev-3", AgentKind::Codex, "native-x", "unrelated"),
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+
+        let search = |query: &str| {
+            let reader = store.reader.clone();
+            let query = query.to_string();
+            let workstream_id = run.workstream_id;
+            async move {
+                reader
+                    .search_workstream_events(
+                        workstream_id,
+                        query,
+                        10,
+                        ai_memory_core::Sanitizer::default(),
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.event_id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(search("subtitle:rendering").await, ["ev-1"]);
+        assert_eq!(search("somebody:").await, ["ev-2"]);
+        // A real column prefix is still stripped, including inside a group.
+        assert_eq!(search("(title:somebody)").await, ["ev-2"]);
+    }
+
     #[tokio::test]
     async fn link_native_session_rejects_blank_wrong_agent_and_inactive_targets() {
         let tmp = TempDir::new().unwrap();
@@ -8607,6 +8906,108 @@ mod tests {
         let derived = store.reader.derived_index_status().await.unwrap();
         assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
         assert_eq!(derived.latest_pages_unembeddable, 1, "{derived:?}");
+    }
+
+    /// A model swap must not read as a covered index: with the configured
+    /// `(provider, model, dim)` triple, a latest page whose only vector is
+    /// from another triple counts as missing, while the historical `None`
+    /// count (no vector at all) is unchanged.
+    #[tokio::test]
+    async fn missing_embeddings_counted_against_configured_triple() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "s", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/stale.md", "body a"))
+            .await
+            .unwrap();
+
+        let db = rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        let insert_embedding = |path: &str, provider: &str, model: &str, dim: u32| {
+            let page_id: Vec<u8> = db
+                .query_row(
+                    "SELECT id FROM pages WHERE path = ?1 AND is_latest = 1",
+                    [path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            db.execute(
+                "INSERT INTO page_embeddings (page_id, vector, provider, model, dim, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0) \
+                 ON CONFLICT(page_id) DO UPDATE SET \
+                     vector = excluded.vector, provider = excluded.provider, \
+                     model = excluded.model, dim = excluded.dim, \
+                     created_at = excluded.created_at",
+                rusqlite::params![
+                    page_id,
+                    crate::f32_vec_to_bytes(&vec![0.5f32; dim as usize]),
+                    provider,
+                    model,
+                    dim,
+                ],
+            )
+            .unwrap();
+        };
+        // One latest page whose only vector is triple A.
+        let triple_a = ("prov-a".to_string(), "model-a".to_string(), 8);
+        let triple_b = ("prov-b".to_string(), "model-b".to_string(), 16);
+        insert_embedding("notes/stale.md", "prov-a", "model-a", 8);
+
+        // Historical behaviour: the page carries a vector, so nothing is
+        // missing.
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
+
+        // Configured triple A: the page is covered by its own vector.
+        let derived = store
+            .reader
+            .derived_index_status_for_embedding(triple_a.clone())
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
+
+        // Configured triple B: the same page now counts as missing — its
+        // only vector is stale for the model in use.
+        let derived = store
+            .reader
+            .derived_index_status_for_embedding(triple_b.clone())
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+
+        // A second page under triple B only: each configured triple then
+        // sees exactly the page holding the other triple's vector, and a
+        // page covered by its own triple never counts.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/fresh.md", "body b"))
+            .await
+            .unwrap();
+        insert_embedding("notes/fresh.md", "prov-b", "model-b", 16);
+        let derived = store
+            .reader
+            .derived_index_status_for_embedding(triple_a.clone())
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+        let derived = store
+            .reader
+            .derived_index_status_for_embedding(triple_b.clone())
+            .await
+            .unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 1, "{derived:?}");
+        let derived = store.reader.derived_index_status().await.unwrap();
+        assert_eq!(derived.latest_pages_missing_embeddings, 0, "{derived:?}");
     }
 
     /// Typed edges surface in the derived status by relation.

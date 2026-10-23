@@ -120,6 +120,14 @@ pub async fn embed_search_query(embedder: &dyn Embedder, query: &str) -> Option<
             model: embedder.model_identity(),
             dim: embedder.dim(),
         }),
+        Err(LlmError::CapacityBusy(_)) => {
+            debug!(
+                provider = embedder.provider(),
+                model = embedder.model(),
+                "embedding capacity busy; degrading search to FTS5 + entity + graph"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(
                 provider = embedder.provider(),
@@ -156,6 +164,7 @@ impl OpenAiEmbedder {
         // sub-second. When the embedder still fails, memory_query
         // degrades gracefully to FTS5 + entity + graph (see server.rs).
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self {
@@ -275,10 +284,61 @@ pub(crate) fn parse_openai_embedding_values(body: &str, status: u16) -> LlmResul
     Ok(first.embedding)
 }
 
+/// Retried statuses for every remote embedder's request: a rate limit and a
+/// transient "out of capacity" answer. Everything else — other 4xx and
+/// 5xx — is handled exactly as before: no retry.
+fn is_retryable_embedding_status(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// Cap for a single wait taken from `Retry-After`; larger values are
+/// clamped so one bad header cannot stall a call for minutes.
+const MAX_RETRY_AFTER_SECS: u64 = 32;
+
+/// Total wait budget for one embedding call: the worst case of the
+/// previous fixed backoff (2+4+8+16+32). When the next wait would push
+/// the call past this, the loop gives up and returns the error of the
+/// last status, so search (`embed_search_query`) and the inline
+/// write-page embed never wait longer than a 429 storm already could.
+const MAX_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(62);
+
+/// Decide the wait before the next attempt of a remote embedding request
+/// (every HTTP embedder shares this policy), or give up.
+///
+/// Only 429 and 503 are retriable ([`is_retryable_embedding_status`]).
+/// `attempt` is the 1-based index of the attempt being decided: up to
+/// five new attempts are allowed, and attempt 6 is already past the
+/// budget of retries. A whole-second `Retry-After` header (e.g.
+/// `Retry-After: 5`) is honoured, clamped to [`MAX_RETRY_AFTER_SECS`];
+/// a missing header, a non-whole-second value (the HTTP-date form is not
+/// supported) or an unparseable one falls back to the historical
+/// `2^attempt` seconds (2, 4, 8, 16, 32). `None` means the call should
+/// stop and report the last status: a non-retriable status, more than
+/// five new attempts, or `waited + delay` exceeding
+/// [`MAX_RETRY_WAIT_BUDGET`].
+pub(crate) fn retry_delay(
+    status: reqwest::StatusCode,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+    attempt: u32,
+    waited: Duration,
+) -> Option<Duration> {
+    if !is_retryable_embedding_status(status.as_u16()) || attempt > 5 {
+        return None;
+    }
+    let delay = match retry_after
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(secs) => Duration::from_secs(secs.min(MAX_RETRY_AFTER_SECS)),
+        None => Duration::from_secs(2u64.saturating_pow(attempt)),
+    };
+    (waited + delay <= MAX_RETRY_WAIT_BUDGET).then_some(delay)
+}
+
 /// Shared OpenAI-shape embedding request: head-truncate, POST
 /// `/embeddings` (bearer auth only when a key is present — local
-/// engines such as Ollama and LM Studio run keyless), retry 429 with
-/// backoff, parse, dim-check, unit-normalise.
+/// engines such as Ollama and LM Studio run keyless), retry 429 and 503
+/// honouring `Retry-After`, parse, dim-check, unit-normalise.
 async fn openai_style_embed(
     client: &reqwest::Client,
     base_url: &str,
@@ -300,6 +360,7 @@ async fn openai_style_embed(
         model,
     };
     let mut attempt = 0u32;
+    let mut waited = Duration::ZERO;
     loop {
         let mut builder = client.post(&url);
         if let Some(key) = api_key {
@@ -307,10 +368,18 @@ async fn openai_style_embed(
         }
         let resp = builder.json(&req).send().await?;
         let status = resp.status();
-        if status.as_u16() == 429 && attempt < 5 {
+        // Read the header while the response is still owned here: nothing
+        // below may consume the body before the wait is decided.
+        let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+        if let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) {
             attempt += 1;
-            let delay = Duration::from_secs(2u64.saturating_pow(attempt));
-            debug!(attempt, ?delay, "openai embeddings rate-limited; retrying");
+            waited += delay;
+            debug!(
+                attempt,
+                ?delay,
+                status = status.as_u16(),
+                "openai embeddings 429/503; retrying"
+            );
             tokio::time::sleep(delay).await;
             continue;
         }
@@ -443,6 +512,7 @@ impl OpenAiCompatEmbedder {
         // Same cold-load tolerance as OpenAiEmbedder: first request
         // after an Ollama model unload can take ~30s.
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self {
@@ -555,6 +625,7 @@ impl VoyageEmbedder {
         // sub-second. When the embedder still fails, memory_query
         // degrades gracefully to FTS5 + entity + graph (see server.rs).
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .timeout(Duration::from_secs(120))
             .build()?;
         Ok(Self {
@@ -574,6 +645,10 @@ impl VoyageEmbedder {
     }
 }
 
+/// Sent without a client-side cut: Voyage's `truncation` defaults to true and
+/// shortens an over-long input to the model's own context (4k-32k tokens), so
+/// the shared 8 KB head cut would only discard text the model can embed.
+/// <https://docs.voyageai.com/docs/embeddings>
 #[derive(Debug, Serialize)]
 struct VoyageRequest<'a> {
     input: [&'a str; 1],
@@ -610,13 +685,31 @@ impl Embedder for VoyageEmbedder {
             input: [text],
             model: &self.model,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(self.api_key.expose_secret())
-            .json(&req)
-            .send()
-            .await?;
+        let mut attempt = 0u32;
+        let mut waited = Duration::ZERO;
+        let resp = loop {
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(self.api_key.expose_secret())
+                .json(&req)
+                .send()
+                .await?;
+            let status = resp.status();
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+            let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) else {
+                break resp;
+            };
+            attempt += 1;
+            waited += delay;
+            debug!(
+                attempt,
+                ?delay,
+                status = status.as_u16(),
+                "voyage embeddings 429/503; retrying"
+            );
+            tokio::time::sleep(delay).await;
+        };
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
@@ -762,6 +855,144 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
+    fn header(value: &'static str) -> reqwest::header::HeaderValue {
+        reqwest::header::HeaderValue::from_static(value)
+    }
+
+    #[test]
+    fn retry_delay_honours_whole_second_retry_after_on_429_and_503() {
+        let five = Duration::from_secs(5);
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(429).unwrap(),
+                Some(&header("5")),
+                1,
+                Duration::ZERO
+            ),
+            Some(five)
+        );
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(503).unwrap(),
+                Some(&header("5")),
+                1,
+                Duration::ZERO
+            ),
+            Some(five)
+        );
+    }
+
+    #[test]
+    fn retry_delay_clamps_retry_after_to_the_per_wait_cap() {
+        let capped = Duration::from_secs(32);
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(429).unwrap(),
+                Some(&header("120")),
+                1,
+                Duration::ZERO
+            ),
+            Some(capped)
+        );
+        assert_eq!(
+            retry_delay(
+                reqwest::StatusCode::from_u16(503).unwrap(),
+                Some(&header("120")),
+                1,
+                Duration::ZERO
+            ),
+            Some(capped)
+        );
+    }
+
+    #[test]
+    fn retry_delay_falls_back_to_exponential_backoff_without_a_valid_header() {
+        let status = reqwest::StatusCode::from_u16(503).unwrap();
+        // Missing header: the historical 2^attempt seconds.
+        assert_eq!(
+            retry_delay(status, None, 1, Duration::ZERO),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay(status, None, 3, Duration::ZERO),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            retry_delay(status, None, 5, Duration::ZERO),
+            Some(Duration::from_secs(32))
+        );
+        // A non-whole-second value is not supported (HTTP-date form):
+        // same fallback as an absent header.
+        assert_eq!(
+            retry_delay(status, Some(&header("abc")), 1, Duration::ZERO),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            retry_delay(
+                status,
+                Some(&header("Wed, 21 Oct 2015 07:28:00 GMT")),
+                1,
+                Duration::ZERO
+            ),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn retry_delay_refuses_non_retriable_statuses() {
+        let header5 = Some(&header("5"));
+        for status in [400u16, 404, 500, 502] {
+            let code = reqwest::StatusCode::from_u16(status).unwrap();
+            assert_eq!(
+                retry_delay(code, header5, 1, Duration::ZERO),
+                None,
+                "status {status}"
+            );
+            assert_eq!(
+                retry_delay(code, None, 1, Duration::ZERO),
+                None,
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_delay_stops_after_five_new_attempts() {
+        let status = reqwest::StatusCode::from_u16(503).unwrap();
+        assert_eq!(
+            retry_delay(status, Some(&header("0")), 5, Duration::from_secs(30)),
+            Some(Duration::ZERO),
+            "attempt 5 stays inside the attempt cap and the 62 s budget"
+        );
+        assert_eq!(
+            retry_delay(status, Some(&header("0")), 6, Duration::ZERO),
+            None
+        );
+        assert_eq!(retry_delay(status, None, 6, Duration::ZERO), None);
+        assert_eq!(retry_delay(status, None, 7, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn retry_delay_gives_up_when_the_wait_budget_is_exhausted() {
+        let status = reqwest::StatusCode::from_u16(503).unwrap();
+        // 35 s already waited plus a 30 s Retry-After would reach 65 s.
+        assert_eq!(
+            retry_delay(status, Some(&header("30")), 1, Duration::from_secs(35)),
+            None
+        );
+        // A clamped 120 s header (32 s) after 32 s already waited: 64 s > 62 s.
+        assert_eq!(
+            retry_delay(status, Some(&header("120")), 2, Duration::from_secs(32)),
+            None
+        );
+        // Boundary control: the previous worst case (30 s waited + 32 s)
+        // still fits the budget, so behaviour is unchanged at the limit.
+        assert_eq!(
+            retry_delay(status, None, 5, Duration::from_secs(30)),
+            Some(Duration::from_secs(32))
+        );
+    }
+
     #[test]
     fn document_prefix_identity_is_unchanged_when_the_prefix_is_empty() {
         // The legacy-identity guarantee: an install with no document
@@ -898,6 +1129,36 @@ mod tests {
         e.embed_query("find the runbook")
             .await
             .expect("embed_query succeeds");
+    }
+
+    /// Voyage truncates server side by default, so a long page goes out whole
+    /// rather than through the 8 KB head cut the other HTTP embedders need.
+    #[tokio::test]
+    async fn voyage_embedder_sends_a_long_input_whole() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let page = "word ".repeat(8_000);
+        let expected = page.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(move |req: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert_eq!(body["input"][0], expected.as_str());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{ "embedding": [0.6_f32, 0.8] }],
+                }))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let e = VoyageEmbedder::new(SecretString::from("test-key"), "voyage-3-large", 2)
+            .unwrap()
+            .with_base_url(server.uri());
+
+        e.embed(&page).await.expect("voyage embed succeeds");
     }
 
     #[tokio::test]

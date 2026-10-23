@@ -405,6 +405,8 @@ jobs:
       - run: python3 scripts/test_changelog_frozen.py
       - name: released sections stay frozen
         run: scripts/check-changelog-frozen.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
+      - name: released database migrations stay frozen
+        run: scripts/check-migrations-immutable.sh "origin/${{ github.base_ref || github.event.repository.default_branch }}"
 
   # End-to-end docker smoke: packages the release-build binary and confirms
   # the image runs. Catches Dockerfile drift (missing COPY, bad ENTRYPOINT)

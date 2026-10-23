@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use crate::auth::CopilotAuth;
 use crate::auth_file::{load_entry, now_ms, save_entry};
 use crate::embedding::{
-    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values,
+    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values, retry_delay,
 };
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
@@ -210,6 +210,7 @@ impl CopilotAuthState {
             )));
         }
         let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
             .user_agent(COPILOT_USER_AGENT)
             .build()
             .map_err(LlmError::from)?;
@@ -254,7 +255,13 @@ impl CopilotAuthState {
             })?;
 
         info!("copilot API token expired or missing, exchanging GitHub token");
-        let exchanged = exchange_copilot_token(&self.client, self.timeout, &github).await?;
+        let exchanged = exchange_copilot_token(
+            &self.client,
+            self.timeout,
+            &github,
+            GITHUB_COPILOT_TOKEN_URL,
+        )
+        .await?;
         guard.copilot_access = Some(exchanged.access.clone());
         guard.copilot_expires_at_ms = Some(exchanged.expires_at_ms);
         guard.api_base_url = Some(resolve_copilot_api_base_url(
@@ -579,6 +586,7 @@ impl Embedder for CopilotEmbedder {
             model: &self.model,
         };
         let mut attempt = 0u32;
+        let mut waited = Duration::ZERO;
         loop {
             let resp = self
                 .state
@@ -592,10 +600,16 @@ impl Embedder for CopilotEmbedder {
                 .await
                 .map_err(LlmError::from)?;
             let status = resp.status();
-            if status.as_u16() == 429 && attempt < 5 {
+            let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER);
+            if let Some(delay) = retry_delay(status, retry_after, attempt + 1, waited) {
                 attempt += 1;
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
-                debug!(attempt, ?delay, "copilot embeddings rate-limited; retrying");
+                waited += delay;
+                debug!(
+                    attempt,
+                    ?delay,
+                    status = status.as_u16(),
+                    "copilot embeddings 429/503; retrying"
+                );
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -638,9 +652,10 @@ async fn exchange_copilot_token(
     client: &reqwest::Client,
     timeout: Duration,
     github_token: &SecretString,
+    token_url: &str,
 ) -> LlmResult<CopilotApiToken> {
     let resp = client
-        .get(GITHUB_COPILOT_TOKEN_URL)
+        .get(token_url)
         .timeout(timeout)
         .bearer_auth(github_token.expose_secret())
         .headers(copilot_token_exchange_headers())
@@ -650,6 +665,16 @@ async fn exchange_copilot_token(
     let status = resp.status();
     if !status.is_success() {
         let body = provider_error_body(resp).await;
+        // GitHub rate-limits this endpoint per account. A 429/5xx here says
+        // nothing about the credential, and `LlmError::Auth` is not transient,
+        // so classifying it as auth stops the fallback chain and tells the
+        // operator to fix a token that is fine.
+        if LlmError::status_is_transient(status.as_u16()) {
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body: format!("copilot token exchange: {body}"),
+            });
+        }
         return Err(LlmError::Auth(format!(
             "copilot token exchange failed ({status}): {body}"
         )));
@@ -1125,6 +1150,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn token_exchange_treats_a_throttled_endpoint_as_transient() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (code, transient) in [(429u16, true), (503, true), (401, false)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(code).set_body_string("{}"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let Err(err) = exchange_copilot_token(
+                &reqwest::Client::new(),
+                Duration::from_secs(5),
+                &SecretString::from("gho_test"),
+                &server.uri(),
+            )
+            .await
+            else {
+                panic!("{code} from the token endpoint must fail");
+            };
+
+            assert_eq!(err.is_transient(), transient, "{code}: {err:?}");
+            if transient {
+                assert_eq!(err.http_status(), Some(code), "{code}: {err:?}");
+                assert!(err.to_string().contains("copilot token exchange"), "{err}");
+            } else {
+                assert!(matches!(err, LlmError::Auth(_)), "{code}: {err:?}");
+            }
+        }
+    }
 
     #[test]
     fn token_file_round_trips_copilot_entry() {

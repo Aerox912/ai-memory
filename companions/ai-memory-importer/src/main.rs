@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use url::Url;
 use walkdir::WalkDir;
 
 mod agentmemory;
+mod document;
 mod mcp;
 #[cfg(test)]
 mod test_http;
@@ -45,6 +47,8 @@ enum Commands {
     AgentmemoryVault(agentmemory::vault::VaultArgs),
     /// Import an agentmemory `ExportData` JSON file.
     AgentmemoryExport(agentmemory::export::ExportArgs),
+    /// Extract one bounded local document into an attributed wiki page.
+    Document(document::DocumentArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -308,6 +312,7 @@ async fn main() -> Result<()> {
         Commands::ExternalConversation(args) => run_conversation(args).await,
         Commands::AgentmemoryVault(args) => agentmemory::vault::run(args).await,
         Commands::AgentmemoryExport(args) => agentmemory::export::run(args).await,
+        Commands::Document(args) => document::run(args).await,
     }
 }
 
@@ -951,8 +956,10 @@ fn write_manifest(path: &Path, entries: &[ManifestEntry]) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent
         && !parent.exists()
     {
         bail!(
@@ -960,23 +967,22 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             parent.display()
         );
     }
-    let tmp = temp_path_for(path)?;
-    fs::write(&tmp, bytes)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(err.into())
-        }
-    }
-}
-
-fn temp_path_for(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("manifest path must include a file name"))?;
-    Ok(path.with_file_name(format!(".{file_name}.tmp")))
+    let directory = parent.unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
 }
 
 fn plan_omc_wiki(
@@ -1104,10 +1110,20 @@ fn split_frontmatter(input: &str) -> Result<(Option<YamlMap>, String)> {
     let Some(rest) = rest else {
         return Ok((None, input.to_owned()));
     };
-    let Some(end) = rest.find(&close) else {
+    // The closing fence may also end the file with no line ending after it.
+    let split = if let Some(body) = rest.strip_prefix(&close[1..]) {
+        Some(("", body))
+    } else if rest == "---" {
+        Some(("", ""))
+    } else {
+        rest.find(&close)
+            .map(|end| (&rest[..end], &rest[end + close.len()..]))
+            .or_else(|| rest.strip_suffix("\n---").map(|yaml| (yaml, "")))
+    };
+    let Some((yaml, body)) = split else {
         return Ok((None, input.to_owned()));
     };
-    let yaml = rest[..end].trim_end_matches('\r');
+    let yaml = yaml.trim_end_matches('\r');
     let value: serde_json::Value =
         serde_saphyr::from_str_with_options(yaml, frontmatter_parse_options())
             .context("parse YAML frontmatter")?;
@@ -1115,7 +1131,7 @@ fn split_frontmatter(input: &str) -> Result<(Option<YamlMap>, String)> {
         serde_json::Value::Object(map) => Some(map),
         _ => None,
     };
-    Ok((map, rest[end + close.len()..].to_owned()))
+    Ok((map, body.to_owned()))
 }
 
 /// Read frontmatter the way `serde_yaml` 0.9 did, matching the server's
@@ -1155,9 +1171,51 @@ fn yaml_tags(map: &YamlMap) -> Vec<String> {
     }
 }
 fn first_h1(body: &str) -> Option<String> {
-    body.lines()
-        .find_map(|l| l.strip_prefix("# ").map(str::trim).map(str::to_owned))
+    first_h1_line(body)
+        .map(str::trim)
+        .map(str::to_owned)
         .filter(|s| !s.is_empty())
+}
+
+/// The text after `# ` on the first H1 line outside fenced code. Inside a
+/// fence a `# ` line is a shell or Python comment; fences follow CommonMark
+/// as the server's `derive_title` reads them (a run of 3+ backticks or
+/// tildes indented at most 3 spaces, closed by a bare run of the same glyph
+/// at least as long).
+fn first_h1_line(body: &str) -> Option<&str> {
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let marker = &line[indent..];
+        if let Some(glyph) = marker.chars().next().filter(|c| matches!(c, '`' | '~'))
+            && indent <= 3
+        {
+            let run = marker.chars().take_while(|&c| c == glyph).count();
+            let info = &marker[run..];
+            if run >= 3 {
+                match fence {
+                    // A backtick info string cannot hold a backtick: this is
+                    // an inline code span, not a fence.
+                    None if glyph == '`' && info.contains('`') => {}
+                    None => {
+                        fence = Some((glyph, run));
+                        continue;
+                    }
+                    Some((open, len)) if open == glyph && run >= len && info.trim().is_empty() => {
+                        fence = None;
+                        continue;
+                    }
+                    Some(_) => continue,
+                }
+            }
+        }
+        if fence.is_none()
+            && let Some(rest) = line.strip_prefix("# ")
+        {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 fn validate_source_rel(rel: &str) -> Result<()> {
@@ -1384,7 +1442,11 @@ impl ImportClient {
 }
 
 fn enc(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+    // Form encoding writes a space as `+`, which a URL path keeps literally;
+    // a literal `+` is already `%2B`, so every `+` left is a space.
+    url::form_urlencoded::byte_serialize(s.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20")
 }
 fn enc_path(s: &str) -> String {
     s.split('/').map(enc).collect::<Vec<_>>().join("/")
@@ -1393,6 +1455,16 @@ fn enc_path(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Path segments are percent-encoded: a space is `%20`. Form encoding's
+    /// `+` reaches the server as a literal `+`, so a project named "My App"
+    /// was looked up as "My+App".
+    #[test]
+    fn path_segments_encode_a_space_as_percent_20() {
+        assert_eq!(enc("My App"), "My%20App");
+        assert_eq!(enc("a+b"), "a%2Bb");
+        assert_eq!(enc_path("omc/my notes.md"), "omc/my%20notes.md");
+    }
     use crate::test_http::{read_http_request, respond_json};
     use std::net::TcpListener;
     use std::thread;
@@ -1422,6 +1494,38 @@ mod tests {
     }
 
     #[test]
+    fn atomic_manifest_write_replaces_existing_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manifest.json");
+        atomic_write(&path, b"first").unwrap();
+        atomic_write(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_manifest_write_does_not_follow_legacy_predictable_temp_symlink() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manifest.json");
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&victim, temp.path().join(".manifest.json.tmp")).unwrap();
+
+        atomic_write(&path, b"manifest").unwrap();
+
+        assert_eq!(fs::read_to_string(victim).unwrap(), "unchanged");
+        assert_eq!(fs::read(path).unwrap(), b"manifest");
+    }
+
+    #[test]
     fn parses_omc_frontmatter() {
         let parsed = parse_markdown("---\ntitle: T\nkind: rule\ntier: procedural\ntags: [a, b]\npinned: true\nextra: ignored\n---\n# Body\ntext").unwrap();
         assert_eq!(parsed.title.as_deref(), Some("T"));
@@ -1442,6 +1546,44 @@ mod tests {
         assert_eq!(parsed.tags, vec!["on"]);
 
         assert!(parse_markdown("---\ntitle: a\ntitle: b\n---\nbody").is_err());
+    }
+
+    /// A `# ` line inside fenced code is a shell or Python comment, not the
+    /// page's H1; the server's `derive_title` skips fences the same way.
+    #[test]
+    fn title_skips_comment_lines_inside_code_fences() {
+        let parsed = parse_markdown("```bash\n# install deps\nnpm i\n```\n# Real Title\n").unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("Real Title"));
+        let tilde = parse_markdown("~~~~\n# not it\n~~~\n# still code\n~~~~\n# Title\n").unwrap();
+        assert_eq!(tilde.title.as_deref(), Some("Title"));
+        let none = parse_markdown("```sh\n# just a comment\n```\nbody\n").unwrap();
+        assert_eq!(none.title, None);
+        let inline = parse_markdown("```code``` text\n# After\n").unwrap();
+        assert_eq!(inline.title.as_deref(), Some("After"));
+    }
+
+    /// A frontmatter-only page whose closing fence ends the file with no
+    /// final newline, which the server's parser has accepted since #1402.
+    #[test]
+    fn parses_omc_frontmatter_closed_at_end_of_file() {
+        let parsed = parse_markdown("---\ntitle: T\ntier: procedural\npinned: true\n---").unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("T"));
+        assert_eq!(parsed.tier.as_deref(), Some("procedural"));
+        assert!(parsed.pinned);
+        assert_eq!(parsed.body, "");
+
+        let crlf = parse_markdown("\u{feff}---\r\ntitle: T\r\n---").unwrap();
+        assert_eq!(crlf.title.as_deref(), Some("T"));
+        assert_eq!(crlf.body, "");
+
+        let not_a_fence = parse_markdown("---\ntitle: T\n----").unwrap();
+        assert_eq!(not_a_fence.title, None);
+
+        let empty = parse_markdown("---\n---").unwrap();
+        assert_eq!(empty.body, "");
+        let empty_with_body = parse_markdown("---\n---\n# Body\n").unwrap();
+        assert_eq!(empty_with_body.title.as_deref(), Some("Body"));
+        assert_eq!(empty_with_body.body, "# Body\n");
     }
 
     /// A wiki checked out on Windows with `core.autocrlf=true`, or saved

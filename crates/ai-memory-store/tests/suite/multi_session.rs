@@ -17,13 +17,13 @@
 //! core capability rather than a detail.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, HandoffAcceptance, HandoffState, IdentityKey, NewHandoff, NewPage,
-    NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier, UserRole, WorkspaceId,
-    owner_stamp,
+    ActorContext, AgentKind, FeedbackKind, HandoffAcceptance, HandoffState, IdentityKey,
+    NewHandoff, NewPage, NewSession, NewUser, OwnerFilter, PagePath, ProjectId, SessionId, Tier,
+    UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    ConditionalUpsert, LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PagePrecondition,
-    PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
+    ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    PagePrecondition, PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -928,6 +928,30 @@ async fn existing_latest_paths_reports_exactly_the_live_paths() {
         .await
         .unwrap();
     assert!(found.is_empty());
+
+    // An expired page is never reported as live.
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired page");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    let mut future_exp = page(ws, proj, "notes/future.md", "Future", "future page");
+    future_exp.expires_at = Some(jiff::Timestamp::from_second(4_102_444_800).unwrap());
+    store.writer.upsert_page(future_exp).await.unwrap();
+
+    let mut found = store
+        .reader
+        .existing_latest_paths(
+            ws,
+            proj,
+            vec![
+                "notes/expired.md".to_string(),
+                "notes/future.md".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    found.sort();
+    assert_eq!(found, vec!["notes/future.md"]);
 }
 
 /// The link guard's path probe is no existence oracle for a restricted
@@ -4238,4 +4262,277 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
             .unwrap()
             .is_empty()
     );
+}
+
+/// Open feedback findings ignore feedback attached to expired pages.
+#[tokio::test]
+async fn open_feedback_findings_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let live = page(ws, proj, "notes/live.md", "Live", "active content");
+    store.writer.upsert_page(live).await.unwrap();
+
+    let mut expired = page(ws, proj, "notes/expired.md", "Expired", "expired content");
+    expired.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired).await.unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/live.md").unwrap(),
+            FeedbackKind::Stale,
+            Some("live page is stale".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/expired.md").unwrap(),
+            FeedbackKind::Wrong,
+            Some("expired page was wrong".to_string()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    let findings = store.reader.open_feedback_findings(ws, proj).await.unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].path, "notes/live.md");
+    assert_eq!(findings[0].kind, "stale");
+    assert_eq!(findings[0].reason.as_deref(), Some("live page is stale"));
+}
+
+/// A link authored by a superseded page version is not a reference.
+/// `replace_links_in_tx` deletes rows only for the new version's id, so v1's
+/// row survives an edit, and `refresh_incoming_links_for_path` repoints it at
+/// the new latest id without filtering on `is_latest` — so without a join to a
+/// live source page, a link the author removed still answers for its target.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_a_superseded_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/b.md", "B", "target"))
+        .await
+        .unwrap();
+
+    // a.md v1 links b.md.
+    let mut a_v1 = page(ws, proj, "notes/a.md", "A", "see b");
+    a_v1.links = vec![ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new("notes/b.md").unwrap(),
+        relation: None,
+    }];
+    store.writer.upsert_page(a_v1).await.unwrap();
+
+    // Control: while the link is live, b.md is not an orphan.
+    let (_, _, linked_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        linked_orphans, 0,
+        "with a live inbound link neither page is an orphan"
+    );
+
+    // a.md v2 drops the link; v1's row survives, repointed at b.md's latest id.
+    store
+        .writer
+        .upsert_page(page(ws, proj, "notes/a.md", "A", "no link now"))
+        .await
+        .unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 2,
+        "both pages are orphans once the only link is gone from the latest version"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert!(
+        orphan_paths.contains(&"notes/b.md"),
+        "b.md lost its only inbound link and must be listed: {orphan_paths:?}"
+    );
+}
+
+/// A link authored by a TTL-expired page is not a reference either, and the
+/// workspace-wide health queries (which bind no project) agree with the
+/// project-scoped ones. A live link to a second target is the control.
+#[tokio::test]
+async fn memory_health_orphans_ignore_links_from_an_expired_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let link_to = |path: &str| ai_memory_core::LinkTarget {
+        workspace: None,
+        project: None,
+        path: PagePath::new(path).unwrap(),
+        relation: None,
+    };
+
+    for path in ["notes/expired_target.md", "notes/live_target.md"] {
+        store
+            .writer
+            .upsert_page(page(ws, proj, path, path, "target"))
+            .await
+            .unwrap();
+    }
+    let mut expired_source = page(ws, proj, "notes/expired_source.md", "E", "see target");
+    expired_source.links = vec![link_to("notes/expired_target.md")];
+    expired_source.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(expired_source).await.unwrap();
+    let mut live_source = page(ws, proj, "notes/live_source.md", "L", "see target");
+    live_source.links = vec![link_to("notes/live_target.md")];
+    store.writer.upsert_page(live_source).await.unwrap();
+
+    let (_, _, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 1,
+        "only the target of the expired page's link is an orphan"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(orphan_paths, ["notes/expired_target.md"]);
+}
+
+/// Memory health counts and detail lists ignore TTL-expired pages.
+#[tokio::test]
+async fn memory_health_ignores_expired_pages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let past_time = jiff::Timestamp::from_second(1).unwrap();
+
+    // 1. Live episodic page and expired episodic page.
+    let mut live_stale = page(ws, proj, "notes/live_stale.md", "LiveStale", "content");
+    live_stale.tier = Tier::Episodic;
+    store.writer.upsert_page(live_stale).await.unwrap();
+
+    let mut expired_stale = page(
+        ws,
+        proj,
+        "notes/expired_stale.md",
+        "ExpiredStale",
+        "content",
+    );
+    expired_stale.tier = Tier::Episodic;
+    expired_stale.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_stale).await.unwrap();
+
+    // 2. Duplicate titles: one live page and one expired page sharing title "SameTitle".
+    let live_dup = page(ws, proj, "notes/live_dup.md", "SameTitle", "content");
+    store.writer.upsert_page(live_dup).await.unwrap();
+
+    let mut expired_dup = page(ws, proj, "notes/expired_dup.md", "SameTitle", "content");
+    expired_dup.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_dup).await.unwrap();
+
+    // 3. Orphans: live_stale and live_dup have no links.
+    // An expired orphan page should not be counted or listed as an orphan.
+    let mut expired_orphan = page(
+        ws,
+        proj,
+        "notes/expired_orphan.md",
+        "ExpiredOrphan",
+        "content",
+    );
+    expired_orphan.expires_at = Some(past_time);
+    store.writer.upsert_page(expired_orphan).await.unwrap();
+
+    // Set updated_at on the episodic pages to 60 days ago so they qualify as stale (< 30 days).
+    let sixty_days_ago_us = jiff::Timestamp::now().as_microsecond() - 60 * 86_400 * 1_000_000;
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = ?1 WHERE path IN ('notes/live_stale.md', 'notes/expired_stale.md')",
+        rusqlite::params![sixty_days_ago_us],
+    )
+    .unwrap();
+
+    // Workspace-level health counts and detail:
+    let (stale, dups, orphans) = store
+        .reader
+        .memory_health_for_workspace(ws, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale, 1,
+        "only live_stale is counted, expired_stale is ignored"
+    );
+    assert_eq!(
+        dups, 0,
+        "SameTitle has only one live page, expired_dup is ignored"
+    );
+    assert_eq!(
+        orphans, 2,
+        "only live_stale and live_dup are orphans; expired_orphan is ignored"
+    );
+
+    let detail = store
+        .reader
+        .health_detail_for_workspace(ws, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(detail.stale.len(), 1);
+    assert_eq!(detail.stale[0].path, "notes/live_stale.md");
+    assert!(detail.duplicates.is_empty());
+    let orphan_paths: Vec<&str> = detail.orphans.iter().map(|p| p.path.as_str()).collect();
+    assert_eq!(
+        orphan_paths,
+        vec!["notes/live_dup.md", "notes/live_stale.md"]
+    );
+
+    // Project-level health counts and detail:
+    let (p_stale, p_dups, p_orphans) = store
+        .reader
+        .memory_health_for_project(ws, proj)
+        .await
+        .unwrap();
+    assert_eq!(p_stale, 1);
+    assert_eq!(p_dups, 0);
+    assert_eq!(p_orphans, 2);
+
+    let p_detail = store
+        .reader
+        .health_detail_for_project(ws, proj, 10)
+        .await
+        .unwrap();
+    assert_eq!(p_detail.stale.len(), 1);
+    assert_eq!(p_detail.stale[0].path, "notes/live_stale.md");
+    assert!(p_detail.duplicates.is_empty());
+    assert_eq!(p_detail.orphans.len(), 2);
 }
