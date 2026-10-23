@@ -780,6 +780,32 @@ fn install_ps1_keeps_its_safety_checks() {
     );
     assert_eq!(script.trim_end().lines().last(), Some("Install-AiMemory"));
     assert!(!script.contains("raw.githubusercontent.com"));
+
+    // A plain-http GitHub base must be refused, and the refusal must not be
+    // nested inside a branch that already requires https. That nesting is what
+    // made it unreachable: both arms of
+    // `$base -eq $defaultBase -or StartsWith('https://github.com/')` imply
+    // `https://`, so the inner `-not StartsWith('https://')` could never fire,
+    // and an `http://github.com/...` base matched neither arm and skipped the
+    // check entirely.
+    assert!(script.contains("[Uri]::TryCreate($base"));
+    assert!(script.contains("$baseUri.Scheme -eq 'http'"));
+    assert!(script.contains("$baseUri.Host.TrimEnd('.') -eq 'github.com'"));
+    assert!(
+        !script.contains("StartsWith('https://github.com/'"),
+        "the GitHub refusal must not be gated on an https-only branch again"
+    );
+    assert!(
+        script.contains("refusing a non-https GitHub URL"),
+        "the refusal keeps its operator-facing message"
+    );
+    // Scoped to GitHub on purpose: `tests/install_ps1.ps1` serves its fixture
+    // releases over plain http from loopback, and the header documents a
+    // non-GitHub base as the operator's own trust decision.
+    assert!(
+        !script.contains("-match '(?i)^http://'"),
+        "refusing every plain-http base would break the loopback test harness"
+    );
 }
 
 #[test]
@@ -1463,6 +1489,8 @@ fn run_powershell_wrapper_with_fake_native(
             ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo autowire: %AI_MEMORY_RUN_AUTOWIRE%\r\n",
             "if not defined AI_MEMORY_RUN_AUTOWIRE ",
             ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo autowire: unset\r\n",
+            "if defined AI_MEMORY_AUTH__BEARER_TOKEN_FILE ",
+            ">>\"%AI_MEMORY_TEST_NATIVE_ARGS%\" echo bearer-file: %AI_MEMORY_AUTH__BEARER_TOKEN_FILE%\r\n",
             "exit /b %AI_MEMORY_TEST_NATIVE_EXIT%\r\n",
         ),
     )
@@ -1470,7 +1498,12 @@ fn run_powershell_wrapper_with_fake_native(
     let docker = tmp.path().join("docker.cmd");
     std::fs::write(
         &docker,
-        "@echo off\r\n>>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\nexit /b 0\r\n",
+        concat!(
+            "@echo off\r\n",
+            ">>\"%AI_MEMORY_TEST_DOCKER_ARGS%\" echo %*\r\n",
+            "echo %* | findstr /c:\"auth-tokens/default\" >nul && echo test-volume-token\r\n",
+            "exit /b 0\r\n",
+        ),
     )
     .unwrap();
 
@@ -1493,6 +1526,7 @@ fn run_powershell_wrapper_with_fake_native(
         .env("AI_MEMORY_TEST_NATIVE_EXIT", "7")
         .env("AI_MEMORY_TEST_DOCKER_ARGS", &docker_args)
         .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env("LOCALAPPDATA", tmp.path())
         .env_remove("AI_MEMORY_DATA_DIR")
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("AI_MEMORY_RUN_AUTOWIRE");
@@ -3651,6 +3685,28 @@ mod slow {
         assert!(
             native_log.contains("autowire: true"),
             "an explicit AI_MEMORY_RUN_AUTOWIRE must win; got {native_log}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_hooks_refreshes_the_volume_bearer_for_managed_launches() {
+        let (code, native_log, docker_log) = run_powershell_wrapper_with_fake_native(
+            &["install-hooks", "--agent", "claude-code"],
+            &[],
+        );
+        assert_eq!(code, Some(7));
+        assert!(
+            native_log.contains("argv: install-hooks --agent claude-code"),
+            "native install must receive the original argv; got {native_log}"
+        );
+        assert!(
+            native_log.contains("bearer-file:"),
+            "native install must receive the refreshed bearer path; got {native_log}"
+        );
+        assert!(
+            docker_log.contains("auth-tokens/default"),
+            "setup must read the configured bearer from the named volume; got {docker_log}"
         );
     }
 

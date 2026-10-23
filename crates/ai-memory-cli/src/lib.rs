@@ -28,6 +28,7 @@ mod local_auth;
 mod logging;
 mod marker;
 mod process_guard;
+mod proxy_env;
 mod secret_input;
 mod server_profiles;
 mod terminal;
