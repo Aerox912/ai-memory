@@ -10,7 +10,7 @@
         "source": "git-subdir",
         "url": "https://github.com/Aerox912/ai-memory.git",
         "path": "plugins/codex",
-        "ref": "codex/upstream-20260907"
+        "ref": "v3.2.1-aerox.1"
       },
       "policy": {
         "installation": "AVAILABLE",
