@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed opt-in cold-page compaction replacing a newer user edit with the stale
+  episodic body and metadata it had selected earlier. The sweep now writes the
+  whole compaction batch only when every selected page version is still latest;
+  one changed page leaves the entire batch untouched for the next sweep (#1721).
 - Automatic backfill no longer flashes a console window for each Git probe on
   Windows. Git children inherit `CREATE_NO_WINDOW`, and a run resolves each
   harness's session directory only once (#1727).
