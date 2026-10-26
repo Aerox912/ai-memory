@@ -63,7 +63,9 @@ from hook paths.
    high-latency operators can raise the drain/handoff/background caps with
    minute-based env vars.
    Agent hot paths never block on the network; saturated servers return HTTP
-   429 instead of queueing unbounded work.
+   429 instead of queueing unbounded work. A native spool drain pauses that
+   endpoint for the rest of its pass without charging retry attempts; queued
+   events for other endpoints still deliver with their own credentials.
    For supported native commands and generated OpenCode/OMP/Pi/OpenClaw
     integrations, the nearest-marker capture policy runs first: a dropped
     recognized file-tool event never enters spool, queue, transport, logs, or

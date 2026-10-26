@@ -25,6 +25,10 @@ version in [`docs/changelog/`](docs/changelog/):
   but whose Unix permissions differed, leaving executable plugins without
   their execute bits. Permission-only changes now appear in the preview and
   require `--apply --force`, with the usual backup copy (#962).
+- Fixed a saturated hook server blocking delivery to other servers sharing
+  the native spool. HTTP 429 now pauses only that endpoint for the current
+  drain pass, preserving unacknowledged events and their retry budget across
+  batched, fallback and retry delivery paths (#1283).
 - Restored affirmative profile preferences about tools, browsers and MCP.
   The capability-ban filter also discarded statements such as "Always use
   tools to verify facts"; it now requires negative or disabling wording.
