@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed agentmemory imports resuming over destination body edits that retained
+  the original attribution footer. A resume now requires the complete body to
+  match a planned version before using its page id for the next conditional
+  write; identical imports still resume without duplicate versions.
 - Restored affirmative profile preferences about tools, browsers and MCP.
   The capability-ban filter also discarded statements such as "Always use
   tools to verify facts"; it now requires negative or disabling wording.

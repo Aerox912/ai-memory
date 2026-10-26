@@ -138,7 +138,9 @@ Initial source support is intentionally narrow:
   scope, every write conditional (`create_only`, then `expected_page_id` per
   later version), refuse servers older than 3.0, and land under
   `imported/agentmemory/`, outside every reserved family. Each page version
-  carries a stable UUIDv5 ingest key, so a rerun skips what is already there.
+  carries a stable UUIDv5 ingest key; a rerun skips an existing version only
+  when its complete body matches the sanitized plan. A destination body edit
+  retaining the key stops resumption before another version replaces it.
   Observations are dropped unless replayed as `external-import` sessions
   through `/hook/batch`; records with no ai-memory counterpart are counted in
   the manifest. Details are in the importer README.
