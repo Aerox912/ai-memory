@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed agentmemory imports resuming over destination body edits that retained
+  the original attribution footer. A resume now requires the complete body to
+  match a planned version before using its page id for the next conditional
+  write; identical imports still resume without duplicate versions (#1726).
 - Refused restore archives whose `db/memory.sqlite` snapshot is absent,
   empty, or has no applied ai-memory migration history before replacing any
   live data. Opening those sources previously initialized a new empty store
