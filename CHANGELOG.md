@@ -13,6 +13,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed `ai-memory doctor` native memory inspection omitting Antigravity CLI
+  and using a Claude-only synthetic probe (#1745).
 - Fixed native hook backlogs repeatedly missing their 250 ms mid-session
   delivery window on loaded macOS hosts. Threshold catch-up now launches the
   long-budget detached drainer, and POSIX fallback hooks use macOS's real
