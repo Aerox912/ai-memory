@@ -347,9 +347,11 @@ directions are family-scoped and dry-run by default.
   and is refused for a server page carrying any metadata the write cannot
   carry (`summary`, `sources`, `kind`, …), naming the keys.
 - Every import and delete is conditional on the page version the plan
-  classified, so the server refuses one that changed in between. That page
-  is reported as changed during the run and keeps its state; the other pages
-  still sync and the run exits non-zero.
+  classified. An edited repository file uses one full page read to obtain
+  both its comparison and its write precondition; unchanged files still use
+  ETag revalidation. The server refuses a version that changed in between.
+  That page is reported as changed during the run and keeps its state; the
+  other pages still sync and the run exits non-zero.
 
 ### Validation
 
