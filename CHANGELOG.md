@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Refused restore archives whose `db/memory.sqlite` snapshot is absent,
+  empty, or has no applied ai-memory migration history before replacing any
+  live data. Opening those sources previously initialized a new empty store
+  and let `restore --force` discard the previous database and wiki (#923).
 - Restored affirmative profile preferences about tools, browsers and MCP.
   The capability-ban filter also discarded statements such as "Always use
   tools to verify facts"; it now requires negative or disabling wording.
