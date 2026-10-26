@@ -655,6 +655,29 @@ assert_eq "url_encode encodes an accented macOS path" \
     "$(ai_memory_url_encode '/Users/me/Área de Trabalho')"
 
 # --- offline spool ----------------------------------------------------
+# Without an explicit data-dir, the script fallback must agree with the
+# native client's platform default. In particular, macOS setup stores state
+# under Application Support rather than a shadow ~/.local/share tree.
+MAC_HOME="$TMP/mac-home"
+mkdir -p "$MAC_HOME/Library/Application Support/ai-memory"
+: > "$MAC_HOME/Library/Application Support/ai-memory/auth-header"
+MAC_STATE=$(
+    HOME="$MAC_HOME"; export HOME
+    unset AI_MEMORY_DATA_DIR XDG_DATA_HOME
+    uname() { printf 'Darwin\n'; }
+    ai_memory_state_dir
+)
+assert_eq "state_dir uses the macOS data directory" \
+    "$MAC_HOME/Library/Application Support/ai-memory" "$MAC_STATE"
+MAC_AUTH=$(
+    HOME="$MAC_HOME"; export HOME
+    unset AI_MEMORY_DATA_DIR XDG_DATA_HOME
+    uname() { printf 'Darwin\n'; }
+    ai_memory_auth_header_file
+)
+assert_eq "auth header follows the macOS state directory" \
+    "$MAC_HOME/Library/Application Support/ai-memory/auth-header" "$MAC_AUTH"
+
 # The spool dir follows the data dir, which the harness pins inside $TMP.
 AI_MEMORY_DATA_DIR="$TMP/spool-data"
 export AI_MEMORY_DATA_DIR
