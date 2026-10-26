@@ -726,7 +726,7 @@ fn acknowledged_items(ack: &HookBatchAck, items: &[&HookItem]) -> Result<Vec<usi
 /// every event, so retroactive text crosses the same trust boundary as live
 /// capture, and `capture` drops or strips tool events the checkout's
 /// `[capture] ignore_paths` excludes before anything is posted.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn import_one(
     endpoint: &ServerEndpoint,
     workspace: &str,
