@@ -69,6 +69,8 @@ jobs:
             codeql/rust-queries:codeql-suites/rust-code-scanning.qls \
             --additional-packs=.github/codeql/extensions \
             --model-packs=akitaonrails/ai-memory-models \
+            --ram="$CODEQL_RAM" \
+            --threads="$CODEQL_THREADS" \
             --format=sarif-latest \
             --output=sarif-results/rust.sarif
       - name: Test the alert filter

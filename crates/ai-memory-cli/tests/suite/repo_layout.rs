@@ -183,6 +183,8 @@ fn codeql_workflow_loads_local_models() {
         "skip-queries: ${{ matrix.language == 'rust' }}",
         "--additional-packs=.github/codeql/extensions",
         "--model-packs=akitaonrails/ai-memory-models",
+        "--ram=\"$CODEQL_RAM\"",
+        "--threads=\"$CODEQL_THREADS\"",
         "codeql/rust-queries:codeql-suites/rust-code-scanning.qls",
     ] {
         assert!(
