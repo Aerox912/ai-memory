@@ -13,6 +13,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed `ai-memory-wikisync` scope-adoption warnings containing long runs of
+  spaces where source formatting had leaked into the displayed sentence.
 - Fixed opt-in cold-page compaction replacing a newer user edit with the stale
   episodic body and metadata it had selected earlier. The sweep now writes the
   whole compaction batch only when every selected page version is still latest;
