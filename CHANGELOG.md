@@ -17,6 +17,9 @@ version in [`docs/changelog/`](docs/changelog/):
   episodic body and metadata it had selected earlier. The sweep now writes the
   whole compaction batch only when every selected page version is still latest;
   one changed page leaves the entire batch untouched for the next sweep (#1721).
+- Automatic backfill no longer flashes a console window for each Git probe on
+  Windows. Git children inherit `CREATE_NO_WINDOW`, and a run resolves each
+  harness's session directory only once (#1727).
 - The OpenCode version probe now waits up to 10 seconds instead of 2, allowing
   cold-start executable scanning and loaded hosts without treating a working
   installation as hung (#1718).
