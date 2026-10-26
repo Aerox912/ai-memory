@@ -119,6 +119,7 @@ fn codeql_model_targets_exist() {
             "ai_memory_client",
             repo_root.join("companions/ai-memory-client/src"),
         ),
+        ("ai_memory_wiki", crates_dir().join("ai-memory-wiki/src")),
     ];
     let models_dir = repo_root.join(".github/codeql/extensions/ai-memory-models/models");
     let mut targets = 0;
