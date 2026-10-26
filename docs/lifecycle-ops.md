@@ -41,6 +41,14 @@ commands do: the `.ai-memory.toml` marker's `project`, then the git remote, then
 the directory name. `--confirm`, the preview and every other guard behave the
 same as with a name.
 
+That derived target is a deprecation, not a promise: `purge-project --confirm`
+without `--project`/`--project-id` prints the project it resolved and the
+command that names it, and it will be refused in 4.0, because the one thing a
+purge must not do is guess between "the checkout I am standing in" and "the
+project I meant" (#1642). An explicitly empty flag is already refused: `--project
+""` used to pass the "was it named" check and then resolve as if it had not been
+passed, which is how an unset variable in a script reached a real delete.
+
 State-touching commands route through the HTTP admin API except `reset`,
 `restore`, and `reindex`, which are direct-disk lifecycle operations that
 fundamentally cannot run while another process holds the SQLite WAL writer. See
@@ -1008,6 +1016,11 @@ Fresh empty installs still have no commit until there is content to save.
 ai-memory restore-page --workspace default --project my-project \
   --path notes/foo.md --from <checkpoint>
 ```
+
+Each omitted scope flag is resolved from the current directory; a non-empty
+explicit value takes precedence over that default. An explicitly empty or
+whitespace-only flag is refused before any request, so an unset shell variable
+cannot restore a page in the checkout's project by accident.
 
 What happens:
 

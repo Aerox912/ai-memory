@@ -26,7 +26,7 @@ use crate::client::{ApiClient, ApiPage};
 use crate::mcp::{self, McpClient, Precondition, PreconditionFailed, Scope};
 use crate::page_file::{self, PageMeta};
 use crate::state::{self, PageState, SyncState};
-use crate::sync::{self, Mode, RunArgs};
+use crate::sync::{self, Mode, RunArgs, write_if_unchanged};
 use crate::{MAX_BODY_BYTES, MAX_PAGES, paths};
 
 /// Server frontmatter keys a `memory_write_page` import writes back, or
@@ -325,7 +325,8 @@ pub async fn run(args: &SyncArgs, mode: SyncMode) -> Result<Outcome> {
     };
     let dest_root = sync::resolve_dest(&run_args.dest, fs_mode)?;
     let stateless_check = mode == SyncMode::Check && !state::state_path(&dest_root).exists();
-    let old_state = state::load(&dest_root)?;
+    let scope = state::SyncScope::of(&run_args.server, &run_args.workspace, &run_args.project);
+    let old_state = sync::baseline_for(state::load(&dest_root)?, &scope, run_args.adopt_scope)?;
     let api = ApiClient::new(&run_args.server, run_args.token.clone())?;
 
     let plan = build_plan(
@@ -730,6 +731,11 @@ async fn apply_plan(
     plan: Plan,
 ) -> Result<Applied> {
     let mut new_state = old_state.clone();
+    new_state.scope = Some(state::SyncScope::of(
+        &args.server,
+        &args.workspace,
+        &args.project,
+    ));
     new_state.pages.extend(plan.adopted);
     for path in &plan.forget {
         new_state.pages.remove(path);
@@ -846,24 +852,6 @@ fn report_local_change(path: &str) {
         "  {:<9} {path} — changed in the repository during this run; left for the next sync",
         "CHANGED"
     );
-}
-
-/// Write `bytes` over a repository file only while it is still the file the
-/// plan classified: `expected` is that file's hash, or `None` when there was
-/// no file. Returns `false`, writing nothing, when an edit landed after the
-/// plan (the check and the rename are as close together as `delete_file`'s).
-fn write_if_unchanged(
-    dest_root: &Path,
-    rel: &str,
-    expected: Option<&str>,
-    bytes: &[u8],
-) -> Result<bool> {
-    let current = sync::read_disk(dest_root, rel)?;
-    if current.as_deref().map(state::sha256_hex).as_deref() != expected {
-        return Ok(false);
-    }
-    sync::atomic_write(dest_root, rel, bytes)?;
-    Ok(true)
 }
 
 fn report_race(path: &str, error: &anyhow::Error) {

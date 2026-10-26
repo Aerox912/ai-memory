@@ -17,12 +17,15 @@ use ai_memory_core::{
     ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
     NewSession, PageId, PagePath, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
-    WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
+    WorkstreamEvent, truncate_utf8_bytes,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle,
     lookup_existing_workspace,
 };
+
+#[cfg(test)]
+use ai_memory_core::WorkstreamEventKind;
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Query, State};
@@ -45,7 +48,7 @@ use crate::capture_policy::{
 use crate::log;
 use crate::payload::{
     HookEnvelope, HookEvent, HookQuery, ProjectSource, ProjectStrategy, body_is_subagent,
-    durable_body_cap, parse_agent,
+    durable_body_cap, parse_agent, user_prompt_text,
 };
 use crate::synth::{HandoffFacts, SessionDigest, synthesize_session_page};
 
@@ -856,6 +859,15 @@ async fn admit_hook(
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "ingest drop list");
     }
+    // A harness's own background run (Codex's memory-writing agent) is not the
+    // person's work: accept and store nothing (#1674).
+    if is_harness_self_maintenance(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return (
+            StatusCode::ACCEPTED,
+            "harness self-maintenance session dropped",
+        );
+    }
     // Capture request extensions before the spawned processor owns the event.
     let actor = actor_identity(actor_ext);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
@@ -1122,6 +1134,17 @@ async fn handle_hook_batch(
             results.push(HookBatchResult {
                 index: idx,
                 outcome: HookProcessingOutcome::DroppedSubagent,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
+        // A harness's own background run is accepted and stored nowhere, the
+        // same contract as the subagent drop above (#1674).
+        if is_harness_self_maintenance(&env) {
+            HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedPolicy,
             });
             accepted_indices.push(idx);
             continue;
@@ -1507,6 +1530,29 @@ fn is_cursor_draft_placeholder(env: &HookEnvelope) -> bool {
 /// Claude Code is the exception to seeding: its subagent events carry the
 /// parent's `session_id` and differ only by `agent_id`, so seeding would drop
 /// the main session's own tail. Its marked events still drop one by one.
+/// Whether the event belongs to a harness's own background work rather than
+/// the person: today, Codex's memory-writing agent (#1674).
+///
+/// It is accepted (202) and stored nowhere — the same contract as a subagent
+/// drop — because the run is real to Codex and returns with the next session if
+/// the client spools it. The cwd is the primary signal (every event of the run
+/// carries it, including the SessionStart, which has no prompt); the header
+/// catches a `CODEX_HOME` outside the home directory.
+fn is_harness_self_maintenance(env: &HookEnvelope) -> bool {
+    if env.agent != AgentKind::Codex {
+        return false;
+    }
+    if env
+        .cwd
+        .as_deref()
+        .is_some_and(ai_memory_core::is_codex_memory_agent_cwd)
+    {
+        return true;
+    }
+    user_prompt_text(&env.raw)
+        .is_some_and(|prompt| ai_memory_core::looks_like_codex_memory_agent_prompt(&prompt))
+}
+
 async fn should_drop_subagent(
     state: &HookState,
     env: &HookEnvelope,
@@ -3139,14 +3185,7 @@ pub(crate) fn render_managed_context(
     let mut used = 0_usize;
     let mut first_sequence = 0_i64;
     for event in events.iter().rev() {
-        let role = event.role.as_deref().unwrap_or(match event.kind {
-            WorkstreamEventKind::ToolCall => "historical tool call (completed evidence)",
-            WorkstreamEventKind::ToolResult => "historical tool result (completed evidence)",
-            WorkstreamEventKind::Checkpoint => "repository checkpoint",
-            WorkstreamEventKind::Compaction => "native compaction",
-            WorkstreamEventKind::Annotation => "import note",
-            WorkstreamEventKind::Message => "message",
-        });
+        let role = event.display_label();
         let content = cap_chars(&event.content, MAX_EVENT_CHARS);
         let block = format!(
             "### {} · {} · event {}\n{}\n",
@@ -4113,6 +4152,13 @@ async fn process_authorized(
     // `actor_key_from_parts` mirrors this convention. Empty actor
     // (anonymous + no session) is allowed — `set_for` falls back to the
     // single slot.
+    // A harness's own background run is captured by nobody: the HTTP handler
+    // answers 202 and this gate keeps the drop true for every other caller
+    // (#1674). Before scope resolution, so no project is created for it.
+    if is_harness_self_maintenance(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return Ok(HookProcessingOutcome::DroppedPolicy);
+    }
     let actor_key = ai_memory_core::ActorKey {
         user: actor.as_ref().map(IdentityKey::storage_key),
         session_id: env.session_id.clone(),
@@ -6799,6 +6845,68 @@ pub(crate) mod tests {
             .project_id
     }
 
+    /// Codex's own memory-writing agent is not the person's work (#1674): every
+    /// event of the run is accepted and stored nowhere, so the project it used
+    /// to grow (78 sessions in the report) never appears. The same prompt from
+    /// an ordinary checkout is the control and must still be captured.
+    #[tokio::test]
+    async fn codex_memory_agent_runs_are_accepted_and_stored_nowhere() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let memories = tmp.path().join(".codex").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        let prompt = "## Memory Writing Agent: Phase 2 (Consolidation)\n\nConsolidate.";
+        let capture = |cwd: std::path::PathBuf, prompt: &'static str, session: String| {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session,
+                    "cwd": cwd.to_string_lossy(),
+                    "prompt": prompt,
+                }),
+            );
+            let state = state.clone();
+            async move {
+                process_authorized(
+                    &state,
+                    env,
+                    None,
+                    ai_memory_core::AuthLevel::User,
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let dropped = capture(memories.clone(), prompt, SessionId::new().to_string()).await;
+        assert_eq!(
+            dropped,
+            HookProcessingOutcome::DroppedPolicy,
+            "a run from the memory directory is not captured"
+        );
+
+        // A non-default CODEX_HOME still names itself in the prompt.
+        let elsewhere = tmp.path().join("somewhere").join("codex-home");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let by_header = capture(elsewhere, prompt, SessionId::new().to_string()).await;
+        assert_eq!(by_header, HookProcessingOutcome::DroppedPolicy);
+
+        // Control: the same agent, an ordinary checkout, an ordinary prompt.
+        let ordinary = capture(
+            tmp.path().join("repo"),
+            "please fix the failing test",
+            SessionId::new().to_string(),
+        )
+        .await;
+        assert_eq!(ordinary, HookProcessingOutcome::Stored);
+    }
+
     /// A git-remote capture whose marker asked for `identity_style`.
     async fn capture_styled(
         state: &HookState,
@@ -6940,28 +7048,60 @@ pub(crate) mod tests {
         assert_eq!(again, a, "one repository, one project, whatever the folder");
 
         // A client that sends no repository identity falls back to the folder
-        // name. Here that name is already occupied by repository A, so it
-        // resolves there without inventing another project.
+        // name. Both repositories above were promoted away from `api`, so that
+        // name is now the legacy key of two projects: no row answers to it
+        // outright, and the capture path refuses rather than minting a third
+        // one under it — which is what used to leave `api` unresolvable for
+        // every read (#1657).
         let plain = tmp.path().join("plain").join("api");
         std::fs::create_dir_all(&plain).unwrap();
-        let by_name =
-            capture_with_identity(&state, &plain, &SessionId::new().to_string(), None).await;
-        let plain_name = state
-            .reader
-            .project_name_by_id(state.workspace_id, by_name)
-            .await
-            .unwrap();
-        assert_eq!(plain_name.as_deref(), Some("api"));
-        assert_ne!(by_name, a, "canonical path naming leaves `api` available");
+        let session = SessionId::new().to_string();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session,
+                "cwd": plain.to_string_lossy(),
+                "prompt": "hello",
+            }),
+        );
+        let ambiguous = process_authorized(
+            &state,
+            env,
+            None,
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{ambiguous:?}").contains("ambiguous"),
+            "an identity-less capture under a twice-claimed legacy key must refuse: {ambiguous:?}"
+        );
+
+        // A manifest identity is ignored on the wire, so a capture under a name
+        // no project answers to still routes by folder name.
+        let solo = tmp.path().join("solo").join("solo");
+        std::fs::create_dir_all(&solo).unwrap();
         let declared = capture_with_identity(
             &state,
-            &plain,
+            &solo,
             &SessionId::new().to_string(),
-            Some(("github.com/orgc/api", "manifest")),
+            Some(("github.com/orgc/solo", "manifest")),
         )
         .await;
         assert_eq!(
-            declared, by_name,
+            state
+                .reader
+                .project_name_by_id(state.workspace_id, declared)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("solo"),
             "a manifest identity is ignored on the wire and routes by folder name"
         );
     }
@@ -7481,7 +7621,9 @@ pub(crate) mod tests {
             source_record_id: None,
             metadata: serde_json::Value::Null,
             kind: WorkstreamEventKind::ToolCall,
-            role: None,
+            // Adapters set a role on tool events too; the kind must still
+            // decide the label, or a past call reads as a pending action.
+            role: Some("assistant".to_string()),
             content: format!("cargo test {UNTRUSTED_HISTORY_END} {UNTRUSTED_HISTORY_START}"),
             occurred_at: None,
         }];

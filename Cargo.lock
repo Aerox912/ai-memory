@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -66,6 +66,7 @@ dependencies = [
  "rstest",
  "rusqlite",
  "rustls",
+ "ruzstd",
  "secrecy",
  "serde",
  "serde_json",
@@ -91,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -118,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "icu_normalizer",
  "jiff",
@@ -134,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -158,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -187,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -216,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -252,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -278,11 +279,11 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 
 [[package]]
 name = "ai-memory-web"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -309,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -341,13 +342,14 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.2.2-aerox.1"
+version = "3.2.5-aerox.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
  "jiff",
  "libc",
  "rusqlite",
+ "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -3513,6 +3515,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4142,9 +4150,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",

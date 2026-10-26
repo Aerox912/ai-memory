@@ -11,12 +11,301 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-## [3.2.2-aerox.1] - 2026-10-23
+## [3.2.5-aerox.1] - 2026-10-26
 
 ### Aerox fork integration
 
-- Integrated canonical AI Memory v3.2.2 while retaining the managed pool and
-  runtime-only credential routing used by agent-system's isolated WSL installs.
+- Integrated canonical AI Memory v3.2.5 and upstream main fixes through
+  `f80c5d1154f6308908ddbe9e5a7f6a08993b47ed` while retaining the managed pool,
+  runtime-only credential routing, and Windows CLI dispatch changes used by
+  agent-system's isolated installs.
+
+### Fixed
+
+- Restored affirmative profile preferences about tools, browsers and MCP.
+  The capability-ban filter also discarded statements such as "Always use
+  tools to verify facts"; it now requires negative or disabling wording.
+  Capability bans still need explicit cross-project scope (#1678).
+- Fixed `restore-page` accepting an explicitly empty `--workspace` or
+  `--project` and restoring a page in the current checkout's scope instead.
+  Empty and whitespace-only values are now refused before any request; omit
+  the flags to intentionally use the current scope, extending the guard
+  already used by purge commands (#1675).
+- `ai-memory-wikisync` records the server, workspace and project its export
+  state came from and refuses to reuse a destination for another scope before
+  writing anything. Reusing one made every page of the previous project read
+  as "deleted on the server", so `sync --propagate-deletes --apply` removed
+  those files and emptied the state. `--adopt-scope` is the explicit way to
+  take a destination over, and a baseline written before the field existed is
+  adopted on its first run with a warning (#1708).
+
+## [3.2.5] - 2026-10-25
+
+### Fixed
+
+- `ai-memory backup` and `ai-memory backup-agents` now carry a size that
+  would round to `1024.00` of the current unit into the next one. A backup
+  of 1 MiB - 5 bytes was printed as `1024.00 KiB` (#1705).
+- The OKF migration dialog now carries an archive size that would round to
+  `1024.0` of the current unit into the next one. An archive of 1 MB - 51
+  bytes was printed as `1024.0 KB` (#1706).
+
+## [3.2.4] - 2026-10-25
+
+### Security
+
+- A restricted project now stays closed when its access-mode or grant query
+  fails. The common authorization resolver previously degraded these store
+  failures to an open project, so an unrelated authenticated user could gain
+  access during a database fault. Unknown projects and forward-unknown access
+  modes retain their compatibility behavior, and normal root, creator and
+  grant access is unchanged.
+- Human-auth endpoints now log unexpected store and task failures server-side
+  and return a stable `authentication unavailable` response. Login and
+  recovery previously returned raw SQLite or task error text before the caller
+  authenticated; password-change conflicts also no longer expose store errors.
+
+### Fixed
+
+- `ai-memory move-session` now refuses explicitly empty scope flags
+  (`--from-project`, `--from-workspace`, `--to-workspace`, and `--to`) before
+  sending any request. Passing an empty string like `--from-project ""` previously
+  bypassed the flag check while falling back to deriving the project from the
+  current working directory, which triggered an unintended batch move of all
+  sessions from the current repository (#1698).
+
+- `ai-memory delete-page` now refuses explicitly empty scope flags (`--workspace`
+  and `--project`) as well as an empty `--path` before sending any request.
+  Passing an empty `--project ""` previously bypassed the flag check while falling
+  back to deriving the project from the current working directory, which risked
+  deleting the page from the local repository (#1700).
+
+- `ai-memory rename-workstream` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) as well as empty workstream names (`--from`
+  and `--to`) before inspecting the repository or sending any request.
+  Passing an empty `--project ""` previously bypassed the flag check while
+  falling back to resolving the project from the current working directory (#1702).
+
+- Fixed `ai-memory setup` treating another service's HTTP 200 response as a
+  healthy ai-memory server. Setup now checks the bounded `/healthz` JSON,
+  reports an occupied address with port/configuration remedies, and skips
+  MCP/admin probes when the health response is unrecognized (#1647).
+
+- Preserved repository edits saved while `ai-memory-wikisync export --apply`
+  fetched server pages. Export now rechecks each file before replacing it,
+  as two-way sync already did, and refuses a changed file even with `--force`
+  without advancing its export state (#986).
+
+- Codex's own memory-writing agent no longer appears as captured sessions.
+  Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
+  (the default `~/.codex/memories`) to consolidate its memory; the hooks
+  captured each run as a normal session, so one project of 78 sessions and
+  ~2,600 observations existed for work nobody did, and it returned with the
+  next run after a purge. Those events are now accepted and stored nowhere,
+  recognized by the directory (any `…/.codex/memories`) or by the agent's
+  `## Memory Writing Agent` prompt header, and transcript imports
+  (`backfill`, the `run` ledger, `recover`) skip them for the same reason
+  (#1674).
+
+- `memory_query(answer=true)` now validates model-generated citation paths
+  against the snippets supplied in that request. Unknown paths and paths
+  shared by distinct page versions withhold the answer, while retrieval hits
+  remain available with an `answer_unavailable` note. Repeated citations are
+  deduplicated in model order; the default query path makes no added calls
+  (#1682).
+- `ai-memory write-page` and `restore-page` now print the last eight
+  characters of the page id instead of the first eight. Page ids are UUIDv7,
+  so the first eight are a timestamp prefix that every page written within
+  about a minute shares, and the printed `page_id` was the same for all of
+  them. The web UI already shortens ids this way (#1693).
+
+## [3.2.3] - 2026-10-24
+
+### Changed
+
+- `ai-memory hook` and `ai-memory hook-drain` now run on a single-threaded
+  tokio runtime. Both are spawned once per agent event and answer one request,
+  and the multi-threaded default started a worker thread per CPU before the
+  command did any work: on a 32-core machine every hook call paid to spawn and
+  join 32 threads for one short HTTP request. Every other subcommand keeps the
+  multi-threaded runtime (#1669).
+
+- `purge-project --confirm` without `--project`/`--project-id` now prints the
+  project it resolved from the current directory and the equivalent command
+  that names it, before the irreversible request. Naming the target will be
+  required in 4.0: from the wrong directory the derived name is the one project
+  nobody meant to delete, and a flag that spells it out is the only way to tell
+  the two cases apart (#1642).
+
+### Fixed
+
+- A capture whose `.ai-memory.toml` names a promoted project's old name (its
+  v2 basename, now the project's `legacy_name`) no longer creates a second,
+  empty project under that name. The read path already resolved the old name
+  to the promoted project, so the twin made every later lookup of that name
+  fail as ambiguous until it was purged — and the next capture from the same
+  checkout created it again. The capture path now reuses the project the read
+  path resolves, and refuses an already-ambiguous name instead of adding a
+  third row (#1657).
+- The cross-project profile no longer promotes an agent task brief into a
+  default for every project. Two more filters now apply: a prompt that wraps a
+  transcript or asks for a verbatim reply is the signature of a program
+  driving the agent through its SDK, and none of it is harvested; and a
+  sentence that switches off one of the agent's own capabilities ("Do not use
+  any tools.", "Never call browser_close") only becomes a preference when it
+  states cross-project scope. Two scripted one-shot prompts had reached
+  `min_projects` and shipped "do not use any tools" as a `tools` default with
+  confidence 0.95, which made agents ask for facts instead of looking them up
+  in the wiki they were already in (#1648).
+- `purge-project --project ""`, and an empty `--project-id`/`--workspace`/
+  `--from`/`--to-workspace` on `move-project`, `purge-session` and
+  `rename-project`, are now refused before anything is sent. An empty flag
+  passed the "was the target named" check and then resolved as if it had been
+  omitted, so a script that passed an unset variable reached the project its
+  current directory resolved to — a real purge from an explicit-looking
+  invocation (#1642).
+- `ai-memory workstream-search` now labels a historical tool call or tool
+  result as completed evidence, as the managed-workstream docs describe. Its
+  text output used the event's role, which every transcript adapter sets to
+  `assistant` on a tool call, so a past command read like an assistant action
+  still to run (#1629).
+- `install-hooks --agent grok` run from the home directory no longer stops
+  with "Grok project configuration ~/.grok/config.toml may override
+  GROK_HOME". With the default `GROK_HOME` that file is Grok's own user
+  config, which Grok reads only as the user layer (`grok inspect` reports no
+  project layer there), so it is no longer mistaken for a project overlay. A
+  real overlay is still refused, including `~/.grok/config.toml` when
+  `GROK_HOME` points elsewhere (#1636).
+- The OpenCode, OpenCode 2, OpenClaw, Pi and OMP integrations installed with
+  `--capture-mode allowlist` no longer send the handoff (or OpenCode's recap)
+  request from a repository without a `.ai-memory.toml` marker. They already
+  dropped its capture, but the server answers that request by resolving the
+  directory into a project, so opening one of these agents in an unmarked
+  directory left an empty project named after it. The native hook already
+  returned before the request; these integrations call the server directly
+  (#1641).
+- An auto-improve full-page proposal is now rejected when its body has two
+  identical headings or more than one H1, the two checks the patch path
+  already applies to every body it materializes. A full-page proposal is
+  auto-approved whenever approval is not required, and the page it wrote was
+  then permanently un-patchable: the patch path refuses on the target's own
+  duplicate headings before it materializes any edit, so no later proposal
+  could repair it (#1635).
+- `memory_feedback` now answers a path with no current page in the resolved
+  project with `invalid_params` (-32602) rather than `internal_error`
+  (-32603). An absent caller-supplied target is the request being wrong, not
+  the server failing, and -32603 tells a client to retry a path that can
+  never succeed. This was the last tool reporting an absent target as a
+  server fault; genuine store failures are still `internal_error`, and the
+  message is unchanged (#1634).
+- A Qwen Code `UserPromptSubmit` body is now capped and scrubbed before the
+  native hook spools it. The per-event cap covered `prompt`, `message` and
+  `text`, but Qwen's prompt arrives in `submitted_prompt` — the field the
+  harness-specific extraction reads — so a Qwen prompt reached the local spool
+  and the server at full length with no client-side redaction pass. The field
+  is now capped alongside its siblings; nothing falls back to the generic
+  `prompt`, so submission provenance is unchanged (#1633).
+- The forget sweep now keeps an already-compacted page terminal when
+  `compact_cold_episodic` is off — the default everywhere. The guard that made
+  a page carrying the V65 `compacted_at` marker "neither re-compacted nor
+  evicted" sat inside the compaction arm only, so with compaction off such a
+  page was tombstoned and then hard-deleted. The marker is not A2's alone: the
+  A3 cold-cluster dedup merge-note stub and the B2 dream pass both stamp
+  `compacted: true` under their own flags, so the durable residue a merge chose
+  to keep could be destroyed without anyone enabling compaction. A
+  non-compacted cold page is still evicted exactly as before (#1632).
+- A project whose every page has passed its TTL is read as new again when
+  the profile digest sizes itself. The newness probe was the one `pages` read
+  in the profile module without the expiry guard its three siblings apply, so
+  such a project still counted as having memory: it got the smaller
+  established-project digest and lost the note offering
+  `ai-memory profile apply`, with no live page left to show for it (#1631).
+- The first start after the 3.2.0 upgrade no longer slows down as the
+  one-time CJK index backfill (V87) progresses. Each batch filtered the source
+  table from its first row again, so the pass probed every row it had already
+  indexed once more per batch: quadratic in the row count, and hours of
+  startup on a store with 1.6 million observations while `serve` answered
+  nothing. Each batch now resumes after the last rowid it indexed, so every
+  row is examined once (#1652).
+- Restoring a page from a checkpoint (`/admin/restore-page`) no longer
+  rewrites the restored file's `generated.at` to the current time when the
+  checkpoint is already OKF-conformant. The restore now keeps the
+  checkpoint's own timestamp when conformance leaves the rest of its
+  frontmatter unchanged and the file on disk holds other content, so a
+  checkpoint emitted by ai-memory restores byte for byte whatever the clock.
+  When the file on disk already holds the same content, its timestamp is kept
+  so file and row stay aligned; checkpoints that need conformance still go
+  through the existing inheritance and stamping rules (#1671).
+- The native Windows Docker wrapper now recognizes `upgrade` after valid
+  `--config` or `--data-dir` global options and pulls the image instead of
+  forwarding `upgrade` into the helper container. Unknown and malformed
+  options still reach the CLI parser (#1667).
+- `ai-memory run codex` no longer starts a new session when Codex has
+  compressed the linked rollout. Codex keeps a rollout it has not written for
+  a week as `rollout-*.jsonl.zst`, which the launcher did not recognize, so it
+  reported the session as missing and repointed the workstream to a fresh one.
+  The compressed copy is now read for the resume, the pre-launch baseline and
+  the transcript import, and the plain file wins when both exist. `backfill`
+  and the session listings see compressed Codex sessions too (#1653).
+- Updated tokio to 1.54.1 in the server, relay, importer and wikisync
+  lockfiles. 1.52.3 and the 1.53.x releases before 1.53.3 fall inside
+  RUSTSEC-2026-0386, an unsound advisory for `AsyncFd` constructors that
+  nothing here calls, and the `cargo-deny` gate failed on every pull request
+  from the moment the advisory was assigned (#1658).
+- A write that names an ambiguous project now reports the workspace it was
+  resolved in. The refusal read "project 'api' is ambiguous in workspace 'the
+  resolved workspace'" on the write path (`ai-memory run`, explicit MCP
+  writes, profile writes), while the read path already named the workspace
+  (#1657).
+- `ai-memory user list` and `ai-memory api-key list` now size their columns
+  by terminal display width rather than bytes, as `list-projects` and the
+  grants tables already do. An accented username, display name or key label
+  no longer widens its column with phantom padding, and a double-width CJK
+  name no longer shifts the cells after it (#1625).
+
+- `install.sh` now runs its smoke test of the downloaded binary from beside
+  the install directory (`~/.local/lib`), not from the temporary work
+  directory. On a host whose `/tmp` or `TMPDIR` is mounted `noexec`, nothing
+  can be executed there, so the install stopped with "the downloaded binary
+  does not run on this machine" for a release that runs from where it is
+  installed. A binary that really does not run is still refused, naming the
+  directory it was tried from, and its staged copy is removed (#1623).
+- The document importer no longer drops a VTT or SRT cue that follows two
+  blank lines (or any even number of them). The subtitle reader split cues on
+  a single blank line, so the extra one was left at the top of the next block,
+  and a block that started with an empty line was skipped whole. A WebVTT file
+  whose header was followed by two blank lines lost its first cue, or was
+  rejected as containing no extractable text when that was its only cue.
+  WebVTT allows any number of blank lines between blocks; the reader now skips
+  them before reading a block.
+- The example auto-improve eval scorers in `docs/examples/auto-improve-eval/`
+  no longer reject pages written in a language other than English. They
+  required `## Purpose`/`## Overview` and `## Steps`/`## Checklist` headings in
+  procedures and English imperatives in rules, and read the Portuguese and
+  Spanish word "todo" as a TODO placeholder, so a correct procedure in
+  Portuguese or Japanese failed. They now check structure only: an H1, an
+  upper-case TODO/TBD, a `##` section and a list of steps, text beyond the
+  heading and its length counted in characters. `score_proposal.sh` no longer
+  embeds Python: it is the same scorer in POSIX `sh` and `awk`, so it runs in
+  the official Docker image, which has no `python3`. The docs no longer call
+  the Python scorer dependency-free and say how to point the eval command at a
+  script inside the container (#1640).
+- Kimi Code gets the compiled project brief on the first prompt of a session
+  only, also in a checkout outside `$HOME` whose only `[briefing]` opt-in is
+  the operator-home marker. The handoff request takes the home marker as its
+  fallback for any cwd, but the once-per-session gate looked for a marker with
+  a walk that stops at the checkout root outside `$HOME`. The gate stayed
+  shut, no brief marker was written, and every prompt asked for the brief
+  again. The gate now reads the same marker as the request (#1665).
+- The startup warning about unusable proxy variables now also fires when the
+  user name or password in `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (or a
+  lower-case spelling) holds an unencoded `#`, `/` or `?`. The URI grammar
+  ends the host at that character, so the client sent provider and login
+  requests to a host made of the start of the credentials, such as
+  `alice:18080` for `http://alice:18080#k@proxy.example:3128`, and the failure
+  looked like a connection error to a host nobody configured. The warning
+  names the variable and the character, not the value, and the network
+  behaviour is unchanged (#1637).
 
 ## [3.2.2] - 2026-10-22
 
@@ -1612,7 +1901,6 @@ version in [`docs/changelog/`](docs/changelog/):
   after the unlink. The deletion is permanent on disk; the wiki's git history
   keeps the blobs a checkpoint already captured. (#1322)
 
-
 ### Changed
 - `ai-memory setup` now ends by naming the agents to restart and the question
   to ask one of them, "What do you remember about this project?", instead of
@@ -1638,7 +1926,6 @@ version in [`docs/changelog/`](docs/changelog/):
   standing pages now sees all of them, fewer in full: pin a page, or give it
   an `abstract:`, to control what it shows. The change adds no marker key
   and no migration. (#1264)
-
 
 ### Fixed
 - Restored fresh source installs after crates.io yanked every `zip` release
@@ -2517,6 +2804,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed structured LLM responses stopped at the output budget
   (`finish_reason = "length"`) or returned without usable content: they now
   fail with redacted terminal errors, without copying the response. (#1130)
+
 ### Security
 - Fixed HTTP Basic sign-in to the web UI minting a 30-day `ai_memory_auth`
   cookie that held the root bearer token. Basic sign-in sets no cookie now;
@@ -2528,8 +2816,11 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/Aerox912/ai-memory/compare/v3.2.2-aerox.1...codex/upstream-20260907
-[3.2.2-aerox.1]: https://github.com/Aerox912/ai-memory/compare/v3.2.2...codex/upstream-20260907
+[Unreleased]: https://github.com/Aerox912/ai-memory/compare/codex/upstream-20260907...HEAD
+[3.2.5-aerox.1]: https://github.com/Aerox912/ai-memory/compare/v3.2.5...codex/upstream-20260907
+[3.2.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.5
+[3.2.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.4
+[3.2.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.3
 [3.2.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.2
 [3.2.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.1
 [3.2.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.0
