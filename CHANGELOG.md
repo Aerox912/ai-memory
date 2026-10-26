@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Automatic backfill no longer flashes a console window for each Git probe on
+  Windows. Git children inherit `CREATE_NO_WINDOW`, and a run resolves each
+  harness's session directory only once (#1727).
 - The OpenCode version probe now waits up to 10 seconds instead of 2, allowing
   cold-start executable scanning and loaded hosts without treating a working
   installation as hung (#1718).
