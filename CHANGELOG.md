@@ -24,6 +24,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The OpenCode version probe now waits up to 10 seconds instead of 2.
+  `setup`, `install-hooks`, `install-mcp` and `ai-memory run` run
+  `opencode --version` to choose which major to wire, and a cold first start
+  of the executable (macOS scans a fresh binary, and a loaded machine slows
+  every launch) could pass the old limit, so the command failed with "version
+  probe timed out" although `opencode` was fine. A genuinely hung `opencode` is
+  still reported, after 10 seconds (#1718).
+
 - Codex's own memory-writing agent no longer appears as captured sessions.
   Codex runs a background "memory writing agent" from `$CODEX_HOME/memories`
   (the default `~/.codex/memories`) to consolidate its memory; the hooks
