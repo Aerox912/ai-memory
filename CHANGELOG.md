@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The OpenCode version probe now waits up to 10 seconds instead of 2, allowing
+  cold-start executable scanning and loaded hosts without treating a working
+  installation as hung (#1718).
 - Fixed agentmemory imports resuming over destination body edits that retained
   the original attribution footer. A resume now requires the complete body to
   match a planned version before using its page id for the next conditional
