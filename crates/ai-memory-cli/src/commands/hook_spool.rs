@@ -3472,7 +3472,7 @@ mod tests {
     /// rode out the outage.
     #[tokio::test]
     async fn outage_then_recovery_delivers_the_entire_backlog() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncWriteExt as _;
 
         // Phase 1 — outage: nothing listens where the events were captured.
         let dead_addr = {
@@ -3515,9 +3515,8 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut s, _)) = listener.accept().await {
                 tokio::spawn(async move {
-                    let mut buf = vec![0_u8; 65536];
-                    let n = s.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let buf = read_test_http_request(&mut s).await;
+                    let req = String::from_utf8_lossy(&buf);
                     let (status, body) = if req
                         .lines()
                         .next()
@@ -5376,12 +5375,71 @@ mod tests {
         serve_counting_hook_with_accept(req_count, batch_status, None).await
     }
 
+    async fn read_test_http_request<R>(stream: &mut R) -> Vec<u8>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt as _;
+
+        const MAX_REQUEST_BYTES: usize = 65_536;
+        let mut request = Vec::with_capacity(4096);
+        let mut chunk = [0_u8; 4096];
+        while let Ok(read) = stream.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.len() >= MAX_REQUEST_BYTES {
+                request.truncate(MAX_REQUEST_BYTES);
+                break;
+            }
+
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_start = header_end + 4;
+            let content_length = std::str::from_utf8(&request[..header_end])
+                .ok()
+                .and_then(|headers| {
+                    headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if request.len() >= body_start.saturating_add(content_length) {
+                break;
+            }
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn test_http_reader_waits_for_a_split_body() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"POST /hook/batch HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            writer.write_all(b"[1,2]").await.unwrap();
+        });
+
+        let request = read_test_http_request(&mut reader).await;
+        assert!(request.ends_with(b"[1,2]"));
+    }
+
     async fn serve_counting_hook_with_accept(
         req_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         batch_status: &'static str,
         accepted_override: Option<usize>,
     ) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncWriteExt as _;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5389,10 +5447,9 @@ mod tests {
                 let rc = req_count.clone();
                 let accepted_override = accepted_override;
                 tokio::spawn(async move {
-                    let mut buf = vec![0_u8; 65536];
-                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let buf = read_test_http_request(&mut s).await;
                     rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let req = String::from_utf8_lossy(&buf);
                     let is_batch = req
                         .lines()
                         .next()
