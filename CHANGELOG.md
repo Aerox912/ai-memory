@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed `ai-memory-wikisync sync` overwriting a concurrent server edit when
+  importing a repository edit. Edited files now use one full page read for
+  classification and the write precondition; a second read after a 304 could
+  previously accept the newer version without checking for a conflict (#986).
 - Restored affirmative profile preferences about tools, browsers and MCP.
   The capability-ban filter also discarded statements such as "Always use
   tools to verify facts"; it now requires negative or disabling wording.
