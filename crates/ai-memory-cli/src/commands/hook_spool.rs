@@ -5384,10 +5384,7 @@ mod tests {
         const MAX_REQUEST_BYTES: usize = 65_536;
         let mut request = Vec::with_capacity(4096);
         let mut chunk = [0_u8; 4096];
-        loop {
-            let Ok(read) = stream.read(&mut chunk).await else {
-                break;
-            };
+        while let Ok(read) = stream.read(&mut chunk).await {
             if read == 0 {
                 break;
             }
