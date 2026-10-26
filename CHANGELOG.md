@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.2.7] - 2026-10-26
+
 ### Fixed
 
 - Fixed `ai-memory doctor` native memory inspection omitting Antigravity CLI
@@ -2850,7 +2852,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.7...HEAD
+[3.2.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.7
 [3.2.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.6
 [3.2.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.5
 [3.2.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.4
