@@ -1150,7 +1150,7 @@ printf '[briefing]\ninject_on_session_start = false\nmax_chars = 6000\n' >"$PLAI
 # Runs script "$1" from repository "$2" with a fresh state dir and prints the
 # handoff GET it sent. The payload carries every cwd and session field the
 # bundles read, plus Antigravity's first-invocation marker.
-session_start_handoff_get() {
+briefing_handoff_get() {
     rm -rf "$TMP/brief-data" "$FAKE_CURL_LOG"
     printf '{"cwd":"%s","workspacePaths":["%s"],"invocationNum":0,"session_id":"brief-s","conversationId":"brief-s","prompt":"continue","tool_name":"read_file","tool_input":{}}' "$2" "$2" \
         | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
@@ -1161,16 +1161,16 @@ session_start_handoff_get() {
 
 BRIEF_SCRIPTS=0
 for script in "$(dirname "$0")"/../../hooks/*/*.sh; do
-    grep -q 'ai_memory_briefing_qs' "$script" || continue
+    grep -q 'ai_memory_get_handoff "' "$script" || continue
     name="$(basename "$(dirname "$script")")/$(basename "$script")"
     BRIEF_SCRIPTS=$((BRIEF_SCRIPTS + 1))
-    GET=$(session_start_handoff_get "$script" "$BRIEF_REPO")
+    GET=$(briefing_handoff_get "$script" "$BRIEF_REPO")
     case "$GET" in
         *'&briefing=true&briefing_budget=6000'*)
             PASS=$((PASS + 1)); printf '  ok  %s\n' "$name: opted-in handoff GET carries the briefing keys" ;;
         *) FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-in handoff GET carries the briefing keys\n    got =%s\n' "$name" "$GET" ;;
     esac
-    GET=$(session_start_handoff_get "$script" "$PLAIN_REPO")
+    GET=$(briefing_handoff_get "$script" "$PLAIN_REPO")
     case "$GET" in
         *'/handoff?'*briefing*)
             FAIL=$((FAIL + 1)); printf '  FAIL %s: opted-out handoff GET omits the briefing keys\n    got =%s\n' "$name" "$GET" ;;
@@ -1181,8 +1181,7 @@ for script in "$(dirname "$0")"/../../hooks/*/*.sh; do
 done
 # Guards the discovery itself: an empty glob or a renamed helper would
 # otherwise pass with nothing checked.
-assert_eq "scripts that fetch the handoff with briefing were found" "yes" \
-    "$([ "$BRIEF_SCRIPTS" -ge 12 ] && printf 'yes' || printf 'no (%s)' "$BRIEF_SCRIPTS")"
+assert_eq "all handoff-fetching scripts were checked for briefing" "13" "$BRIEF_SCRIPTS"
 
 # --- a handoff is never claimed without a project directory -------------
 # `GET /handoff` claims the newest open handoff in whatever project the server
