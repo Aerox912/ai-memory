@@ -1100,8 +1100,9 @@ fn collect_git_commits_fallback(
 fn git_command() -> std::process::Command {
     use std::os::windows::process::CommandExt as _;
 
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut command = std::process::Command::new("git");
-    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    command.creation_flags(CREATE_NO_WINDOW);
     command
 }
 

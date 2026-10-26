@@ -155,7 +155,8 @@ fn git_bytes(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
 fn hide_console(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
 
-    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
