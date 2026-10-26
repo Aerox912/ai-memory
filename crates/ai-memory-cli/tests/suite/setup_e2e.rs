@@ -474,11 +474,16 @@ fn setup_web_stops_when_its_stdin_closes_only_when_asked() {
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
-        for line in std::io::BufReader::new(stdout).lines() {
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        for line in lines.by_ref() {
             if line.unwrap().trim().starts_with("http://127.0.0.1:") {
                 break;
             }
         }
+        // Keep the pipe open and drained after the readiness line. Dropping
+        // it here races the child's following informational println!, whose
+        // broken-pipe panic can look like an stdin-triggered shutdown.
+        std::thread::spawn(move || for _ in lines {});
         child
     };
     let wait = |child: &mut std::process::Child, within: std::time::Duration| {
