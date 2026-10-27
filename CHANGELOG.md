@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Antigravity CLI hooks on Windows failing when the install or profile
+  path contains spaces — bare hook commands are now caret-escaped (#1767).
+
 ## [3.2.8] - 2026-10-27
 
 ### Fixed
