@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory rename-project` now refuses an explicitly empty `--to` target
+  name before sending any request to the server (#1759).
+
 - `ai-memory write-page` now refuses explicitly empty scope flags
   (`--workspace` and `--project`) as well as an empty `--path` before
   reading stdin or sending any request. Passing an empty `--project ""`
