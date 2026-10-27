@@ -66,8 +66,9 @@ struct CancelMessagesResponse {
 /// Dispatch `ai-memory message`.
 ///
 /// # Errors
-/// Returns [`anyhow::Error`] when the scope cannot be resolved, stdin cannot
-/// be read, the server is unreachable, or it answers non-2xx.
+/// Returns [`anyhow::Error`] when an explicit mutating scope or target is
+/// empty, the scope cannot be resolved, stdin cannot be read, the server is
+/// unreachable, or it answers non-2xx.
 pub async fn run(config: &Config, args: MessageArgs) -> Result<()> {
     match args.command {
         MessageCommand::Send(args) => send(config, args).await,
@@ -471,9 +472,7 @@ mod tests {
         };
         let error = pop(&config, a).await.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("--project was passed empty"),
+            error.to_string().contains("--project was passed empty"),
             "unexpected error: {error}"
         );
     }
@@ -506,9 +505,7 @@ mod tests {
         };
         let error = cancel(&config, a).await.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("--workspace was passed empty"),
+            error.to_string().contains("--workspace was passed empty"),
             "unexpected error: {error}"
         );
     }
@@ -548,9 +545,102 @@ mod tests {
         };
         let error = send(&config, a).await.unwrap_err();
         assert!(
+            error.to_string().contains("--to-project was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_refuses_empty_workspace_coordinates_before_reading_stdin() {
+        let config = Config::default();
+        let mut a = MessageSendArgs {
+            from_workspace: Some(" ".into()),
+            from_project: None,
+            to_workspace: "team".into(),
+            to_project: "api".into(),
+            subject: None,
+            body: None,
+            json: false,
+        };
+        let error = send(&config, a).await.unwrap_err();
+        assert!(
             error
                 .to_string()
-                .contains("--to-project was passed empty"),
+                .contains("--from-workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+
+        a = MessageSendArgs {
+            from_workspace: None,
+            from_project: None,
+            to_workspace: String::new(),
+            to_project: "api".into(),
+            subject: None,
+            body: None,
+            json: false,
+        };
+        let error = send(&config, a).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--to-workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pop_refuses_empty_workspace_before_any_request() {
+        let error = pop(
+            &Config::default(),
+            MessagePopArgs {
+                workspace: Some(String::new()),
+                project: None,
+                id: None,
+                json: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--workspace was passed empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_empty_project_and_id_before_any_request() {
+        let config = Config::default();
+        let error = cancel(
+            &config,
+            MessageCancelArgs {
+                workspace: None,
+                project: Some(" ".into()),
+                id: None,
+                all: true,
+                json: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--project was passed empty"),
+            "unexpected error: {error}"
+        );
+
+        let error = cancel(
+            &config,
+            MessageCancelArgs {
+                workspace: None,
+                project: None,
+                id: Some(String::new()),
+                all: false,
+                json: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("--id was passed empty"),
             "unexpected error: {error}"
         );
     }
