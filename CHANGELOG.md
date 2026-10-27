@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory read-page` now refuses explicitly empty scope flags (`--workspace`
+  and `--project`), empty `--path`, and an empty search query before resolving
+  scope or sending a request to the server (#1769).
+
+- `ai-memory finalize-session` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) before resolving scope or querying the server
+  (#1771).
+
 - Admission webhook URLs are validated when the chain is built: only
   `http://` and `https://` URLs are accepted. A webhook configured with any
   other scheme (`file:`, `ftp:`, a custom scheme), a bare hostname, or an
