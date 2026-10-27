@@ -22,6 +22,15 @@ version in [`docs/changelog/`](docs/changelog/):
 - `ai-memory finalize-session` now refuses explicitly empty scope flags
   (`--workspace` and `--project`) before resolving scope or querying the server
   (#1771).
+
+- Admission webhook URLs are validated when the chain is built: only
+  `http://` and `https://` URLs are accepted. A webhook configured with any
+  other scheme (`file:`, `ftp:`, a custom scheme), a bare hostname, or an
+  empty URL could never be called, yet previously loaded fine and then
+  errored on every covered write at request time — under a `reject` failure
+  policy that aborted each write. The server now refuses to start and names
+  the offending webhook instead (#1766).
+
 ## [3.2.8] - 2026-10-27
 
 ### Fixed
