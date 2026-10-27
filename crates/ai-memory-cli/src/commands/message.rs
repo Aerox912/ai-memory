@@ -471,7 +471,9 @@ mod tests {
         };
         let error = pop(&config, a).await.unwrap_err();
         assert!(
-            error.to_string().contains("--project was passed empty"),
+            error
+                .to_string()
+                .contains("--project was passed empty"),
             "unexpected error: {error}"
         );
     }
@@ -504,7 +506,9 @@ mod tests {
         };
         let error = cancel(&config, a).await.unwrap_err();
         assert!(
-            error.to_string().contains("--workspace was passed empty"),
+            error
+                .to_string()
+                .contains("--workspace was passed empty"),
             "unexpected error: {error}"
         );
     }
@@ -523,7 +527,9 @@ mod tests {
         };
         let error = send(&config, a).await.unwrap_err();
         assert!(
-            error.to_string().contains("--from-project was passed empty"),
+            error
+                .to_string()
+                .contains("--from-project was passed empty"),
             "unexpected error: {error}"
         );
     }
@@ -542,7 +548,9 @@ mod tests {
         };
         let error = send(&config, a).await.unwrap_err();
         assert!(
-            error.to_string().contains("--to-project was passed empty"),
+            error
+                .to_string()
+                .contains("--to-project was passed empty"),
             "unexpected error: {error}"
         );
     }
