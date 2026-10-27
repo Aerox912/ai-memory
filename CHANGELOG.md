@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `ai-memory message` subcommands (`send`, `pop`, and `cancel`) now refuse
+  explicitly empty scope flags and targets before reading stdin or sending
+  any request to the server (#1761).
+
 ## [3.2.7] - 2026-10-26
 
 ### Fixed
