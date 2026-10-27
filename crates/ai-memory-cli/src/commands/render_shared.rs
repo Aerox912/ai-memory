@@ -4750,6 +4750,32 @@ if (inheritOnly) {
             !cmd.contains("^ --"),
             "do not escape separator spaces: {cmd}"
         );
+        assert!(
+            !cmd.starts_with('&'),
+            "antigravity must not gain a call operator: {cmd}"
+        );
+
+        let metacharacters = windows_native_hook_command_with_exe(
+            Path::new(r"C:\Users\Felipe^ Leite\.local\bin\ai-memory.exe"),
+            Path::new("pre-tool-use.sh"),
+            "https://memory.example.com",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(Path::new(r"C:\Users\Felipe (Work)\AppData")),
+                None,
+            ),
+        );
+        assert!(!metacharacters.contains('"'), "{metacharacters}");
+        assert!(
+            metacharacters.contains(r"C:\Users\Felipe^^^ Leite\.local\bin\ai-memory.exe"),
+            "existing caret must be doubled before the space escape: {metacharacters}"
+        );
+        assert!(
+            metacharacters.contains(r"--data-dir C:\Users\Felipe^ ^(Work^)\AppData"),
+            "parentheses must be escaped on the rendered command: {metacharacters}"
+        );
 
         let quoted_field = windows_native_hook_command_with_exe(
             Path::new("C:\\Users\\me\\ai\"memory.exe"),
@@ -4785,6 +4811,7 @@ if (inheritOnly) {
             .and_then(|v| v.as_str())
             .expect("PreToolUse command");
         assert!(!cmd.contains('"'), "{cmd}");
+        assert!(!cmd.starts_with('&'), "{cmd}");
         assert!(
             cmd.contains(r"--data-dir C:\Users\Felipe^ Leite\AppData\Local\ai-memory"),
             "{cmd}"
@@ -4810,10 +4837,16 @@ if (inheritOnly) {
                 .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
                 .and_then(|v| v.as_str())
                 .expect(agent);
-            assert!(other_cmd.contains('"'), "{agent}: {other_cmd}");
+            assert!(
+                other_cmd.contains(r#"--data-dir "C:\Users\Felipe Leite\AppData""#),
+                "{agent} must quote the spaced data-dir, not merely some other field: {other_cmd}"
+            );
             assert!(!other_cmd.contains("^ "), "{agent}: {other_cmd}");
             if agent == "gemini-cli" {
-                assert!(other_cmd.contains("& "), "{other_cmd}");
+                assert!(
+                    other_cmd.starts_with("& "),
+                    "gemini call operator must be the command prefix: {other_cmd}"
+                );
             }
         }
     }
