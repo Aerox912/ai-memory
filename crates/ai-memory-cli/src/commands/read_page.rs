@@ -223,9 +223,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("search query was passed empty"),
+                error.to_string().contains("search query was passed empty"),
                 "unexpected error: {error}"
             );
         }
