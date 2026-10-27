@@ -15,6 +15,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory restore-page` now refuses empty or whitespace-only `--path` and
+  `--from` values before resolving scope, authentication, or sending a request
+  to the server (#1764).
 - `ai-memory message` subcommands (`send`, `pop`, and `cancel`) now refuse
   explicitly empty scope flags and targets before reading stdin or sending
   any request to the server (#1761).
