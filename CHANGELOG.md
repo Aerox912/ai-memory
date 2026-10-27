@@ -17,6 +17,9 @@ version in [`docs/changelog/`](docs/changelog/):
   and `--project`), empty `--path`, and an empty search query before resolving
   scope or sending a request to the server (#1769).
 
+- `ai-memory finalize-session` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) before resolving scope or querying the server
+  (#1771).
 ## [3.2.8] - 2026-10-27
 
 ### Fixed
