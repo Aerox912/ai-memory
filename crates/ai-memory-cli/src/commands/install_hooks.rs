@@ -5950,16 +5950,35 @@ function sessionID(ctx: any): string | undefined {{
   return typeof id === "string" && id.length > 0 ? id : undefined;
 }}
 
+// OMP rebinds this extension into every subagent session (task tool, eval
+// `agent()`, `/tan` clones) and reports the agent a session runs as
+// `ctx.agent`. An advisor's tool calls reach the session they advise with
+// `kind: "sub"` under that session's id, so only a session's own lifecycle
+// events record it. Pi reports no `ctx.agent`, so every Pi session stays
+// top-level. https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md
+const subagentSessions = new Map<string, string>();
+
+function noteSubagent(ctx: any): void {{
+  const id = sessionID(ctx);
+  const agent = ctx?.agent;
+  if (!id || agent?.kind !== "sub") return;
+  subagentSessions.set(id, typeof agent.id === "string" && agent.id ? agent.id : "sub");
+}}
+
 function modelName(model: any): string | undefined {{
   const name = model?.id ?? model?.name ?? model?.model;
   return typeof name === "string" && name.length > 0 ? name : undefined;
 }}
 
 function sessionPayload(ctx: any): Record<string, unknown> {{
+  const id = sessionID(ctx);
+  const agentID = id ? subagentSessions.get(id) : undefined;
   return {{
-    sessionID: sessionID(ctx),
+    sessionID: id,
     cwd: ctx?.cwd,
     model: modelName(ctx?.model),
+    // `agent_id` marks a subagent session; a top-level one has none.
+    ...(agentID ? {{ agent_id: agentID }} : {{}}),
   }};
 }}
 
@@ -6060,10 +6079,12 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
 
 export default function AiMemoryExtension(api: any): void {{
   api.on("session_start", (_event: any, ctx: any) => {{
+    noteSubagent(ctx);
     startSession(ctx);
   }});
 
   api.on("before_agent_start", async (event: any, ctx: any) => {{
+    noteSubagent(ctx);
     startSession(ctx);
     postHook("user-prompt", {{
       ...sessionPayload(ctx),
@@ -6072,7 +6093,8 @@ export default function AiMemoryExtension(api: any): void {{
     }});
 
     const id = sessionID(ctx);
-    if (!id || handoffChecked.has(id)) return;
+    // The baton belongs to the next top-level session, never to a subagent.
+    if (!id || subagentSessions.has(id) || handoffChecked.has(id)) return;
     handoffChecked.add(id);
     const handoff = await fetchHandoff(ctx?.cwd ?? "", id);
     if (!handoff) return;
@@ -6127,6 +6149,7 @@ export default function AiMemoryExtension(api: any): void {{
   }});
 
   api.on("session_shutdown", async (_event: any, ctx: any) => {{
+    noteSubagent(ctx);
     startSession(ctx);
     postHook("session-end", sessionPayload(ctx));
     await drainHookQueueForDispose();
@@ -13509,6 +13532,50 @@ model = "gpt-5"
             !extension.contains("api.on(\"session_shutdown\", (_event: any, ctx: any) => {"),
             "session_shutdown must not regress to the sync fire-and-forget form: {extension}"
         );
+    }
+
+    /// OMP rebinds the extension into every subagent session and reports the
+    /// session's agent as `ctx.agent` (`docs/extensions.md`, "Handler
+    /// context"). A subagent session forwards `agent_id` and never claims the
+    /// baton. Only the session's own lifecycle events record the kind: an
+    /// advisor's tool calls reach the session they advise as `kind: "sub"`.
+    #[test]
+    fn omp_extension_marks_subagent_sessions_and_skips_their_handoff() {
+        let extension =
+            build_omp_extension("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        // Slice a single `api.on("...")` handler so an assertion cannot be
+        // satisfied by a call that lives in a neighbouring one.
+        let handler = |event: &str| {
+            let needle = format!("api.on(\"{event}\"");
+            let start = extension
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{event} handler missing"));
+            let rest = &extension[start..];
+            let end = rest[needle.len()..]
+                .find("api.on(")
+                .map(|offset| offset + needle.len())
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+        assert!(extension.contains("if (!id || agent?.kind !== \"sub\") return;"));
+        assert!(extension.contains("...(agentID ? { agent_id: agentID } : {}),"));
+        assert!(
+            handler("before_agent_start")
+                .contains("if (!id || subagentSessions.has(id) || handoffChecked.has(id)) return;"),
+            "a subagent's first prompt must not claim the baton"
+        );
+        for event in ["session_start", "before_agent_start", "session_shutdown"] {
+            assert!(
+                handler(event).contains("noteSubagent(ctx);"),
+                "{event} carries the session's own agent and must record it"
+            );
+        }
+        for event in ["tool_call", "tool_result", "agent_end"] {
+            assert!(
+                !handler(event).contains("noteSubagent"),
+                "{event} can carry an advisor's identity and must not record it"
+            );
+        }
     }
 
     #[test]
