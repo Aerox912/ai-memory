@@ -167,15 +167,12 @@ pub(crate) fn humanize_age_secs(seconds: i64) -> String {
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
 }
 
-/// Refuse an explicitly empty scope or target flag on a mutating command.
+/// Refuse an explicitly empty or whitespace-only scope or target flag.
 ///
-/// [`resolve_scope`] treats an empty string as absent, so a harness that
-/// fills an unset variable with `""` still resolves the scope it would have
-/// resolved without the flag. That is the right reading for a read, and the
-/// wrong one for a mutation: `--project "" --confirm` would aim a purge at
-/// whatever the current directory resolves to, and an empty message scope
-/// would claim or cancel mail there. These commands ask for the flag to be
-/// omitted instead.
+/// A shell wrapper or harness that fills an unset variable with `""` (or
+/// whitespace) must fail closed rather than silently falling back to the
+/// scope the current directory resolves to or forwarding a blank project/
+/// workspace name to the server.
 ///
 /// # Errors
 /// Returns an error naming `flag` when it was passed as an empty or
@@ -208,8 +205,8 @@ pub(crate) fn resolve_scope_noting_marker_project(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String, bool)> {
-    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
-    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    refuse_empty_explicit(explicit_proj, "--project")?;
     if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
         return Ok((workspace.to_string(), project.to_string(), false));
     }
@@ -230,8 +227,8 @@ pub(crate) fn resolve_scope_with_marker(
     marker: Option<(crate::marker::MarkerScope, String, String)>,
     announce: bool,
 ) -> Result<(String, String)> {
-    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
-    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    refuse_empty_explicit(explicit_proj, "--project")?;
 
     let mut decided: Vec<&str> = Vec::with_capacity(2);
     let workspace = match explicit_ws {
@@ -372,7 +369,8 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
 /// workspace). Resolving the pair there would make the command fail on the
 /// cwd-derived project name it is about to throw away.
 pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> Result<String> {
-    if let Some(explicit) = explicit_ws.filter(|s| !s.is_empty()) {
+    refuse_empty_explicit(explicit_ws, "--workspace")?;
+    if let Some(explicit) = explicit_ws {
         return Ok(explicit.to_string());
     }
     Ok(match marker_scope(config)? {
@@ -1008,5 +1006,66 @@ mod tests {
         let (workspace, _) = resolve_scope(&config, None, None).unwrap();
 
         assert_eq!(workspace, crate::config::DEFAULT_WORKSPACE);
+    }
+
+    #[test]
+    fn resolve_scope_and_workspace_refuse_empty_and_whitespace_flags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = config_at(
+            tmp.path(),
+            Some("workspace = \"acme\"\nproject = \"pinned\"\n"),
+        );
+
+        for empty in ["", " ", " \t\n "] {
+            let err = resolve_scope(&config, Some(empty), None).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+            let err = resolve_scope(&config, Some(empty), Some("explicit")).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+            let err = resolve_scope(&config, None, Some(empty)).unwrap_err();
+            assert!(
+                err.to_string().contains("--project was passed empty"),
+                "{err}"
+            );
+            let err = resolve_scope(&config, Some("explicit"), Some(empty)).unwrap_err();
+            assert!(
+                err.to_string().contains("--project was passed empty"),
+                "{err}"
+            );
+            let err =
+                resolve_scope_with_marker(&config, Some(empty), None, None, false).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+            let err =
+                resolve_scope_with_marker(&config, None, Some(empty), None, false).unwrap_err();
+            assert!(
+                err.to_string().contains("--project was passed empty"),
+                "{err}"
+            );
+            let err = resolve_workspace(&config, Some(empty)).unwrap_err();
+            assert!(
+                err.to_string().contains("--workspace was passed empty"),
+                "{err}"
+            );
+        }
+
+        // Legitimate controls: omitted flags use the marker; non-empty flags override it.
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("acme".to_string(), "pinned".to_string())
+        );
+        assert_eq!(
+            resolve_scope(&config, Some("ws"), Some("proj")).unwrap(),
+            ("ws".to_string(), "proj".to_string())
+        );
+        assert_eq!(resolve_workspace(&config, None).unwrap(), "acme");
+        assert_eq!(resolve_workspace(&config, Some("ws")).unwrap(), "ws");
     }
 }

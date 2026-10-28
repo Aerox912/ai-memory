@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Refused empty and whitespace-only `--workspace` and `--project` flags at the
+  shared CLI scope-resolution choke point (`resolve_scope`,
+  `resolve_scope_noting_marker_project`, `resolve_scope_with_marker`, and
+  `resolve_workspace`) so an unset shell variable (`--project "$UNSET"`) or
+  blank value fails closed across all scoped CLI subcommands instead of
+  silently falling back to the current directory's scope or forwarding a
+  whitespace name (#1774).
 - OMP subagent sessions (the task tool, eval `agent()`, `/tan` clones) no
   longer claim the pending handoff or leave one behind. OMP runs them inside
   the parent's process and loads the extension into each, so a subagent's
