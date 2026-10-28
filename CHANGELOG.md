@@ -11,6 +11,28 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.2.9] - 2026-10-27
+
+### Fixed
+
+- Fixed Antigravity CLI hooks on Windows failing when the install or profile
+  path contains spaces — bare hook commands are now caret-escaped (#1767).
+- `ai-memory read-page` now refuses explicitly empty scope flags (`--workspace`
+  and `--project`), empty `--path`, and an empty search query before resolving
+  scope or sending a request to the server (#1769).
+
+- `ai-memory finalize-session` now refuses explicitly empty scope flags
+  (`--workspace` and `--project`) before resolving scope or querying the server
+  (#1771).
+
+- Admission webhook URLs are validated when the chain is built: only
+  `http://` and `https://` URLs are accepted. A webhook configured with any
+  other scheme (`file:`, `ftp:`, a custom scheme), a bare hostname, or an
+  empty URL could never be called, yet previously loaded fine and then
+  errored on every covered write at request time — under a `reject` failure
+  policy that aborted each write. The server now refuses to start and names
+  the offending webhook instead (#1766).
+
 ## [3.2.8] - 2026-10-27
 
 ### Fixed
@@ -2870,7 +2892,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.8...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.2.9...HEAD
+[3.2.9]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.9
 [3.2.8]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.8
 [3.2.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.7
 [3.2.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.6
