@@ -11290,6 +11290,81 @@ pub(crate) mod tests {
         );
     }
 
+    /// `drop_subagent_captures` reaches OMP through the extension's `agent_id`:
+    /// a marked subagent session is dropped through its end, while a top-level
+    /// OMP session in the same project is stored.
+    #[tokio::test]
+    async fn drop_subagent_captures_drops_an_omp_subagent_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let url = |event: &str| format!("http://h/hook?event={event}&agent=omp&drop_subagent=1");
+        let subagent = serde_json::json!({
+            "sessionID": "omp-sub", "agent_id": "0-Explore", "prompt": "Find the config loader"
+        });
+        let top_level = serde_json::json!({ "sessionID": "omp-top", "prompt": "Ship the fix" });
+        let items = vec![
+            HookBatchItem {
+                url: url("user-prompt"),
+                body: subagent.clone(),
+            },
+            HookBatchItem {
+                url: url("session-end"),
+                body: subagent.clone(),
+            },
+            HookBatchItem {
+                url: url("user-prompt"),
+                body: top_level.clone(),
+            },
+        ];
+
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 3, "all acked: 2 dropped + 1 processed");
+
+        let omp_prompt = || HookQuery {
+            event: "user-prompt".into(),
+            agent: Some("omp".into()),
+            ..Default::default()
+        };
+        let sub_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(omp_prompt(), subagent)).unwrap();
+        let top_sid =
+            resolve_session_id(&HookEnvelope::from_query_and_body(omp_prompt(), top_level))
+                .unwrap();
+        assert!(
+            state
+                .reader
+                .observations_for_session(sub_sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an opted-in project drops the OMP subagent session"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(top_sid)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the top-level OMP session is kept"
+        );
+    }
+
     #[tokio::test]
     async fn subagent_start_event_seeds_the_session_so_its_tail_drops() {
         let tmp = TempDir::new().unwrap();
