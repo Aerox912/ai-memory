@@ -68,10 +68,6 @@ const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
 const MAX_BRIEFED_MARKERS: usize = 512;
-/// Total budget AND per-event timeout for the mid-session catch-up drain — kept
-/// well under a second so a `post-tool-use` hook never stalls a tool call (one
-/// in-flight POST against a slow server is bounded by this too).
-const INCREMENTAL_DRAIN_BUDGET: Duration = Duration::from_millis(250);
 /// Total budget, lock wait included, for a `session-end` drained in-process
 /// ([`session_end_drains_in_process`]). Fixed rather than env-overridable:
 /// together with [`IN_PROCESS_SESSION_END_DEADLINE`] it has to stay inside
@@ -127,8 +123,12 @@ fn background_drain_budget_from(lookup: impl FnMut(&str) -> Option<String>) -> D
 
 /// Backlog size at which `post-tool-use` triggers a mid-session catch-up drain.
 /// Env: `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD` (positive integer).
-fn incremental_drain_threshold() -> usize {
-    incremental_drain_threshold_from(env_lookup)
+fn incremental_drain_threshold(runtime_env: &RuntimeEnv) -> usize {
+    incremental_drain_threshold_from(|name| {
+        runtime_env
+            .var_os(name)
+            .map(|value| value.to_string_lossy().into_owned())
+    })
 }
 
 fn incremental_drain_threshold_from(mut lookup: impl FnMut(&str) -> Option<String>) -> usize {
@@ -1585,6 +1585,7 @@ where
         None => None,
     };
     let spool = hook_spool::spool_dir(&dd);
+    let mut incremental_background_drain = false;
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
     let hook_qs = format!("{qs}{session_qs}{managed_qs}");
@@ -1705,42 +1706,49 @@ where
         }
 
         // Mid-session catch-up: per-event hooks only enqueue, so a heavy session
-        // outpaces the boundary-only drain and the spool grows until the next
-        // boundary. On `post-tool-use`, once the backlog crosses the threshold, do a
-        // tightly time-boxed drain (budget == per-event timeout, sub-second) so the
-        // spool stays flat without ever stalling a tool call.
+        // can outpace the boundary-only drain. Once a `post-tool-use` backlog
+        // crosses the threshold, hand it to the same long-budget detached
+        // drainer used at boundaries. A 250 ms inline attempt proved too short
+        // on loaded macOS hosts and could leave every later threshold attempt
+        // timing out too (#1744). Zero kills detached children, so it retains a
+        // tightly bounded in-process pass.
         if should_incremental_drain(
             &args.event,
             hook_spool::spool_len(&spool),
-            incremental_drain_threshold(),
+            incremental_drain_threshold(&runtime_env),
         ) {
-            if let Some(pool_id) = pool_id.as_deref() {
-                let _ = hook_spool::drain_exclusive_trusted_pool(
-                    &spool,
-                    &dd,
-                    INCREMENTAL_DRAIN_BUDGET,
-                    INCREMENTAL_DRAIN_BUDGET,
-                    hook_spool::DrainLockWait::NoWait,
-                    hook_spool::TrustedPool {
-                        server_url: &args.server_url,
-                        static_bearer: install_token,
-                        pool_id,
-                    },
-                    max_attempts,
-                )
-                .await;
+            if agent_kind == AgentKind::Zero {
+                let budget = Duration::from_millis(250);
+                if let Some(pool_id) = pool_id.as_deref() {
+                    let _ = hook_spool::drain_exclusive_trusted_pool(
+                        &spool,
+                        &dd,
+                        budget,
+                        budget,
+                        hook_spool::DrainLockWait::NoWait,
+                        hook_spool::TrustedPool {
+                            server_url: &args.server_url,
+                            static_bearer: install_token,
+                            pool_id,
+                        },
+                        max_attempts,
+                    )
+                    .await;
+                } else {
+                    let _ = hook_spool::drain_exclusive_trusted(
+                        &spool,
+                        &dd,
+                        budget,
+                        budget,
+                        hook_spool::DrainLockWait::NoWait,
+                        &args.server_url,
+                        install_token,
+                        max_attempts,
+                    )
+                    .await;
+                }
             } else {
-                let _ = hook_spool::drain_exclusive_trusted(
-                    &spool,
-                    &dd,
-                    INCREMENTAL_DRAIN_BUDGET,
-                    INCREMENTAL_DRAIN_BUDGET,
-                    hook_spool::DrainLockWait::NoWait,
-                    &args.server_url,
-                    install_token,
-                    max_attempts,
-                )
-                .await;
+                incremental_background_drain = true;
             }
         }
 
@@ -2124,7 +2132,7 @@ where
         )
         .await;
     } else if !external_capture
-        && should_spawn_background_drainer(&args.event)
+        && (incremental_background_drain || should_spawn_background_drainer(&args.event))
         && let Err(err) = after_background_drain_event_enqueue(
             &dd,
             // The install's own token, resolved the same way an install-default
@@ -4060,6 +4068,59 @@ mod tests {
                 "{event} must not drain inline"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn post_tool_threshold_spawns_long_budget_background_drainer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let spool = hook_spool::spool_dir(&data_dir);
+        for index in 0..2 {
+            hook_spool::enqueue(
+                &spool,
+                &hook_spool::entry_for(
+                    format!("http://127.0.0.1:1/hook?queued={index}"),
+                    "{}".into(),
+                    None,
+                    false,
+                ),
+            )
+            .unwrap();
+        }
+        let called = std::cell::Cell::new(0);
+        let mut stdout = Vec::new();
+        let args = HookArgs {
+            event: "post-tool-use".into(),
+            agent: "claude-code".into(),
+            server_url: dead_server_url(),
+            auth_token: None,
+            auth_token_file: None,
+            pool_id: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+            capture_mode: None,
+        };
+
+        run_with_payload_in_home(
+            Some(data_dir.clone()),
+            args,
+            r#"{"session_id":"s","cwd":"/tmp","tool_name":"Read","tool_input":{"file_path":"/tmp/example"}}"#.into(),
+            &mut stdout,
+            |path, _token| {
+                assert_eq!(path, data_dir.as_path());
+                assert_eq!(hook_spool::spool_len(&spool), 3);
+                called.set(called.get() + 1);
+                Ok(())
+            },
+            None,
+            RuntimeEnv::with_process_env_for_tests(&[(INCREMENTAL_THRESHOLD_ENV, "3")]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert_eq!(called.get(), 1);
     }
 
     fn zero_hook_args(event: &str, server_url: &str) -> HookArgs {

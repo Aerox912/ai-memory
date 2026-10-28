@@ -112,8 +112,8 @@ fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
-/// Every manifest version is the workspace version and every catalog entry
-/// is pinned to its tag, so a marketplace add installs released content only.
+/// Every manifest version is the workspace version. Canonical builds point at
+/// their tag; maintained Aerox builds point at the fork branch until tagged.
 #[test]
 fn plugin_versions_and_catalog_refs_match_the_workspace() {
     let root = repo_root();
@@ -135,7 +135,12 @@ fn plugin_versions_and_catalog_refs_match_the_workspace() {
         assert_eq!(json["name"], "ai-memory", "{catalog}");
         for plugin in json["plugins"].as_array().unwrap() {
             assert_eq!(plugin["name"], "ai-memory", "{catalog}");
-            assert_eq!(plugin["source"]["ref"], format!("v{VERSION}"), "{catalog}");
+            let expected_ref = if VERSION.contains("-aerox.") {
+                "main".to_owned()
+            } else {
+                format!("v{VERSION}")
+            };
+            assert_eq!(plugin["source"]["ref"], expected_ref, "{catalog}");
             assert_eq!(
                 plugin["source"]["url"], "https://github.com/Aerox912/ai-memory.git",
                 "{catalog}"

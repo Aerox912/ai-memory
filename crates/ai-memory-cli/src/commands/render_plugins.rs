@@ -112,8 +112,19 @@ fn git_subdir(path: &str, version: &str) -> Value {
         "source": "git-subdir",
         "url": format!("{REPOSITORY_URL}.git"),
         "path": path,
-        "ref": format!("v{version}"),
+        "ref": catalog_ref(version),
     })
+}
+
+/// Maintained Aerox builds use the fork's integration branch until a
+/// user-approved version tag is published. Canonical releases remain pinned
+/// to their immutable version tag.
+fn catalog_ref(version: &str) -> String {
+    if version.contains("-aerox.") {
+        "main".to_owned()
+    } else {
+        format!("v{version}")
+    }
 }
 
 fn claude_catalog(version: &str) -> Value {

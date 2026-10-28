@@ -29,8 +29,8 @@ mod logging;
 mod marker;
 mod process_guard;
 mod proxy_env;
-mod secret_input;
 pub mod runtime_flavor;
+mod secret_input;
 mod server_profiles;
 mod terminal;
 
@@ -101,6 +101,12 @@ pub async fn run() -> Result<()> {
         logging::DegradeWarnings::Quiet
     };
     let _logging_guard = logging::init(&config, degrade_warnings)?;
+
+    // The bridge only talks to the local server with proxies disabled, and an
+    // MCP client would surface the warning on every session start.
+    if !matches!(command, Command::McpBridge(_)) {
+        proxy_env::warn_unusable(&config.runtime_env);
+    }
 
     info!(
         version = env!("CARGO_PKG_VERSION"),

@@ -9,12 +9,12 @@
     {
       "name": "ai-memory",
       "description": "Long-term memory across sessions and harnesses.",
-      "version": "3.2.5-aerox.1",
+      "version": "3.2.9-aerox.1",
       "source": {
         "source": "git-subdir",
         "url": "https://github.com/Aerox912/ai-memory.git",
         "path": "plugins/claude-code",
-        "ref": "v3.2.5-aerox.1"
+        "ref": "main"
       }
     }
   ]
